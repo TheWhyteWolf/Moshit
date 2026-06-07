@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moshit"
+version = "0.1.0"
+description = "Moshit: a standalone, FFmpeg-backed datamoshing engine (no Adobe required)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+# No third-party Python dependencies for the engine/CLI.
+# The GUI needs PySide6 (see the 'gui' optional extra). ffmpeg/ffprobe on PATH
+# are required at runtime in all cases.
+dependencies = []
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+
+[project.scripts]
+moshit = "moshit.cli:main"
+moshit-gui = "moshit.gui.app:launch"
+
+[tool.setuptools]
+packages = ["moshit", "moshit.modes", "moshit.gui"]
