@@ -16,6 +16,7 @@ dependencies = []
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.5"]
+test = ["pytest>=7"]
 
 [project.scripts]
 moshit = "moshit.cli:main"
@@ -23,3 +24,9 @@ moshit-gui = "moshit.gui.app:launch"
 
 [tool.setuptools]
 packages = ["moshit", "moshit.modes", "moshit.gui"]
+
+[tool.pytest.ini_options]
+# Run from the repo without an install; integration tests skip without ffmpeg.
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q -ra"

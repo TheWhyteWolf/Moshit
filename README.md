@@ -276,14 +276,27 @@ Render a saved project:
 python -m moshit.cli render-project myproject/project.json --out final.avi
 ```
 
-### Self-test
+### Tests
 
-A dependency-light check (no FFmpeg needed) of the AVI codec, the effects, and
-the non-destructive bake/revert bookkeeping:
+A dependency-light check (no FFmpeg needed) of the AVI codec, the effects, the
+finishing/automation/region math, presets, and the non-destructive bake/revert
+bookkeeping:
 
 ```sh
 python -m moshit.cli selftest
 ```
+
+The `pytest` suite adds **ffmpeg-gated integration tests** — real render/export,
+audio sync, speed/reverse/fade/crossfade, pixel effects, automation and region —
+plus a few GUI smoke tests. Integration tests skip automatically when ffmpeg (or,
+for the GUI, a usable Qt platform) is missing:
+
+```sh
+pip install -e ".[gui,test]"   # or just ".[test]" to skip the GUI tests
+pytest
+```
+
+CI (GitHub Actions) runs both on every push and PR across Python 3.11–3.12.
 
 ## Architecture
 
