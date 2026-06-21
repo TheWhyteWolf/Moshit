@@ -358,6 +358,52 @@ class AppController(QObject):
         self.status.emit(f"Added {media.label} to the {track} track")
         return clip
 
+    # -- pixel FX (clip finishing) ------------------------------------------ #
+
+    def clip_pixel_fx(self, clip_id: str) -> List[dict]:
+        try:
+            return [dict(pe) for pe in self.project.clip(clip_id).pixel_effects]
+        except KeyError:
+            return []
+
+    def add_pixel_fx(self, clip_id: str, name: str):
+        from ..modes import get_pixel_mode
+        try:
+            c = self.project.clip(clip_id)
+            mode = get_pixel_mode(name)
+        except KeyError:
+            return None
+        self._push_undo()
+        c.pixel_effects.append({"name": name, "params": mode.defaults()})
+        self.project_changed.emit()
+        self.status.emit(f"Added pixel FX: {name}")
+        return c
+
+    def remove_pixel_fx(self, clip_id: str, index: int) -> None:
+        try:
+            c = self.project.clip(clip_id)
+        except KeyError:
+            return
+        if not (0 <= index < len(c.pixel_effects)):
+            return
+        self._push_undo()
+        c.pixel_effects.pop(index)
+        self.project_changed.emit()
+        self.status.emit("Removed pixel FX")
+
+    def update_pixel_fx(self, clip_id: str, index: int, params: dict) -> None:
+        try:
+            c = self.project.clip(clip_id)
+        except KeyError:
+            return
+        if not (0 <= index < len(c.pixel_effects)):
+            return
+        if c.pixel_effects[index].get("params") == params:
+            return
+        self._push_undo()
+        c.pixel_effects[index]["params"] = dict(params)
+        self.project_changed.emit()
+
     # -- effect stack ------------------------------------------------------- #
 
     @staticmethod

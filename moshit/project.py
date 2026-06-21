@@ -78,11 +78,13 @@ class Clip:
     fade_in: int = 0               # frames to fade up from black at the head
     fade_out: int = 0              # frames to fade to black at the tail
     transition_in: int = 0         # crossfade frames from the previous main clip
+    pixel_effects: List = field(default_factory=list)  # [{name, params}] FFmpeg FX
 
     def has_finish(self) -> bool:
         """True if this clip needs the pixel-domain finish pass."""
         return (self.speed != 1.0 or self.reverse or self.fade_in > 0
-                or self.fade_out > 0 or self.transition_in > 0)
+                or self.fade_out > 0 or self.transition_in > 0
+                or bool(self.pixel_effects))
 
     def to_dict(self) -> Dict:
         return self.__dict__.copy()
@@ -174,6 +176,20 @@ class Project:
     def _ops_for_clip(self, clip_id: str) -> List[MoshOp]:
         return [o for o in self.mosh_ops
                 if o.target_clip_id == clip_id and o.enabled and not o.archived]
+
+    def _pixel_filters(self, clip: Clip) -> List[str]:
+        """FFmpeg filter strings for a clip's pixel effects (skips unknown ones)."""
+        from .modes import get_pixel_mode
+        out: List[str] = []
+        for pe in (clip.pixel_effects or []):
+            try:
+                mode = get_pixel_mode(pe["name"])
+            except KeyError:
+                continue
+            f = mode.filter(**mode.resolve(pe.get("params") or {}))
+            if f:
+                out.append(f)
+        return out
 
     @staticmethod
     def _op_region(op: MoshOp, n: int):
@@ -438,7 +454,8 @@ class Project:
                         for c, media, frames in segs]
             meta = [{"n": len(frames), "speed": c.speed, "reverse": c.reverse,
                      "fade_in": c.fade_in, "fade_out": c.fade_out,
-                     "transition_in": c.transition_in}
+                     "transition_in": c.transition_in,
+                     "pixel": self._pixel_filters(c)}
                     for c, _, frames in segs]
             out = engine.finish_clips(seg_avis, meta, out_avi)
             for s in seg_avis:               # consumed; don't pile up across renders
@@ -552,7 +569,8 @@ class Project:
                         out_point=len(baked_av.frames),
                         speed=target.speed, reverse=target.reverse,
                         fade_in=target.fade_in, fade_out=target.fade_out,
-                        transition_in=target.transition_in)
+                        transition_in=target.transition_in,
+                        pixel_effects=[dict(pe) for pe in target.pixel_effects])
         self.clips.append(new_clip)
 
         target.enabled = False

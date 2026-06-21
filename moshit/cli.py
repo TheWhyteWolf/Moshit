@@ -101,6 +101,16 @@ def cmd_modes(args) -> int:
             print(f"    - {p.describe()}{req}{auto}")
             if p.help:
                 print(f"        {p.help}")
+
+    from .modes import available_pixel_modes, get_pixel_mode
+    pixel = available_pixel_modes()
+    if pixel:
+        print("\n=== pixel effects (clip finishing, FFmpeg filters) ===")
+        for name in pixel:
+            mode = get_pixel_mode(name)
+            print(f"\n{name}\n  {mode.description}")
+            for p in mode.params:
+                print(f"    - {p.describe()}")
     return 0
 
 
@@ -690,6 +700,45 @@ def cmd_selftest(args) -> int:
            "delete_preset removes a preset", failures)
     _check(not _presets.delete_preset("nope", ppath),
            "delete_preset on a missing name returns False", failures)
+
+    print("\nK. Pixel-domain effects")
+    from .modes import available_pixel_modes, get_pixel_mode
+    _check("rgb_shift" in available_pixel_modes()
+           and "pixelate" in available_pixel_modes(),
+           "built-in pixel effects are registered", failures)
+    _check(get_pixel_mode("rgb_shift").filter(amount=6)
+           == "rgbashift=rh=6:bh=-6:rv=3:bv=-3",
+           "rgb_shift builds the expected FFmpeg filter string", failures)
+    _check("scale=" in get_pixel_mode("pixelate").filter(block=8),
+           "pixelate builds a scale-based filter", failures)
+
+    kproj = Project(name="k", assets_dir=str(tmp / "assets_k"))
+    kp = tmp / "k.avi"
+    _synth_avi(kp, "I" + "P" * 5)
+    kdest = kproj.assets_dir / "kmedia.avi"
+    kdest.write_bytes(kp.read_bytes())
+    kcav = parse_avi(kdest)
+    kproj.media["kmedia"] = MediaItem(
+        id="kmedia", source_path=str(kp), label="k", role="main",
+        intermediate_path=str(kdest), width=kcav.width, height=kcav.height,
+        fps=kcav.fps, nb_frames=len(kcav.frames))
+    kproj._parsed["kmedia"] = kcav
+    kc = kproj.add_clip("kmedia", "main")
+    _check(not kc.has_finish(), "a plain clip needs no finish pass", failures)
+    kc.pixel_effects = [{"name": "rgb_shift", "params": {"amount": 5}},
+                        {"name": "unknown_fx", "params": {}}]
+    _check(kc.has_finish(), "a clip with pixel FX needs the finish pass", failures)
+    _check(kproj._pixel_filters(kc) == ["rgbashift=rh=5:bh=-5:rv=2:bv=-2"],
+           "_pixel_filters builds known filters and skips unknown ones", failures)
+
+    kproj.add_mosh("pframe_duplicate", {"factor": 2}, kc.id)
+    krec = kproj.bake_clip(fake, kc.id)
+    _check([pe["name"] for pe in kproj.clip(krec.baked_clip_id).pixel_effects]
+           == ["rgb_shift", "unknown_fx"],
+           "bake_clip carries pixel FX onto the baked clip", failures)
+    krel = Project.load(kproj.save(tmp / "k.json"))
+    _check(krel.clip(krec.baked_clip_id).pixel_effects[0]["name"] == "rgb_shift",
+           "pixel FX survive JSON round-trip", failures)
 
     print()
     if failures:

@@ -344,6 +344,9 @@ class MainWindow(QMainWindow):
         self.inspector.presetSaveRequested.connect(self._on_preset_save)
         self.inspector.presetApplyRequested.connect(self._on_preset_apply)
         self.inspector.presetDeleteRequested.connect(self._on_preset_delete)
+        self.inspector.pixelFxAddRequested.connect(self._on_pixel_add)
+        self.inspector.pixelFxRemoveRequested.connect(self._on_pixel_remove)
+        self.inspector.pixelFxParamsChanged.connect(self._on_pixel_params)
         self.inspector.bakeRequested.connect(self._on_bake)
         self.inspector.revertRequested.connect(lambda: c.revert_last_bake())
         self.inspector.clipPropsChanged.connect(self._on_clip_props)
@@ -428,6 +431,21 @@ class MainWindow(QMainWindow):
     def _on_preset_delete(self, name: str) -> None:
         self.controller.delete_preset(name)
         self.inspector.set_presets(self.controller.preset_names())
+
+    def _on_pixel_add(self, name: str) -> None:
+        if self._selected_clip:
+            self.controller.add_pixel_fx(self._selected_clip, name)
+            self._schedule_auto_refresh(immediate=True)
+
+    def _on_pixel_remove(self, index: int) -> None:
+        if self._selected_clip:
+            self.controller.remove_pixel_fx(self._selected_clip, index)
+            self._schedule_auto_refresh(immediate=True)
+
+    def _on_pixel_params(self, index: int, params: dict) -> None:
+        if self._selected_clip:
+            self.controller.update_pixel_fx(self._selected_clip, index, params)
+            self._schedule_auto_refresh(immediate=True)
 
     def _set_auto_refresh(self, on: bool) -> None:
         self.auto_refresh = on

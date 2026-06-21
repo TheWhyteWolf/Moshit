@@ -156,10 +156,11 @@ class MoshEngine:
         return self.ff.build_audio_track(plan, dst, fps=fps or self.config.fps)
 
     def finish_clips(self, segments, meta, dst):
-        """Pixel-domain finish pass: apply per-clip speed/reverse/fade and fold
-        clips with crossfade/hard-cut. Returns the finished AVI path."""
+        """Pixel-domain finish pass: apply per-clip speed/reverse/fade/pixel-FX
+        and fold clips with crossfade/hard-cut. Returns the finished AVI path."""
         return self.ff.finish_video(segments, meta, dst, fps=self.config.fps,
-                                    gop=self.config.gop, qscale=self.config.qscale)
+                                    gop=self.config.gop, qscale=self.config.qscale,
+                                    width=self.config.width, height=self.config.height)
 
     # -- convenience: end-to-end two-clip mosh ------------------------------ #
 

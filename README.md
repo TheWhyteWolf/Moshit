@@ -150,6 +150,15 @@ from the dropdown and **Apply** to drop it onto another clip (presets live in
 random values into the parameters below — a fast way to find a look, which you
 then **Add** or **Apply**.
 
+**Pixel FX.** A second, pixel-domain class of effect (distinct from the
+codec-domain mosh stack): clean FFmpeg-filter looks applied in the finish pass,
+*after* the mosh and the speed/fade finishing. The inspector's **Pixel FX** panel
+adds, edits and removes them per clip. Built-ins: `rgb_shift` (chromatic
+aberration), `hue_rotate`, `pixelate`, `noise`, `echo` (frame ghosting), and
+`trails` (light streaks). They compose with everything — mosh a clip, slow it,
+crossfade it, *and* shift its channels — and bake/persist like the other clip
+finishing. `moshit modes` lists them under their own heading.
+
 **Generated motion (transforms).** The **Generate** menu makes procedural motion
 sources — zoom in/out, horizontal/vertical pan, and rotate — and drops them on
 the motion track. Each is a static, detailed texture moved by the chosen

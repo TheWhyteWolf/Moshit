@@ -334,15 +334,18 @@ class FFmpeg:
                 pass
 
     def finish_video(self, segments: List, meta: List[Dict], dst, *,
-                     fps: float, gop: int = 250, qscale: int = 3) -> Path:
+                     fps: float, gop: int = 250, qscale: int = 3,
+                     width: int = 0, height: int = 0) -> Path:
         """Assemble per-clip moshed segment AVIs into one finished video.
 
         Each clip gets a pixel-domain chain -- ``reverse``, ``setpts`` (speed),
-        ``fps``, ``fade`` in/out -- and adjacent clips are folded together with
-        ``xfade`` (crossfade) where ``transition_in`` is set, else ``concat`` (a
-        hard cut). ``meta[i]`` is ``{n, speed, reverse, fade_in, fade_out,
-        transition_in}`` (frame counts). ``settb`` pins a common timebase so
-        ``xfade`` accepts the concat output.
+        ``fps``, ``fade`` in/out, then any ``pixel`` filter strings -- and
+        adjacent clips are folded together with ``xfade`` (crossfade) where
+        ``transition_in`` is set, else ``concat`` (a hard cut). ``meta[i]`` is
+        ``{n, speed, reverse, fade_in, fade_out, transition_in, pixel}`` (frame
+        counts plus a list of filter strings). ``settb`` pins a common timebase
+        so ``xfade`` accepts the concat output; pixel filters are followed by a
+        ``scale`` back to ``width x height`` so size-changing ones stay foldable.
         """
         tb = int(round(fps))
         parts: List[str] = []
@@ -363,6 +366,11 @@ class FFmpeg:
             if fo > 0:
                 chain.append(f"fade=t=out:st={max(0.0, (mlen - fo) / fps):.6f}:"
                              f"d={fo / fps:.6f}")
+            pixel = m.get("pixel") or []
+            if pixel:
+                chain.extend(pixel)
+                if width and height:           # restore exact geometry for the fold
+                    chain.append(f"scale={int(width)}:{int(height)}:flags=bicubic")
             chain.append("format=yuv420p")
             chain.append(f"settb=1/{tb}")
             parts.append(f"[{i}:v]" + ",".join(chain) + f"[v{i}]")
