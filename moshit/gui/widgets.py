@@ -760,6 +760,9 @@ class InspectorPanel(QWidget):
     effectRemoveRequested = Signal(str)            # op_id
     effectMoveRequested = Signal(str, int)         # op_id, delta (-1 up / +1 down)
     effectEnabledChanged = Signal(str, bool)       # op_id, enabled
+    presetSaveRequested = Signal()                 # save the current stack
+    presetApplyRequested = Signal(str)             # preset name
+    presetDeleteRequested = Signal(str)            # preset name
     bakeRequested = Signal()
     revertRequested = Signal()
     clipPropsChanged = Signal(dict)                # speed/reverse/fades/transition
@@ -767,6 +770,7 @@ class InspectorPanel(QWidget):
     def __init__(self):
         super().__init__()
         self._getters: Dict[str, Callable] = {}
+        self._param_widgets: Dict[str, QWidget] = {}
         self._clip_ref_combos: List[QComboBox] = []
         self._motion_labels: List[str] = []
         self._clip_id: Optional[str] = None
@@ -824,9 +828,36 @@ class InspectorPanel(QWidget):
 
         layout.addWidget(self._build_region_row())
 
+        editor_row = QHBoxLayout()
         self.apply_btn = QPushButton("Apply to selected effect")
         self.apply_btn.clicked.connect(self._emit_update)
-        layout.addWidget(self.apply_btn)
+        self.random_btn = QPushButton("🎲")
+        self.random_btn.setMaximumWidth(36)
+        self.random_btn.setToolTip("Randomise the parameters below")
+        self.random_btn.clicked.connect(self._randomize_editor)
+        editor_row.addWidget(self.apply_btn)
+        editor_row.addWidget(self.random_btn)
+        layout.addLayout(editor_row)
+
+        preset_row = QHBoxLayout()
+        self.preset_combo = QComboBox()
+        self.preset_combo.setToolTip("Saved effect-stack presets")
+        self.preset_save_btn = QPushButton("Save…")
+        self.preset_save_btn.setToolTip("Save this clip's effect stack as a preset")
+        self.preset_save_btn.clicked.connect(lambda: self.presetSaveRequested.emit())
+        self.preset_apply_btn = QPushButton("Apply")
+        self.preset_apply_btn.setToolTip("Replace this clip's stack with the preset")
+        self.preset_apply_btn.clicked.connect(self._emit_apply_preset)
+        self.preset_del_btn = QPushButton("✕")
+        self.preset_del_btn.setMaximumWidth(30)
+        self.preset_del_btn.setToolTip("Delete the selected preset")
+        self.preset_del_btn.clicked.connect(self._emit_delete_preset)
+        preset_row.addWidget(QLabel("Preset"))
+        preset_row.addWidget(self.preset_combo, 1)
+        preset_row.addWidget(self.preset_save_btn)
+        preset_row.addWidget(self.preset_apply_btn)
+        preset_row.addWidget(self.preset_del_btn)
+        layout.addLayout(preset_row)
 
         row = QHBoxLayout()
         self.bake_btn = QPushButton("Bake stack")
@@ -963,6 +994,9 @@ class InspectorPanel(QWidget):
         on = clip_id is not None
         self.mode_combo.setEnabled(on)
         self.bake_btn.setEnabled(on)
+        self.random_btn.setEnabled(on)
+        self.preset_save_btn.setEnabled(on)
+        self.preset_apply_btn.setEnabled(on)
         self._form_host.setEnabled(on)
         self._region_host.setEnabled(on)
         self._clip_group.setEnabled(on)
@@ -1053,6 +1087,7 @@ class InspectorPanel(QWidget):
         while self._form.rowCount():
             self._form.removeRow(0)
         self._getters = {}
+        self._param_widgets = {}
         self._clip_ref_combos = []
         if not mode_name:
             return
@@ -1067,6 +1102,49 @@ class InspectorPanel(QWidget):
                 widget.setToolTip(param.help)
             self._form.addRow(param.label or param.name, widget)
             self._getters[param.name] = getter
+            self._param_widgets[param.name] = widget
+
+    # -- presets & randomiser ----------------------------------------------- #
+
+    def set_presets(self, names: List[str]) -> None:
+        cur = self.preset_combo.currentText()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItems(names)
+        if cur in names:
+            self.preset_combo.setCurrentText(cur)
+        self.preset_combo.blockSignals(False)
+
+    def _emit_apply_preset(self) -> None:
+        name = self.preset_combo.currentText()
+        if name:
+            self.presetApplyRequested.emit(name)
+
+    def _emit_delete_preset(self) -> None:
+        name = self.preset_combo.currentText()
+        if name:
+            self.presetDeleteRequested.emit(name)
+
+    def _randomize_editor(self) -> None:
+        """Roll random values into the editor's numeric/choice params."""
+        import random
+        for p in get_mode(self.mode_combo.currentText()).params:
+            w = self._param_widgets.get(p.name)
+            has_range = p.lo is not None and p.hi is not None
+            rand_num = (random.randint(int(p.lo), int(p.hi)) if p.kind == "int"
+                        else round(random.uniform(float(p.lo), float(p.hi)), 2)
+                        ) if has_range else None
+            if isinstance(w, AutoParamWidget):
+                if has_range:
+                    w.auto_chk.setChecked(False)
+                    w.start.setValue(rand_num)
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                if has_range:
+                    w.setValue(rand_num)
+            elif isinstance(w, QCheckBox):
+                w.setChecked(random.random() < 0.5)
+            elif isinstance(w, QComboBox) and p.kind == "choice" and p.choices:
+                w.setCurrentText(str(random.choice(p.choices)))
 
     def _apply_values(self, params: dict) -> None:
         # Reflect an existing op's params back into the controls (best effort).

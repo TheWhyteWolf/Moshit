@@ -668,6 +668,29 @@ def cmd_selftest(args) -> int:
     _check(irel.op(iop.id).region_start == 2 and irel.op(iop.id).region_end == 6,
            "op region survives JSON round-trip", failures)
 
+    print("\nJ. Effect-stack presets")
+    from . import presets as _presets
+    ppath = tmp / "presets.json"
+    _check(_presets.load_presets(ppath) == {},
+           "a missing presets file reads as empty", failures)
+    stack = [{"mode": "bitrot", "params": {"intensity": 0.4},
+              "region": [5, 10], "enabled": True},
+             {"mode": "pframe_duplicate", "params": {"factor": 2},
+              "region": None, "enabled": False}]
+    _presets.save_preset("glitchy", stack, ppath)
+    _presets.save_preset("calm",
+                         [{"mode": "surge", "params": {}, "region": None,
+                           "enabled": True}], ppath)
+    _check(_presets.preset_names(ppath) == ["calm", "glitchy"],
+           "preset_names lists saved presets sorted", failures)
+    _check(_presets.load_presets(ppath)["glitchy"] == stack,
+           "a preset round-trips the stack (mode/params/region/enabled)", failures)
+    _check(_presets.delete_preset("calm", ppath)
+           and _presets.preset_names(ppath) == ["glitchy"],
+           "delete_preset removes a preset", failures)
+    _check(not _presets.delete_preset("nope", ppath),
+           "delete_preset on a missing name returns False", failures)
+
     print()
     if failures:
         print(f"SELFTEST FAILED: {len(failures)} check(s) failed")

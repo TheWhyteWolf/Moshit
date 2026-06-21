@@ -14,8 +14,9 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QMainWindow,
-    QMessageBox, QPushButton, QSpinBox, QSplitter, QVBoxLayout, QWidget,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+    QMainWindow, QMessageBox, QPushButton, QSpinBox, QSplitter, QVBoxLayout,
+    QWidget,
 )
 
 from ..engine import EngineConfig, _ext_for_profile
@@ -191,6 +192,7 @@ class MainWindow(QMainWindow):
         self._wire()
         self._build_shortcuts()
         self.timeline.set_project(self.controller.project)
+        self.inspector.set_presets(self.controller.preset_names())
 
     # -- toolbar ------------------------------------------------------------ #
 
@@ -339,6 +341,9 @@ class MainWindow(QMainWindow):
         self.inspector.effectRemoveRequested.connect(self.controller.remove_effect)
         self.inspector.effectMoveRequested.connect(self.controller.move_effect)
         self.inspector.effectEnabledChanged.connect(self.controller.set_effect_enabled)
+        self.inspector.presetSaveRequested.connect(self._on_preset_save)
+        self.inspector.presetApplyRequested.connect(self._on_preset_apply)
+        self.inspector.presetDeleteRequested.connect(self._on_preset_delete)
         self.inspector.bakeRequested.connect(self._on_bake)
         self.inspector.revertRequested.connect(lambda: c.revert_last_bake())
         self.inspector.clipPropsChanged.connect(self._on_clip_props)
@@ -403,6 +408,26 @@ class MainWindow(QMainWindow):
     def _on_effect_update(self, op_id: str, mode: str, params: dict, region) -> None:
         self.controller.update_effect(op_id, mode, params, region)
         self._schedule_auto_refresh(immediate=True)
+
+    def _on_preset_save(self) -> None:
+        if not self._selected_clip:
+            self.statusBar().showMessage("Select a clip whose stack you want to save.")
+            return
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
+        if ok and name.strip():
+            if self.controller.save_stack_as_preset(self._selected_clip, name.strip()):
+                self.inspector.set_presets(self.controller.preset_names())
+
+    def _on_preset_apply(self, name: str) -> None:
+        if not self._selected_clip:
+            self.statusBar().showMessage("Select a clip to apply the preset to.")
+            return
+        self.controller.apply_preset(self._selected_clip, name)
+        self._schedule_auto_refresh(immediate=True)
+
+    def _on_preset_delete(self, name: str) -> None:
+        self.controller.delete_preset(name)
+        self.inspector.set_presets(self.controller.preset_names())
 
     def _set_auto_refresh(self, on: bool) -> None:
         self.auto_refresh = on

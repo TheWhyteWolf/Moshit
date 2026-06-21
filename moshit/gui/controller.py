@@ -429,6 +429,51 @@ class AppController(QObject):
         self.project_changed.emit()
         self.status.emit(("Enabled " if on else "Disabled ") + op.mode)
 
+    # -- effect-stack presets ----------------------------------------------- #
+
+    def preset_names(self) -> List[str]:
+        from ..presets import preset_names
+        return preset_names()
+
+    def save_stack_as_preset(self, clip_id: str, name: str) -> bool:
+        from ..presets import save_preset
+        effects = []
+        for o in self.project.clip_ops(clip_id):
+            region = ((o.region_start, o.region_end)
+                      if (o.region_start or o.region_end is not None) else None)
+            effects.append({"mode": o.mode, "params": dict(o.params),
+                            "region": list(region) if region else None,
+                            "enabled": o.enabled})
+        if not effects:
+            self.error.emit("This clip has no effects to save as a preset.")
+            return False
+        save_preset(name, effects)
+        self.status.emit(f"Saved preset '{name}'")
+        return True
+
+    def apply_preset(self, clip_id: str, name: str, *, replace: bool = True) -> None:
+        from ..presets import load_presets
+        effects = load_presets().get(name)
+        if not effects:
+            self.error.emit(f"Preset '{name}' is missing or empty.")
+            return
+        self._push_undo()
+        if replace:
+            self.project.mosh_ops = [o for o in self.project.mosh_ops
+                                     if o.target_clip_id != clip_id or o.archived]
+        for e in effects:
+            op = self.project.add_mosh(e["mode"], dict(e.get("params") or {}),
+                                       clip_id)
+            op.region_start, op.region_end = self._region_tuple(e.get("region"))
+            op.enabled = bool(e.get("enabled", True))
+        self.project_changed.emit()
+        self.status.emit(f"Applied preset '{name}'")
+
+    def delete_preset(self, name: str) -> None:
+        from ..presets import delete_preset
+        if delete_preset(name):
+            self.status.emit(f"Deleted preset '{name}'")
+
     def set_clip_props(self, clip_id: str, props: dict):
         """Set a main clip's finishing properties (speed/reverse/fades/crossfade).
 

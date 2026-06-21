@@ -143,6 +143,13 @@ frame). So you can glitch just the middle of a clip, or stack effects that hit
 different parts. Automation ramps over the region when both are set, and the
 range is keyed to the effect's input, so for the first effect it's the clip.
 
+**Presets & randomiser.** **Save…** stores the selected clip's whole stack
+(modes, params, automation, regions, enabled flags) as a named preset; pick one
+from the dropdown and **Apply** to drop it onto another clip (presets live in
+`~/.config/moshit/presets.json`, shared across projects). The **🎲** button rolls
+random values into the parameters below — a fast way to find a look, which you
+then **Add** or **Apply**.
+
 **Generated motion (transforms).** The **Generate** menu makes procedural motion
 sources — zoom in/out, horizontal/vertical pan, and rotate — and drops them on
 the motion track. Each is a static, detailed texture moved by the chosen
