@@ -209,11 +209,16 @@ def cmd_render_project(args) -> int:
     ff = FFmpeg(ffmpeg=args.ffmpeg, ffprobe=args.ffprobe)
     eng = MoshEngine(proj.config, ff)
     load_modes()
-    r = proj.render(eng, args.out, profile=args.export, export_path=args.export_out)
+    r = proj.render(eng, args.out, profile=args.export, export_path=args.export_out,
+                    audio=not args.no_audio)
     print(f"rendered -> {r['moshed_avi']} ({r['frames']} frames, "
           f"{r['clips_rendered']} clips)")
     if "export" in r:
         print(f"exported -> {r['export']}")
+        if "audio" in r:
+            print("  (source audio muxed for clean clips)")
+        elif not args.no_audio:
+            print("  (no source audio found to mux)")
     return 0
 
 
@@ -293,6 +298,16 @@ class _FakeEngine:
         shutil.copy2(moshed_avi, out_avi)
         return parse_avi(out_avi)
 
+    def finish_clips(self, seg_avis, meta, dst):
+        # No ffmpeg: just concatenate the segments so render() completes. The
+        # frame-count math under test is computed in render() before this call,
+        # so a plain concat is enough to exercise it.
+        frames: List[Frame] = []
+        for s in seg_avis:
+            frames.extend(parse_avi(s).frames)
+        write_avi(dst, frames, parse_avi(seg_avis[0]))
+        return Path(dst)
+
 
 def _check(cond: bool, msg: str, failures: List[str]) -> None:
     print(f"  [{'PASS' if cond else 'FAIL'}] {msg}")
@@ -367,7 +382,7 @@ def cmd_selftest(args) -> int:
            "pframe_duplicate leaves I-frames untouched", failures)
 
     print("\nC. Project non-destructive bake / revert (no ffmpeg)")
-    from .project import MediaItem, Project
+    from .project import Clip, MediaItem, Project
 
     fake = _FakeEngine()
     proj = Project(name="t", assets_dir=str(tmp / "assets"))
@@ -425,6 +440,146 @@ def cmd_selftest(args) -> int:
     _check(len(proj.main_clips()) == 1,
            "timeline back to original single clip after revert", failures)
 
+    print("\nD. Clip editing (duplicate / split)")
+    edit_main = add_media("editbase", "main", "IPPPPPPPPP")     # 10 frames
+    ec = proj.add_clip(edit_main, "main")
+    proj.add_mosh("pframe_duplicate", {"factor": 2}, ec.id)
+    before_clips, before_ops = len(proj.clips), len(proj.mosh_ops)
+    dup = proj.duplicate_clip(ec.id)
+    _check(dup is not None and len(proj.clips) == before_clips + 1,
+           "duplicate_clip adds one clip", failures)
+    _check(dup.media_id == ec.media_id and dup.in_point == ec.in_point
+           and dup.out_point == ec.out_point,
+           "duplicate shares the source media and trim", failures)
+    _check(len(proj.mosh_ops) == before_ops + 1
+           and any(o.target_clip_id == dup.id for o in proj.mosh_ops),
+           "duplicate copies the clip's effect onto the copy", failures)
+
+    second = proj.split_clip(dup.id, 4)                          # 4-frame head + 6
+    _check(second is not None and proj._clip_length(dup) == 4,
+           "split leaves the original as a 4-frame head", failures)
+    _check(second is not None and proj._clip_length(second) == 6,
+           "split second half holds the 6-frame remainder", failures)
+    _check(proj.split_clip(dup.id, 0) is None,
+           "split at offset 0 is rejected", failures)
+
+    print("\nE. Audio passthrough plan")
+    aproj = Project(name="a", assets_dir=str(tmp / "assets_a"))
+
+    def add_amedia(label, types_, derived=False):
+        mid = f"amedia_{label}"
+        p = tmp / f"a_{label}.avi"
+        _synth_avi(p, types_)
+        dest = aproj.assets_dir / f"{mid}.avi"
+        dest.write_bytes(p.read_bytes())
+        cav = parse_avi(dest)
+        aproj.media[mid] = MediaItem(
+            id=mid, source_path=str(p), label=label, role="main",
+            intermediate_path=str(dest), width=cav.width, height=cav.height,
+            fps=cav.fps, nb_frames=len(cav.frames), derived=derived)
+        aproj._parsed[mid] = cav
+        return mid
+
+    aproj.add_clip(add_amedia("clean", "IPPPPPPPPP"), "main")           # 10 frames
+    mclip = aproj.add_clip(add_amedia("moshy", "IPPPPPPPPP"), "main")
+    aproj.add_mosh("pframe_duplicate", {"factor": 2}, mclip.id)         # 10 -> 19
+    aproj.add_clip(add_amedia("baked", "IPPPP", derived=True), "main")  # 5 frames
+    ar = aproj.render(fake, tmp / "a_render.avi")
+    plan = ar.get("audio_plan", [])
+    fps = aproj.config.fps
+    _check(len(plan) == 3, "audio plan has one segment per main clip", failures)
+    _check(bool(plan) and plan[0]["silent"] is False
+           and abs(plan[0]["duration"] - 10 / fps) < 1e-9,
+           "clean clip keeps audio, duration matches its frames", failures)
+    _check(len(plan) > 1 and plan[1]["silent"] is False
+           and abs(plan[1]["duration"] - 19 / fps) < 1e-9,
+           "moshed clip keeps audio at its retimed (19-frame) length", failures)
+    _check(len(plan) > 2 and plan[2]["silent"] is True,
+           "baked clip is silent (source audio can't map to it)", failures)
+    _check(abs(sum(s["duration"] for s in plan) - ar["frames"] / fps) < 1e-9,
+           "audio plan total duration matches the rendered video", failures)
+
+    print("\nF. Clean-edit finishing (speed / crossfade) length math")
+    fproj = Project(name="f", assets_dir=str(tmp / "assets_f"))
+
+    def add_fmedia(label, types_):
+        mid = f"fmedia_{label}"
+        p = tmp / f"f_{label}.avi"
+        _synth_avi(p, types_)
+        dest = fproj.assets_dir / f"{mid}.avi"
+        dest.write_bytes(p.read_bytes())
+        cav = parse_avi(dest)
+        fproj.media[mid] = MediaItem(
+            id=mid, source_path=str(p), label=label, role="main",
+            intermediate_path=str(dest), width=cav.width, height=cav.height,
+            fps=cav.fps, nb_frames=len(cav.frames))
+        fproj._parsed[mid] = cav
+        return mid
+
+    c0 = fproj.add_clip(add_fmedia("a", "I" + "P" * 11), "main")   # 12 frames
+    c0.speed = 2.0
+    c1 = fproj.add_clip(add_fmedia("b", "I" + "P" * 9), "main")    # 10 frames
+    c1.transition_in = 4
+    _check(fproj._clip_length(c0) == 6,
+           "2x speed: 12 source frames -> 6 timeline frames", failures)
+    _check(fproj._clip_length(c1) == 10, "no speed: length unchanged", failures)
+    _check(c0.has_finish() and not Clip(id="z", media_id="m", track="main").has_finish(),
+           "has_finish() detects finishing vs. a plain clip", failures)
+    fr = fproj.render(fake, tmp / "f.avi")
+    _check(fr["frames"] == 12,
+           "crossfade overlap subtracts from the total (6 + 10 - 4 = 12)", failures)
+    fplan = fr["audio_plan"]
+    ffps = fproj.config.fps
+    _check(fplan[0]["speed"] == 2.0
+           and abs(fplan[0]["duration"] - 6 / ffps) < 1e-9,
+           "audio plan carries speed and the finished duration", failures)
+    _check(fplan[1]["transition_in"] == 4,
+           "audio plan carries the crossfade length", failures)
+
+    print("\nG. Effect stacking (multiple ops per clip)")
+    gproj = Project(name="g", assets_dir=str(tmp / "assets_g"))
+
+    def add_gmedia(label, types_):
+        mid = f"gmedia_{label}"
+        p = tmp / f"g_{label}.avi"
+        _synth_avi(p, types_)
+        dest = gproj.assets_dir / f"{mid}.avi"
+        dest.write_bytes(p.read_bytes())
+        cav = parse_avi(dest)
+        gproj.media[mid] = MediaItem(
+            id=mid, source_path=str(p), label=label, role="main",
+            intermediate_path=str(dest), width=cav.width, height=cav.height,
+            fps=cav.fps, nb_frames=len(cav.frames))
+        gproj._parsed[mid] = cav
+        return mid
+
+    gc = gproj.add_clip(add_gmedia("stack", "I" + "P" * 9), "main")   # 1 I + 9 P
+    o1 = gproj.add_mosh("pframe_duplicate", {"factor": 2}, gc.id)
+    o2 = gproj.add_mosh("pframe_duplicate", {"factor": 2}, gc.id)
+    _check([o.id for o in gproj.clip_ops(gc.id)] == [o1.id, o2.id],
+           "two ops stack on one clip, in add order", failures)
+    gr = gproj.render(fake, tmp / "g.avi")
+    # op1: 9P -> 18P (19 frames); op2: 18P -> 36P (37 frames)
+    _check(gr["frames"] == 37,
+           "stacked ops apply in sequence (9P -> 18P -> 36P, +I = 37)", failures)
+    _check(gproj.move_mosh(o2.id, -1)
+           and [o.id for o in gproj.clip_ops(gc.id)] == [o2.id, o1.id],
+           "move_mosh reorders the stack", failures)
+    _check(gproj.remove_mosh(o1.id)
+           and [o.id for o in gproj.clip_ops(gc.id)] == [o2.id],
+           "remove_mosh drops an op from the stack", failures)
+    _check(not gproj.remove_mosh("nope"), "remove_mosh on a missing id is a no-op",
+           failures)
+
+    o3 = gproj.add_mosh("pframe_duplicate", {"factor": 2}, gc.id)      # stack of 2
+    grec = gproj.bake_clip(fake, gc.id)
+    _check(gproj.clip(gc.id).archived
+           and all(gproj.op(o.id).archived for o in (o2, o3)),
+           "bake_clip archives the clip and every op in its stack", failures)
+    _check(grec.baked_clip_id in {c.id for c in gproj.clips}
+           and len(gproj.clip_ops(grec.baked_clip_id)) == 0,
+           "bake_clip yields a baked clip with an empty stack", failures)
+
     print()
     if failures:
         print(f"SELFTEST FAILED: {len(failures)} check(s) failed")
@@ -477,6 +632,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", required=True, help="output moshed .avi")
     sp.add_argument("--export", default=None)
     sp.add_argument("--export-out", default=None)
+    sp.add_argument("--no-audio", action="store_true",
+                    help="do not mux source audio into the export")
     sp.set_defaults(func=cmd_render_project)
 
     sp = sub.add_parser("selftest", help="pure-Python checks (no ffmpeg)")

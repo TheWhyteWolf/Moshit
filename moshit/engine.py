@@ -140,9 +140,23 @@ class MoshEngine:
         return avi.parse_avi(out_avi)
 
     def export(self, src_avi, out_path, profile: str,
-               hwaccel: Optional[str] = None) -> Path:
-        self.ff.export(src_avi, out_path, profile, hwaccel=hwaccel)
+               hwaccel: Optional[str] = None, audio_path=None) -> Path:
+        self.ff.export(src_avi, out_path, profile, hwaccel=hwaccel,
+                       audio_path=audio_path)
         return Path(out_path)
+
+    def build_audio(self, plan, dst, *, fps: Optional[float] = None):
+        """Assemble a passthrough audio track from a render's audio plan.
+
+        Returns the written path, or None if there was no real audio to place.
+        """
+        return self.ff.build_audio_track(plan, dst, fps=fps or self.config.fps)
+
+    def finish_clips(self, segments, meta, dst):
+        """Pixel-domain finish pass: apply per-clip speed/reverse/fade and fold
+        clips with crossfade/hard-cut. Returns the finished AVI path."""
+        return self.ff.finish_video(segments, meta, dst, fps=self.config.fps,
+                                    gop=self.config.gop, qscale=self.config.qscale)
 
     # -- convenience: end-to-end two-clip mosh ------------------------------ #
 

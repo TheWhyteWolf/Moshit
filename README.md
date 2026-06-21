@@ -63,10 +63,10 @@ see `No module named 'moshit'`, you're one level too deep; `cd` up. After
 
 Typical flow: **Import video** (one import; the clip is then available to either
 track) → select it in the library and **Add to main** or **Add to motion** → click
-the base clip → pick an effect (e.g. `motion_splice`) and choose a motion source →
-**Apply & Preview** → scrub or play the result → **Bake** to freeze it
-(reversible) → **Export…**. A clip can sit on both tracks at once, and any
-imported clip can be used as a motion source.
+the base clip → pick an effect (e.g. `motion_splice`), choose a motion source, and
+**+ Add** it to the clip's effect stack → scrub or play the result → stack more
+effects, or **Bake stack** to freeze it (reversible) → **Export…**. A clip can sit
+on both tracks at once, and any imported clip can be used as a motion source.
 
 ## The app
 
@@ -83,18 +83,50 @@ under the timeline:
   either edge to trim its start or end.
 - **Cut** — click a clip to split it at that frame into two clips.
 
-Delete (or right-click → Remove) takes a clip off the timeline. **Undo** and
-**Redo** (Ctrl+Z / Ctrl+Shift+Z, under the Edit menu) cover timeline and effect
-edits — add, move, trim, cut, remove, and effect changes. Baking is a commit
-point: it starts a fresh undo history, and is separately reversible with **Revert
-bake**. Edits re-render the preview automatically after a short pause; toggle
-**Auto-refresh** off in the toolbar to render only on demand with **Refresh
-preview** (useful on large projects).
+You can also **split at the playhead** (`S`, or Edit → Split at playhead) and
+**duplicate** a clip with its effect (`Ctrl+D`, or right-click → Duplicate);
+right-click a clip for those plus Remove. Delete (or right-click → Remove) takes
+a clip off the timeline. **Undo** and **Redo** (Ctrl+Z / Ctrl+Shift+Z, under the
+Edit menu) cover timeline and effect edits — add, move, trim, cut, duplicate,
+remove, and effect changes. Baking is a commit point: it starts a fresh undo
+history, and is separately reversible with **Revert bake**. Edits re-render the
+preview automatically after a short pause; toggle **Auto-refresh** off in the
+toolbar to render only on demand with **Refresh preview** (useful on large
+projects).
 
 **Preview.** Frames are decoded with FFmpeg, so the GUI needs nothing beyond
 PySide6 — no extra media libraries. The preview streams in as it decodes (you see
 it build rather than waiting on a frozen window), and your scrub position is kept
 across re-renders so iterating on an effect doesn't jump you back to the start.
+The transport has play/pause (`Space`), single-frame step (`,` / `.`),
+jump-to-start/end (`Home` / `End`), a **Loop** toggle, and a timecode readout
+(`frame / frame · mm:ss:ff`). **File → Save frame as image…** (`Ctrl+Shift+S`)
+writes the current frame as a full-resolution PNG.
+
+**Sequence settings.** Every clip is normalised to one resolution and frame rate
+on import, so you pick them up front: **New project** (`Ctrl+N`) opens a settings
+dialog with presets (720p, 1080p, vertical, …) or a custom size, and **File →
+Project settings…** changes them while the project is still empty. They lock once
+media is imported.
+
+**Clip finishing (speed · reverse · fades · crossfade).** Selecting a main clip
+shows clip controls above the effect inspector: **Speed** (e.g. 2× / 0.5×),
+**Reverse**, **Fade in** / **Fade out** (to/from black, in frames), and
+**Crossfade ⟵** (dissolve in from the previous clip over N frames). These are
+clean, pixel-domain edits — distinct from the codec-domain mosh effects — so they
+compose with moshing: you can mosh a clip *and* slow it, reverse it, or dissolve
+into it. They only kick in a re-encode when used; plain moshing keeps the fast
+codec-only path. Speed shows on the timeline as a `2×` badge (reverse `⇄`, fades
+`⊳`/`⊲`), and a crossfade shows as a corner wedge on the clip it fades into.
+
+**Effect stacks.** A clip holds a *stack* of effects, applied top to bottom — so
+glitches compound (e.g. `pframe_duplicate` → `bitrot` → `pframe_shuffle`). The
+inspector lists the stack: **+ Add** appends the effect configured below, **↑/↓**
+reorder it (order changes the look), the per-row checkbox enables/disables an
+effect without removing it, and **− Remove** deletes it. Select a row to edit that
+effect's mode and parameters, then **Apply to selected effect**. **Bake stack**
+freezes the whole chain into one clip (reversible), leaving the clip's finishing
+editable.
 
 **Generated motion (transforms).** The **Generate** menu makes procedural motion
 sources — zoom in/out, horizontal/vertical pan, and rotate — and drops them on
@@ -188,6 +220,11 @@ python -m moshit.cli modes
 mosh and the intermediate are always CPU — only MPEG-4 Part 2 is moshable, and no
 GPU produces it.
 
+Export reassembles audio from the original source clips and muxes it in (the GUI
+export dialog has an **Include audio** toggle; `render-project` does it by
+default, disable with `--no-audio`). The audio track is built to the rendered
+video's exact length, so trims, cuts and reorders stay in sync.
+
 ### Non-destructive projects
 
 Editing is non-destructive: source files are never modified, and **baking** a
@@ -269,15 +306,30 @@ third-party modes like any script you install.)
 
 ## Known limits (v1)
 
-- The main track is a sequence of non-overlapping clips; a mosh targets one clip
-  and may pull motion from a clip on the motion track. Overlapping / compositing
-  tracks are future work.
+- The main track is a sequence of clips laid out contiguously; a mosh targets one
+  clip and may pull motion from a clip on the motion track. A crossfade overlaps
+  two clips at render time, but the timeline still draws them edge-to-edge (with a
+  marker) — full compositing tracks are future work.
 - Clip trims snap to the nearest preceding keyframe so every clip stays
   decodable (GOP-based editing; for frame-exact cuts, use a smaller GOP).
-- Audio is dropped in the moshable intermediate — v1 is video-only.
+- Audio is reassembled from the original sources and muxed on **export** (the
+  moshable intermediate stays video-only). Clean edits stay perfectly in sync;
+  moshed clips keep their source audio padded/trimmed to the retimed length;
+  baked clips are silent. The **preview is silent** — audio lands in the
+  exported file — and export needs the source files still on disk.
 - Baking re-encodes (one generation of MPEG-4 recompression) in exchange for a
   clean, predictable, re-moshable clip.
 
 ## Roadmap
+
+Remaining basic-editing polish:
+
+- **Preview audio** — audio currently lands only in the export; playing it back,
+  synced to the frame stepper, is the remaining piece of audio support.
+- **Visual crossfade overlap** — crossfades render correctly, but the timeline
+  still lays clips out contiguously (with a corner marker) rather than drawing
+  the true overlap; a compositing track is the longer-term home for that.
+
+And, on the glitch side:
 
 - A pixel-domain optical-flow effect (GPU) for appearance-free motion transfer.

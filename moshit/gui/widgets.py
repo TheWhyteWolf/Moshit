@@ -125,6 +125,7 @@ class TimelineWidget(QWidget):
     removeRequested = Signal(str)
     seekRequested = Signal(float)                  # scrub position, 0..1
     splitRequested = Signal(str, int)              # clip_id, offset frames
+    duplicateRequested = Signal(str)               # clip_id
 
     RULER_H = 20
     LANE_H = 46
@@ -277,10 +278,29 @@ class TimelineWidget(QWidget):
         label = media.label if media else clip.id
         if media and media.derived:
             label += " (baked)"
+        badges = []
+        if abs(getattr(clip, "speed", 1.0) - 1.0) > 1e-6:
+            badges.append(f"{clip.speed:g}×")
+        if getattr(clip, "reverse", False):
+            badges.append("⇄")
+        if getattr(clip, "fade_in", 0):
+            badges.append("⊳")
+        if getattr(clip, "fade_out", 0):
+            badges.append("⊲")
+        suffix = ("   " + " ".join(badges)) if badges else ""
         p.setPen(QColor("#eef1f6"))
         p.drawText(rect.adjusted(5, 0, -3, 0),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                   f"{label}  {length}f")
+                   f"{label}  {length}f{suffix}")
+        # crossfade-from-previous marker: a small wedge on the left edge
+        if getattr(clip, "transition_in", 0) and not motion:
+            p.setBrush(QColor("#ffd166"))
+            p.setPen(Qt.PenStyle.NoPen)
+            tl = rect.topLeft()
+            p.drawPolygon(QPolygon([QPoint(tl.x(), tl.y()),
+                                    QPoint(tl.x() + 11, tl.y()),
+                                    QPoint(tl.x(), tl.y() + 11)]))
+            p.setBrush(Qt.BrushStyle.NoBrush)
 
     # -- hit testing -------------------------------------------------------- #
 
@@ -298,6 +318,23 @@ class TimelineWidget(QWidget):
             if x > rect.center().x():
                 idx += 1
         return idx
+
+    def request_split_at_playhead(self) -> None:
+        """Split the main-track clip under the playhead at its current frame.
+
+        The standard NLE 'split at the cursor' action: mirrors a Cut-tool click
+        located at the playhead, so it stays consistent with the ruler.
+        """
+        if not self._project or not self._hits:
+            return
+        x0, x1 = self._track_x()
+        px = int(x0 + self._play_frac * max(1, x1 - x0))
+        for rect, cid, track in self._hits:
+            if track == "main" and rect.left() <= px <= rect.right():
+                offset = round((px - rect.left()) / self._ppf())
+                if offset > 0:
+                    self.splitRequested.emit(cid, offset)
+                return
 
     # -- interaction -------------------------------------------------------- #
 
@@ -391,10 +428,26 @@ class TimelineWidget(QWidget):
         hit = self._hit(event.pos())
         if not hit:
             return
+        clip_id, track = hit[1], hit[2]
+        self._selected = clip_id
+        self.clipSelected.emit(clip_id)
+        self.update()
         menu = QMenu(self)
-        act = menu.addAction("Remove from timeline")
-        if menu.exec(event.globalPos()) == act:
-            self.removeRequested.emit(hit[1])
+        act_dup = menu.addAction("Duplicate clip")
+        act_split = None
+        if track == "main":
+            act_split = menu.addAction("Split at playhead")
+        menu.addSeparator()
+        act_remove = menu.addAction("Remove from timeline")
+        chosen = menu.exec(event.globalPos())
+        if chosen is None:
+            return
+        if chosen == act_dup:
+            self.duplicateRequested.emit(clip_id)
+        elif chosen == act_split:
+            self.request_split_at_playhead()
+        elif chosen == act_remove:
+            self.removeRequested.emit(clip_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -411,6 +464,7 @@ class PreviewWidget(QWidget):
         self._idx = 0
         self._restore_frac: Optional[float] = None
         self._streaming = False
+        self._loop = False
 
         layout = QVBoxLayout(self)
         layout.addWidget(_heading("Preview"))
@@ -430,11 +484,37 @@ class PreviewWidget(QWidget):
         layout.addWidget(self.slider)
 
         controls = QHBoxLayout()
+        controls.setSpacing(4)
+
+        def _tbtn(text: str, tip: str, slot) -> QPushButton:
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setMaximumWidth(34)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # keep keyboard shortcuts working
+            b.setEnabled(False)
+            b.clicked.connect(slot)
+            return b
+
+        self.start_btn = _tbtn("⏮", "Jump to start (Home)", self.go_start)
+        self.prev_btn = _tbtn("◀", "Previous frame (,)", lambda: self.step(-1))
         self.play_btn = QPushButton("Play")
+        self.play_btn.setToolTip("Play / pause (Space)")
         self.play_btn.setEnabled(False)
-        self.play_btn.clicked.connect(self._toggle)
+        self.play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.play_btn.clicked.connect(self.toggle)
+        self.next_btn = _tbtn("▶", "Next frame (.)", lambda: self.step(1))
+        self.end_btn = _tbtn("⏭", "Jump to end (End)", self.go_end)
+
+        self.loop_chk = QCheckBox("Loop")
+        self.loop_chk.setToolTip("Repeat playback from the start")
+        self.loop_chk.toggled.connect(self._set_loop)
+
         self.frame_lbl = QLabel("0 / 0")
-        controls.addWidget(self.play_btn)
+        for w in (self.start_btn, self.prev_btn, self.play_btn,
+                  self.next_btn, self.end_btn):
+            controls.addWidget(w)
+        controls.addSpacing(8)
+        controls.addWidget(self.loop_chk)
         controls.addStretch(1)
         controls.addWidget(self.frame_lbl)
         layout.addLayout(controls)
@@ -446,6 +526,60 @@ class PreviewWidget(QWidget):
         n = len(self._frames)
         return (self._idx / (n - 1)) if n > 1 else None
 
+    def _set_transport_enabled(self, on: bool) -> None:
+        for b in (self.start_btn, self.prev_btn, self.play_btn,
+                  self.next_btn, self.end_btn):
+            b.setEnabled(on)
+
+    def _set_loop(self, on: bool) -> None:
+        self._loop = bool(on)
+
+    def _timecode(self, frame: int) -> str:
+        fps = max(1.0, self._fps)
+        per_sec = max(1, round(fps))
+        frame = max(0, int(frame))
+        secs, ff = divmod(frame, per_sec)
+        return f"{secs // 60:02d}:{secs % 60:02d}:{ff:02d}"
+
+    def _update_frame_label(self) -> None:
+        n = len(self._frames)
+        last = max(0, n - 1)
+        self.frame_lbl.setText(
+            f"{self._idx} / {last}   ·   "
+            f"{self._timecode(self._idx)} / {self._timecode(last)}")
+
+    # -- public transport (also driven by window shortcuts) ----------------- #
+
+    def toggle(self) -> None:
+        if self.timer.isActive():
+            self.timer.stop()
+            self.play_btn.setText("Play")
+        elif self._frames:
+            self.timer.start(int(1000 / max(1.0, self._fps)))
+            self.play_btn.setText("Pause")
+
+    def step(self, delta: int) -> None:
+        if not self._frames:
+            return
+        self.timer.stop()
+        self.play_btn.setText("Play")
+        self.slider.setValue(max(0, min(self._idx + int(delta),
+                                        len(self._frames) - 1)))
+
+    def go_start(self) -> None:
+        if self._frames:
+            self.slider.setValue(0)
+
+    def go_end(self) -> None:
+        if self._frames:
+            self.slider.setValue(len(self._frames) - 1)
+
+    def current_index(self) -> int:
+        return self._idx
+
+    def current_image(self) -> Optional[QImage]:
+        return self._frames[self._idx] if self._frames else None
+
     def set_frames(self, frames: List[QImage], fps: float) -> None:
         """Replace all frames at once, keeping the scrub position if possible."""
         frac = self._current_fraction()
@@ -455,7 +589,7 @@ class PreviewWidget(QWidget):
         self._fps = fps or 30.0
         has = bool(frames)
         self.slider.setEnabled(has)
-        self.play_btn.setEnabled(has)
+        self._set_transport_enabled(has)
         self.slider.blockSignals(True)
         self.slider.setRange(0, max(0, len(frames) - 1))
         self.slider.blockSignals(False)
@@ -478,7 +612,7 @@ class PreviewWidget(QWidget):
         self._idx = 0
         self._streaming = True
         self.slider.setEnabled(False)
-        self.play_btn.setEnabled(False)
+        self._set_transport_enabled(False)
 
     def append_frames(self, frames: List[QImage]) -> None:
         if not frames:
@@ -490,17 +624,17 @@ class PreviewWidget(QWidget):
         self.slider.setRange(0, max(0, n - 1))
         self.slider.blockSignals(False)
         self.slider.setEnabled(True)
-        self.play_btn.setEnabled(True)
+        self._set_transport_enabled(True)
         if was_empty:
             self._show(0)                                # show something at once
         else:
-            self.frame_lbl.setText(f"{self._idx} / {n - 1}")
+            self._update_frame_label()
 
     def end_stream(self) -> None:
         self._streaming = False
         if not self._frames:
             self.slider.setEnabled(False)
-            self.play_btn.setEnabled(False)
+            self._set_transport_enabled(False)
             self.view.setText("Preview produced no frames.")
             return
         if self._restore_frac is not None and len(self._frames) > 1:
@@ -526,26 +660,24 @@ class PreviewWidget(QWidget):
         self.view.setPixmap(pix.scaled(
             self.view.size(), Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation))
-        self.frame_lbl.setText(f"{idx} / {len(self._frames) - 1}")
+        self._update_frame_label()
         self.frameChanged.emit(idx)
 
     def _on_slider(self, value: int) -> None:
         if value != self._idx:
             self._show(value)
 
-    def _toggle(self) -> None:
-        if self.timer.isActive():
-            self.timer.stop()
-            self.play_btn.setText("Play")
-        elif self._frames:
-            self.timer.start(int(1000 / max(1.0, self._fps)))
-            self.play_btn.setText("Pause")
-
     def _advance(self) -> None:
         if not self._frames:
             return
-        nxt = (self._idx + 1) % len(self._frames)
-        self.slider.setValue(nxt)        # triggers _show via _on_slider
+        if self._idx + 1 >= len(self._frames):       # reached the end
+            if self._loop:
+                self.slider.setValue(0)
+            else:
+                self.timer.stop()
+                self.play_btn.setText("Play")
+            return
+        self.slider.setValue(self._idx + 1)          # triggers _show via _on_slider
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -558,9 +690,14 @@ class PreviewWidget(QWidget):
 # --------------------------------------------------------------------------- #
 
 class InspectorPanel(QWidget):
-    applyRequested = Signal(str, dict)        # mode, params
+    effectAddRequested = Signal(str, dict)         # mode, params
+    effectUpdateRequested = Signal(str, str, dict)  # op_id, mode, params
+    effectRemoveRequested = Signal(str)            # op_id
+    effectMoveRequested = Signal(str, int)         # op_id, delta (-1 up / +1 down)
+    effectEnabledChanged = Signal(str, bool)       # op_id, enabled
     bakeRequested = Signal()
     revertRequested = Signal()
+    clipPropsChanged = Signal(dict)                # speed/reverse/fades/transition
 
     def __init__(self):
         super().__init__()
@@ -568,13 +705,42 @@ class InspectorPanel(QWidget):
         self._clip_ref_combos: List[QComboBox] = []
         self._motion_labels: List[str] = []
         self._clip_id: Optional[str] = None
+        self._populating = False
+        self._effects: List[dict] = []
+        self._selected_op: Optional[str] = None
 
         layout = QVBoxLayout(self)
-        layout.addWidget(_heading("Effect"))
+        layout.addWidget(_heading("Inspector"))
 
         self.clip_lbl = QLabel("Select a clip on the main track.")
         self.clip_lbl.setWordWrap(True)
         layout.addWidget(self.clip_lbl)
+        layout.addWidget(self._build_clip_group())
+
+        layout.addWidget(_heading("Effects (top → bottom)"))
+        self.effect_list = QListWidget()
+        self.effect_list.setMaximumHeight(108)
+        self.effect_list.setToolTip("This clip's effect stack, applied top to "
+                                    "bottom. Toggle the checkbox to enable/disable.")
+        self.effect_list.currentRowChanged.connect(self._on_effect_row)
+        self.effect_list.itemChanged.connect(self._on_effect_item_changed)
+        layout.addWidget(self.effect_list)
+
+        stack_btns = QHBoxLayout()
+        self.add_btn = QPushButton("+ Add")
+        self.add_btn.setToolTip("Add the effect configured below to the stack")
+        self.add_btn.clicked.connect(self._emit_add)
+        self.remove_btn = QPushButton("− Remove")
+        self.remove_btn.clicked.connect(self._emit_remove)
+        self.up_btn = QPushButton("↑")
+        self.up_btn.setMaximumWidth(32)
+        self.up_btn.clicked.connect(lambda: self._emit_move(-1))
+        self.down_btn = QPushButton("↓")
+        self.down_btn.setMaximumWidth(32)
+        self.down_btn.clicked.connect(lambda: self._emit_move(1))
+        for b in (self.add_btn, self.remove_btn, self.up_btn, self.down_btn):
+            stack_btns.addWidget(b)
+        layout.addLayout(stack_btns)
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(available_modes())
@@ -591,12 +757,12 @@ class InspectorPanel(QWidget):
         self._form.setContentsMargins(0, 4, 0, 4)
         layout.addWidget(self._form_host)
 
-        self.apply_btn = QPushButton("Apply && Preview")
-        self.apply_btn.clicked.connect(self._emit_apply)
+        self.apply_btn = QPushButton("Apply to selected effect")
+        self.apply_btn.clicked.connect(self._emit_update)
         layout.addWidget(self.apply_btn)
 
         row = QHBoxLayout()
-        self.bake_btn = QPushButton("Bake")
+        self.bake_btn = QPushButton("Bake stack")
         self.bake_btn.clicked.connect(lambda: self.bakeRequested.emit())
         self.revert_btn = QPushButton("Revert bake")
         self.revert_btn.clicked.connect(lambda: self.revertRequested.emit())
@@ -607,6 +773,65 @@ class InspectorPanel(QWidget):
 
         self.set_enabled_for_clip(None, None)
         self._rebuild_params(self.mode_combo.currentText())
+
+    # -- clip finishing (speed / reverse / fades / crossfade) --------------- #
+
+    def _build_clip_group(self) -> QWidget:
+        group = QWidget()
+        form = QFormLayout(group)
+        form.setContentsMargins(0, 2, 0, 6)
+
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setRange(0.1, 8.0)
+        self.speed_spin.setSingleStep(0.25)
+        self.speed_spin.setValue(1.0)
+        self.speed_spin.setToolTip("Playback speed (2 = twice as fast, 0.5 = half)")
+        self.reverse_chk = QCheckBox("Reverse")
+        self.fadein_spin = QSpinBox()
+        self.fadein_spin.setRange(0, 600)
+        self.fadein_spin.setSuffix(" f")
+        self.fadeout_spin = QSpinBox()
+        self.fadeout_spin.setRange(0, 600)
+        self.fadeout_spin.setSuffix(" f")
+        self.xfade_spin = QSpinBox()
+        self.xfade_spin.setRange(0, 600)
+        self.xfade_spin.setSuffix(" f")
+        self.xfade_spin.setToolTip("Crossfade in from the previous clip over this "
+                                   "many frames (0 = hard cut)")
+
+        form.addRow("Speed ×", self.speed_spin)
+        form.addRow("", self.reverse_chk)
+        form.addRow("Fade in", self.fadein_spin)
+        form.addRow("Fade out", self.fadeout_spin)
+        form.addRow("Crossfade ⟵", self.xfade_spin)
+
+        self.speed_spin.valueChanged.connect(self._emit_clip_props)
+        self.reverse_chk.toggled.connect(self._emit_clip_props)
+        self.fadein_spin.valueChanged.connect(self._emit_clip_props)
+        self.fadeout_spin.valueChanged.connect(self._emit_clip_props)
+        self.xfade_spin.valueChanged.connect(self._emit_clip_props)
+        self._clip_group = group
+        return group
+
+    def _emit_clip_props(self) -> None:
+        if self._populating:                  # don't echo back our own population
+            return
+        self.clipPropsChanged.emit({
+            "speed": self.speed_spin.value(),
+            "reverse": self.reverse_chk.isChecked(),
+            "fade_in": self.fadein_spin.value(),
+            "fade_out": self.fadeout_spin.value(),
+            "transition_in": self.xfade_spin.value(),
+        })
+
+    def _populate_clip_props(self, clip) -> None:
+        self._populating = True
+        self.speed_spin.setValue(float(getattr(clip, "speed", 1.0)))
+        self.reverse_chk.setChecked(bool(getattr(clip, "reverse", False)))
+        self.fadein_spin.setValue(int(getattr(clip, "fade_in", 0)))
+        self.fadeout_spin.setValue(int(getattr(clip, "fade_out", 0)))
+        self.xfade_spin.setValue(int(getattr(clip, "transition_in", 0)))
+        self._populating = False
 
     # -- external state ----------------------------------------------------- #
 
@@ -620,22 +845,90 @@ class InspectorPanel(QWidget):
                 combo.setCurrentText(current)
 
     def set_enabled_for_clip(self, clip_id: Optional[str], label: Optional[str],
-                             mode: Optional[str] = None,
-                             params: Optional[dict] = None) -> None:
+                             clip=None, effects: Optional[List[dict]] = None) -> None:
         self._clip_id = clip_id
         on = clip_id is not None
         self.mode_combo.setEnabled(on)
-        self.apply_btn.setEnabled(on)
         self.bake_btn.setEnabled(on)
         self._form_host.setEnabled(on)
+        self._clip_group.setEnabled(on)
+        self.effect_list.setEnabled(on)
         if on:
             self.clip_lbl.setText(f"Clip: <b>{label}</b>")
-            if mode and mode != self.mode_combo.currentText():
-                self.mode_combo.setCurrentText(mode)   # triggers rebuild
-            if params:
-                self._apply_values(params)
+            self._populate_clip_props(clip if clip is not None else object())
+            self.set_clip_effects(effects or [])
         else:
             self.clip_lbl.setText("Select a clip on the main track.")
+            self._populate_clip_props(object())        # reset to defaults
+            self.set_clip_effects([])
+        self._update_stack_buttons()
+
+    # -- effect stack ------------------------------------------------------- #
+
+    def set_clip_effects(self, effects: List[dict]) -> None:
+        """Populate the stack list. *effects*: [{id, mode, params, enabled}]."""
+        self._effects = list(effects or [])
+        prev = self._selected_op
+        self._populating = True
+        self.effect_list.clear()
+        for e in self._effects:
+            item = QListWidgetItem(e["mode"])
+            item.setData(Qt.ItemDataRole.UserRole, e["id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            enabled = e.get("enabled", True)
+            item.setCheckState(Qt.CheckState.Checked if enabled
+                               else Qt.CheckState.Unchecked)
+            if not enabled:
+                item.setForeground(QColor("#6a7280"))
+            self.effect_list.addItem(item)
+        row = next((i for i, e in enumerate(self._effects) if e["id"] == prev), -1)
+        if row < 0 and self._effects:
+            row = len(self._effects) - 1          # default to the newest
+        self._populating = False
+        if row >= 0:
+            self.effect_list.setCurrentRow(row)   # -> _on_effect_row populates editor
+        else:
+            self._selected_op = None
+            self._update_stack_buttons()
+
+    def _on_effect_row(self, row: int) -> None:
+        if self._populating:
+            return
+        if 0 <= row < len(self._effects):
+            e = self._effects[row]
+            self._selected_op = e["id"]
+            self._load_effect(e["mode"], e["params"])
+        else:
+            self._selected_op = None
+        self._update_stack_buttons()
+
+    def _load_effect(self, mode: str, params: dict) -> None:
+        self._populating = True
+        if mode and mode != self.mode_combo.currentText():
+            self.mode_combo.setCurrentText(mode)   # triggers _rebuild_params
+        else:
+            self._rebuild_params(self.mode_combo.currentText())
+        if params:
+            self._apply_values(params)
+        self._populating = False
+
+    def _on_effect_item_changed(self, item: QListWidgetItem) -> None:
+        if self._populating:
+            return
+        self.effectEnabledChanged.emit(
+            item.data(Qt.ItemDataRole.UserRole),
+            item.checkState() == Qt.CheckState.Checked)
+
+    def _update_stack_buttons(self) -> None:
+        has_clip = self._clip_id is not None
+        has_sel = self._selected_op is not None and has_clip
+        self.add_btn.setEnabled(has_clip)
+        self.apply_btn.setEnabled(has_sel)
+        self.remove_btn.setEnabled(has_sel)
+        idx = next((i for i, e in enumerate(self._effects)
+                    if e["id"] == self._selected_op), -1)
+        self.up_btn.setEnabled(has_sel and idx > 0)
+        self.down_btn.setEnabled(has_sel and 0 <= idx < len(self._effects) - 1)
 
     # -- params form -------------------------------------------------------- #
 
@@ -676,17 +969,38 @@ class InspectorPanel(QWidget):
             elif isinstance(w, QLineEdit):
                 w.setText(str(value))
 
-    def _emit_apply(self) -> None:
+    def _editor_mode_params(self):
+        """Current editor mode + params, or (None, None) if a required motion
+        source is missing (with a hint shown)."""
         params = {name: getter() for name, getter in self._getters.items()}
-        # validate required clip_ref params
-        mode = get_mode(self.mode_combo.currentText())
-        for param in mode.params:
+        mode = self.mode_combo.currentText()
+        for param in get_mode(mode).params:
             if param.kind == "clip_ref" and not params.get(param.name):
                 self.clip_lbl.setText(
                     "<span style='color:#ff5470'>Import a motion clip and add "
                     "it to the motion track first.</span>")
-                return
-        self.applyRequested.emit(self.mode_combo.currentText(), params)
+                return None, None
+        return mode, params
+
+    def _emit_add(self) -> None:
+        mode, params = self._editor_mode_params()
+        if mode is not None:
+            self.effectAddRequested.emit(mode, params)
+
+    def _emit_update(self) -> None:
+        if not self._selected_op:
+            return
+        mode, params = self._editor_mode_params()
+        if mode is not None:
+            self.effectUpdateRequested.emit(self._selected_op, mode, params)
+
+    def _emit_remove(self) -> None:
+        if self._selected_op:
+            self.effectRemoveRequested.emit(self._selected_op)
+
+    def _emit_move(self, delta: int) -> None:
+        if self._selected_op:
+            self.effectMoveRequested.emit(self._selected_op, delta)
 
 
 # --------------------------------------------------------------------------- #

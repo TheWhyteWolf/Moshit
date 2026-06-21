@@ -25,6 +25,22 @@ class FFmpegError(RuntimeError):
     """Raised when an ffmpeg/ffprobe invocation fails."""
 
 
+def _atempo_chain(speed: float) -> List[str]:
+    """`atempo` filters whose product is *speed* (each stage stays in 0.5..2.0)."""
+    s = float(speed)
+    if s <= 0 or s == 1.0:
+        return []
+    out: List[str] = []
+    while s > 2.0:
+        out.append("atempo=2.0")
+        s /= 2.0
+    while s < 0.5:
+        out.append("atempo=0.5")
+        s /= 0.5
+    out.append(f"atempo={s:.6f}")
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Capability detection
 # --------------------------------------------------------------------------- #
@@ -85,6 +101,7 @@ class FFmpeg:
                 f"`pacman -S ffmpeg`) or set FFMPEG_BIN to its path."
             )
         self._caps: Optional[Capabilities] = None
+        self._audio_cache: Dict[str, bool] = {}
 
     # -- process helpers ---------------------------------------------------- #
 
@@ -218,6 +235,173 @@ class FFmpeg:
                     }
         return {"width": 0, "height": 0, "fps": 0.0, "nb_frames": None, "codec": ""}
 
+    def has_audio(self, path) -> bool:
+        """True if *path* has at least one audio stream (probed once, cached)."""
+        key = str(path)
+        if key in self._audio_cache:
+            return self._audio_cache[key]
+        ok = False
+        if shutil.which(self.ffprobe) or Path(self.ffprobe).exists():
+            proc = subprocess.run(
+                [self.ffprobe, "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True)
+            ok = proc.returncode == 0 and "audio" in proc.stdout
+        self._audio_cache[key] = ok
+        return ok
+
+    # -- audio assembly (for clean-edit passthrough) ------------------------ #
+
+    def build_audio_track(self, plan: List[Dict], dst, *, fps: float = 30.0
+                          ) -> Optional[Path]:
+        """Assemble one WAV that matches the rendered video's duration.
+
+        *plan* is the render's audio plan: an ordered list of segments, one per
+        main-track clip. Each carries ``{"source", "start", "duration",
+        "silent"}`` and optional finishing fields ``{"speed", "reverse",
+        "fade_in", "fade_out", "transition_in"}`` (frame counts). A non-silent
+        segment whose source has audio contributes that audio -- retimed
+        (``atempo``/``areverse``) and faded (``afade``) to mirror the video --
+        while everything else contributes matching-length silence so the track
+        stays locked to the video. A crossfade (``transition_in``) trims that
+        many frames off the segment's head so the total length matches the
+        overlapping video (the audio itself hard-cuts at the seam). Returns
+        *dst*, or ``None`` if no real audio was placed (so callers can skip
+        muxing a pure-silence track).
+        """
+        dst = Path(dst)
+        work = dst.parent
+        segs: List[Path] = []
+        listfile = work / f"{dst.stem}_concat.txt"
+        any_real = False
+        try:
+            for i, seg in enumerate(plan):
+                full = max(0.0, float(seg.get("duration", 0.0)))
+                trans = max(0, int(seg.get("transition_in", 0))) / fps
+                dur = full - trans                 # net contribution after overlap
+                if dur <= 0.0:
+                    continue
+                seg_path = work / f"{dst.stem}_seg{i:04d}.wav"
+                source = seg.get("source")
+                real = (not seg.get("silent")) and source and self.has_audio(source)
+                if real:
+                    speed = float(seg.get("speed", 1.0)) or 1.0
+                    # start after the crossfaded-away head, in source time
+                    start = max(0.0, float(seg.get("start", 0.0)) + trans * speed)
+                    src_dur = dur * speed          # atempo brings this back to dur
+                    af = ["aresample=48000"]
+                    if seg.get("reverse"):
+                        af.append("areverse")
+                    af.extend(_atempo_chain(speed))
+                    fi = int(seg.get("fade_in", 0)) / fps
+                    fo = int(seg.get("fade_out", 0)) / fps
+                    if fi > 0:
+                        af.append(f"afade=t=in:st=0:d={fi:.6f}")
+                    if fo > 0:
+                        af.append(f"afade=t=out:st={max(0.0, dur - fo):.6f}:d={fo:.6f}")
+                    af.append("apad")              # pad short audio to exactly `dur`
+                    self._run(
+                        ["-y", "-ss", f"{start:.6f}", "-t", f"{src_dur:.6f}",
+                         "-i", str(source), "-vn", "-af", ",".join(af),
+                         "-ac", "2", "-ar", "48000", "-t", f"{dur:.6f}",
+                         "-c:a", "pcm_s16le", str(seg_path)],
+                        f"audio segment {i}")
+                    any_real = True
+                else:
+                    self._run(
+                        ["-y", "-f", "lavfi", "-i",
+                         "anullsrc=channel_layout=stereo:sample_rate=48000",
+                         "-t", f"{dur:.6f}", "-c:a", "pcm_s16le", str(seg_path)],
+                        f"silent segment {i}")
+                segs.append(seg_path)
+
+            if not any_real or not segs:
+                return None
+            listfile.write_text("".join(f"file '{p}'\n" for p in segs))
+            self._run(["-y", "-f", "concat", "-safe", "0", "-i", str(listfile),
+                       "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(dst)],
+                      "audio concat")
+            return dst
+        finally:
+            for p in segs:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            try:
+                listfile.unlink()
+            except OSError:
+                pass
+
+    def finish_video(self, segments: List, meta: List[Dict], dst, *,
+                     fps: float, gop: int = 250, qscale: int = 3) -> Path:
+        """Assemble per-clip moshed segment AVIs into one finished video.
+
+        Each clip gets a pixel-domain chain -- ``reverse``, ``setpts`` (speed),
+        ``fps``, ``fade`` in/out -- and adjacent clips are folded together with
+        ``xfade`` (crossfade) where ``transition_in`` is set, else ``concat`` (a
+        hard cut). ``meta[i]`` is ``{n, speed, reverse, fade_in, fade_out,
+        transition_in}`` (frame counts). ``settb`` pins a common timebase so
+        ``xfade`` accepts the concat output.
+        """
+        tb = int(round(fps))
+        parts: List[str] = []
+        lens: List[int] = []                       # post-speed frame count per clip
+        for i, m in enumerate(meta):
+            n = int(m["n"])
+            speed = float(m.get("speed", 1.0)) or 1.0
+            mlen = max(1, round(n / speed)) if speed != 1.0 else n
+            chain: List[str] = []
+            if m.get("reverse"):
+                chain.append("reverse")
+            if speed != 1.0:
+                chain.append(f"setpts={1.0 / speed:.6f}*PTS")
+            chain.append(f"fps={fps:g}")
+            fi, fo = int(m.get("fade_in", 0)), int(m.get("fade_out", 0))
+            if fi > 0:
+                chain.append(f"fade=t=in:st=0:d={fi / fps:.6f}")
+            if fo > 0:
+                chain.append(f"fade=t=out:st={max(0.0, (mlen - fo) / fps):.6f}:"
+                             f"d={fo / fps:.6f}")
+            chain.append("format=yuv420p")
+            chain.append(f"settb=1/{tb}")
+            parts.append(f"[{i}:v]" + ",".join(chain) + f"[v{i}]")
+            lens.append(mlen)
+
+        acc, acc_len = "[v0]", lens[0]
+        for i in range(1, len(meta)):
+            trans = max(0, int(meta[i].get("transition_in", 0)))
+            out = f"[x{i}]"
+            if trans > 0:
+                d = min(trans, acc_len, lens[i])
+                offset = max(0.0, (acc_len - d) / fps)
+                parts.append(f"{acc}[v{i}]xfade=transition=fade:duration={d / fps:.6f}"
+                             f":offset={offset:.6f},settb=1/{tb}{out}")
+                acc_len += lens[i] - d
+            else:
+                parts.append(f"{acc}[v{i}]concat=n=2:v=1:a=0,settb=1/{tb}{out}")
+                acc_len += lens[i]
+            acc = out
+
+        inputs: List[str] = []
+        for s in segments:
+            inputs += ["-i", str(s)]
+        self._run([*inputs, "-filter_complex", ";".join(parts), "-map", acc,
+                   "-c:v", "mpeg4", "-q:v", str(qscale), "-bf", "0",
+                   "-g", str(max(1, gop)), "-pix_fmt", "yuv420p", "-y", str(dst)],
+                  "finish video")
+        return Path(dst)
+
+    def _audio_args(self, profile: str) -> List[str]:
+        """Delivery audio codec for muxing a passthrough track into an export."""
+        if profile == "vp9_webm":
+            enc = "libopus" if self.capabilities().has_encoder("libopus") \
+                else "libvorbis"
+            return ["-c:a", enc, "-b:a", "160k"]
+        if profile in ("prores_mov", "ffv1_mkv"):
+            return ["-c:a", "pcm_s16le"]          # lossless containers
+        return ["-c:a", "aac", "-b:a", "192k"]    # h264_mp4, h265_mp4
+
     # -- transcoding stages ------------------------------------------------- #
 
     def normalize(self, src, dst, *, width: int, height: int, fps: float,
@@ -251,13 +435,27 @@ class FFmpeg:
              "-g", str(max(1, gop)), "-pix_fmt", "yuv420p", str(dst_avi)],
             f"bake {Path(src_avi).name}")
 
+    def snapshot(self, src, dst, frame_index: int) -> None:
+        """Write a single decoded frame (*frame_index*, 0-based) as an image.
+
+        The format follows *dst*'s extension (e.g. .png/.jpg). Decoding is linear
+        from the start because a moshed stream has no reliable seek points.
+        """
+        self._run(
+            ["-y", "-i", str(src),
+             "-vf", f"select=eq(n\\,{max(0, int(frame_index))})",
+             "-frames:v", "1", str(dst)],
+            f"snapshot frame {frame_index}")
+
     def export(self, src_avi, dst, profile: str, *,
-               hwaccel: Optional[str] = None) -> None:
+               hwaccel: Optional[str] = None, audio_path=None) -> None:
         """Transcode a moshed/baked AVI to a delivery format.
 
         Transcoding bakes the corruption in as real pixels regardless of the
         target codec. ``hwaccel`` (e.g. 'vaapi') is honoured for H.264/H.265
-        only and silently ignored elsewhere.
+        only and silently ignored elsewhere. If *audio_path* is given (a WAV
+        built to match the video's duration), it is muxed in and encoded with a
+        container-appropriate codec.
         """
         if profile not in _PROFILE_ENCODER:
             raise FFmpegError(f"unknown export profile '{profile}'. "
@@ -300,5 +498,10 @@ class FFmpeg:
         else:  # pragma: no cover - guarded above
             raise FFmpegError(f"unhandled profile '{profile}'")
 
-        self._run([*pre, "-i", str(src_avi), "-an", *args, str(dst)],
-                  f"export {profile}")
+        inputs = ["-i", str(src_avi)]
+        if audio_path:
+            inputs += ["-i", str(audio_path)]
+            tail = ["-map", "0:v:0", "-map", "1:a:0", *self._audio_args(profile)]
+        else:
+            tail = ["-an"]
+        self._run([*pre, *inputs, *args, *tail, str(dst)], f"export {profile}")

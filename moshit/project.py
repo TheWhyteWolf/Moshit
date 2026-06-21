@@ -71,6 +71,18 @@ class Clip:
     out_point: Optional[int] = None  # exclusive; None = end of media
     enabled: bool = True
     archived: bool = False
+    # -- clean-edit finishing (pixel-domain; applied in the render finish pass).
+    # Defaults are inert, so a clip with all defaults takes the fast path.
+    speed: float = 1.0             # 2.0 = twice as fast, 0.5 = half speed
+    reverse: bool = False          # play the clip backwards
+    fade_in: int = 0               # frames to fade up from black at the head
+    fade_out: int = 0              # frames to fade to black at the tail
+    transition_in: int = 0         # crossfade frames from the previous main clip
+
+    def has_finish(self) -> bool:
+        """True if this clip needs the pixel-domain finish pass."""
+        return (self.speed != 1.0 or self.reverse or self.fade_in > 0
+                or self.fade_out > 0 or self.transition_in > 0)
 
     def to_dict(self) -> Dict:
         return self.__dict__.copy()
@@ -212,6 +224,35 @@ class Project:
         self.mosh_ops.append(o)
         return o
 
+    def clip_ops(self, clip_id: str) -> List[MoshOp]:
+        """All non-archived ops on a clip, in application order (the stack)."""
+        return [o for o in self.mosh_ops
+                if o.target_clip_id == clip_id and not o.archived]
+
+    def remove_mosh(self, op_id: str) -> bool:
+        before = len(self.mosh_ops)
+        self.mosh_ops = [o for o in self.mosh_ops if o.id != op_id]
+        return len(self.mosh_ops) != before
+
+    def move_mosh(self, op_id: str, delta: int) -> bool:
+        """Reorder an op within its clip's stack (delta -1 = earlier, +1 = later).
+
+        Application order is the order in ``mosh_ops``, so a move swaps the op
+        with the sibling ``delta`` away in the clip's own sub-sequence.
+        """
+        op = next((o for o in self.mosh_ops if o.id == op_id), None)
+        if op is None:
+            return False
+        siblings = self.clip_ops(op.target_clip_id)
+        idx = siblings.index(op)
+        new = idx + delta
+        if new < 0 or new >= len(siblings):
+            return False
+        other = siblings[new]
+        i, j = self.mosh_ops.index(op), self.mosh_ops.index(other)
+        self.mosh_ops[i], self.mosh_ops[j] = self.mosh_ops[j], self.mosh_ops[i]
+        return True
+
     def split_clip(self, clip_id: str, offset: int) -> Optional[Clip]:
         """Split a clip *offset* frames from its start into two clips.
 
@@ -222,14 +263,42 @@ class Project:
         c = self.clip(clip_id)
         media = self.media[c.media_id]
         out = c.out_point if c.out_point is not None else media.nb_frames
-        offset = int(offset)
-        if offset <= 0 or c.in_point + offset >= out:
+        offset = int(offset)                       # timeline (post-speed) frames
+        src_off = round(offset * c.speed) if c.speed else offset
+        if offset <= 0 or c.in_point + src_off >= out:
             return None
-        split = c.in_point + offset
+        split = c.in_point + src_off
+        # speed/reverse carry to both halves; the tail fade moves to the new one
         new = Clip(id=_new_id("clip"), media_id=c.media_id, track=c.track,
-                   start=c.start + offset, in_point=split, out_point=out)
+                   start=c.start + offset, in_point=split, out_point=out,
+                   speed=c.speed, reverse=c.reverse, fade_out=c.fade_out)
         c.out_point = split
+        c.fade_out = 0
         self.clips.insert(self.clips.index(c) + 1, new)
+        return new
+
+    def duplicate_clip(self, clip_id: str, *, copy_ops: bool = True) -> Clip:
+        """Duplicate a clip in place, inserting the copy right after it.
+
+        The copy shares the same media and trim, and (by default) the clip's
+        active mosh ops are duplicated onto it too -- so duplicating a clip
+        carries its effect, the way copy/paste does in an NLE. The main track is
+        left for the caller to repack. Returns the new clip.
+        """
+        c = self.clip(clip_id)
+        length = self._clip_length(c)
+        # carry speed/reverse/fades; not transition_in (the copy hard-cuts in)
+        new = Clip(id=_new_id("clip"), media_id=c.media_id, track=c.track,
+                   start=c.start + length, in_point=c.in_point,
+                   out_point=c.out_point, enabled=c.enabled, speed=c.speed,
+                   reverse=c.reverse, fade_in=c.fade_in, fade_out=c.fade_out)
+        self.clips.insert(self.clips.index(c) + 1, new)
+        if copy_ops:
+            for o in list(self.mosh_ops):
+                if o.target_clip_id == clip_id and o.enabled and not o.archived:
+                    self.mosh_ops.append(
+                        MoshOp(id=_new_id("op"), mode=o.mode,
+                               params=dict(o.params), target_clip_id=new.id))
         return new
 
     def _timeline_end(self, track: str) -> int:
@@ -240,21 +309,44 @@ class Project:
                 end = max(end, c.start + length)
         return end
 
-    def _clip_length(self, c: Clip) -> int:
+    def _source_len(self, c: Clip) -> int:
+        """Trimmed length in the clip's *source* frames (before any speed)."""
         media = self.media[c.media_id]
         out = c.out_point if c.out_point is not None else media.nb_frames
         return max(0, out - c.in_point)
 
+    def _clip_length(self, c: Clip) -> int:
+        """Timeline length in frames, after speed (reverse keeps the count).
+
+        Crossfade overlap is a junction property and is not subtracted here, so
+        the timeline lays clips out contiguously; the rendered video is the one
+        that overlaps and is therefore shorter.
+        """
+        n = self._source_len(c)
+        if n and c.speed and c.speed != 1.0:
+            n = max(1, round(n / c.speed))
+        return n
+
     # -- frame extraction --------------------------------------------------- #
+
+    def _snapped_in_point(self, media: AviVideo, in_point: int) -> int:
+        """The clip's in-point snapped back to the preceding keyframe.
+
+        A clip must start on a keyframe to decode on its own, so trims align to
+        the nearest preceding I-frame. Audio extraction uses the same snapped
+        point so sound lines up with the frames actually shown.
+        """
+        if in_point <= 0:
+            return 0
+        keys = [i for i in media.iframe_indices if i <= in_point]
+        return keys[-1] if keys else 0
 
     def _clip_frames(self, c: Clip, snap_to_keyframe: bool = True) -> List[Frame]:
         """The (trimmed) frames a clip contributes, keyframe-aligned at the head."""
         media = self._parsed_media(c.media_id)
         frames = media.frames
-        in_pt = c.in_point
-        if snap_to_keyframe and in_pt > 0:
-            keys = [i for i in media.iframe_indices if i <= in_pt]
-            in_pt = keys[-1] if keys else 0
+        in_pt = self._snapped_in_point(media, c.in_point) if snap_to_keyframe \
+            else c.in_point
         out_pt = c.out_point if c.out_point is not None else len(frames)
         return list(frames[in_pt:out_pt])
 
@@ -266,35 +358,100 @@ class Project:
                       key=lambda c: c.start)
 
     def render(self, engine: MoshEngine, out_avi, *,
-               profile: Optional[str] = None, export_path=None) -> Dict:
-        """Materialise the current timeline. Does not mutate the project."""
+               profile: Optional[str] = None, export_path=None,
+               audio: bool = False) -> Dict:
+        """Materialise the current timeline. Does not mutate the project.
+
+        Always returns an ``audio_plan`` (one segment per main clip, keyed to the
+        rendered video's duration). When *audio* is set and an export *profile*
+        is given, the plan is assembled into a track and muxed into the export.
+        Clean and moshed clips keep their source audio (padded/trimmed to the
+        rendered length so the track stays in sync); baked clips are silent.
+        """
         clips = self.main_clips()
         if not clips:
             raise ValueError("no enabled main-track clips to render")
 
+        fps = self.config.fps or 30.0
         motion = self._motion_frames()
-        sequence: List[Frame] = []
+        needs_finish = any(c.has_finish() for c in clips)
+
+        # Codec-domain stage: each clip's moshed frame list (pure Python).
+        segs: List = []                            # (clip, media, frames)
         template: Optional[AviVideo] = None
         for c in clips:
             media = self._parsed_media(c.media_id)
             if template is None:
                 template = media
             frames = self._clip_frames(c)
-            ops = self._ops_for_clip(c.id)
-            for op in ops:
+            for op in self._ops_for_clip(c.id):
                 frames = engine.mosh(
                     _as_avivideo(frames, media), op.mode, op.params,
                     motion_clips=_wrap_motion(motion))
-            sequence.extend(frames)
+            segs.append((c, media, frames))
 
-        out = engine.write_moshed(sequence, template, out_avi)
-        result = {"moshed_avi": out, "frames": len(sequence),
-                  "clips_rendered": len(clips)}
+        # Per-clip finished (post-speed) length; crossfade overlap handled below.
+        finished = [(max(1, round(len(f) / c.speed))
+                     if (c.speed and c.speed != 1.0) else len(f))
+                    for c, _, f in segs]
+
+        audio_plan: List[Dict] = []
+        total = 0
+        prev_len = 0
+        for idx, ((c, media, frames), mlen) in enumerate(zip(segs, finished)):
+            item = self.media[c.media_id]
+            snapped = self._snapped_in_point(media, c.in_point)
+            # The first clip can't crossfade from a previous one; the video
+            # finish ignores its transition_in, so the audio plan must too.
+            trans = min(c.transition_in, mlen, prev_len) if idx > 0 else 0
+            audio_plan.append({
+                "source": item.source_path, "start": snapped / fps,
+                "duration": mlen / fps,
+                # A clip's trim indexes its *source* media, so source audio lines
+                # up; only baked (derived) media -- re-encoded frames -- can't map
+                # back, so it stays silent. Speed/reverse/fades/crossfade mirror
+                # the video finish (see build_audio_track).
+                "silent": item.derived,
+                "speed": c.speed, "reverse": c.reverse,
+                "fade_in": c.fade_in, "fade_out": c.fade_out,
+                "transition_in": trans,
+            })
+            total += mlen - trans
+            prev_len = mlen
+
+        if needs_finish:
+            seg_avis = [engine.write_moshed(frames, media, engine._tmp(".avi"))
+                        for c, media, frames in segs]
+            meta = [{"n": len(frames), "speed": c.speed, "reverse": c.reverse,
+                     "fade_in": c.fade_in, "fade_out": c.fade_out,
+                     "transition_in": c.transition_in}
+                    for c, _, frames in segs]
+            out = engine.finish_clips(seg_avis, meta, out_avi)
+            for s in seg_avis:               # consumed; don't pile up across renders
+                try:
+                    Path(s).unlink()
+                except OSError:
+                    pass
+        else:                                      # fast path: concat coded chunks
+            sequence: List[Frame] = []
+            for _, _, frames in segs:
+                sequence.extend(frames)
+            out = engine.write_moshed(sequence, template, out_avi)
+
+        result = {"moshed_avi": out, "frames": total,
+                  "clips_rendered": len(clips), "audio_plan": audio_plan}
         if profile:
+            audio_path = None
+            if audio:
+                audio_path = engine.build_audio(
+                    audio_plan, Path(out).with_suffix(".audio.wav"), fps=fps)
+                if audio_path:
+                    result["audio"] = audio_path
             ep = Path(export_path) if export_path else out.with_suffix(
                 {"h264_mp4": ".mp4", "h265_mp4": ".mp4", "prores_mov": ".mov",
                  "ffv1_mkv": ".mkv", "vp9_webm": ".webm"}.get(profile, ".mp4"))
-            result["export"] = engine.export(out, ep, profile)
+            result["export"] = engine.export(out, ep, profile,
+                                             audio_path=audio_path)
         return result
 
     # -- bake (reversible) -------------------------------------------------- #
@@ -339,6 +496,60 @@ class Project:
         record = BakeRecord(
             id=_new_id("bake"), baked_media_id=baked_id, baked_clip_id=new_clip.id,
             replaced_clip_ids=[target.id], consumed_mosh_op_ids=[op.id])
+        self.bake_records.append(record)
+        return record
+
+    def bake_clip(self, engine: MoshEngine, clip_id: str) -> BakeRecord:
+        """Freeze a clip's whole effect stack into one baked clip.
+
+        Applies every enabled op in order, re-encodes to a clean clip, and
+        archives the original clip and all the ops it consumed. The clip's
+        finishing (speed/reverse/fades/crossfade) is *not* baked in -- it carries
+        over to the baked clip so it stays editable.
+        """
+        target = self.clip(clip_id)
+        media = self._parsed_media(target.media_id)
+        frames = self._clip_frames(target)
+        motion = self._motion_frames()
+        ops = self._ops_for_clip(clip_id)
+        for op in ops:
+            frames = engine.mosh(_as_avivideo(frames, media), op.mode, op.params,
+                                 motion_clips=_wrap_motion(motion))
+
+        raw = engine.write_moshed(frames, media, engine._tmp(".avi"))
+        baked_id = _new_id("media")
+        baked_path = (self.assets_dir / f"{baked_id}.avi") if self.assets_dir \
+            else engine._tmp(".avi")
+        baked_av = engine.bake(raw, baked_path)
+
+        baked_media = MediaItem(
+            id=baked_id, source_path=self.media[target.media_id].source_path,
+            label=f"baked_{target.id}", role="main",
+            intermediate_path=str(baked_path), width=baked_av.width,
+            height=baked_av.height, fps=baked_av.fps,
+            nb_frames=len(baked_av.frames), derived=True)
+        self.media[baked_id] = baked_media
+        self._parsed[baked_id] = baked_av
+
+        new_clip = Clip(id=_new_id("clip"), media_id=baked_id, track="main",
+                        start=target.start, in_point=0,
+                        out_point=len(baked_av.frames),
+                        speed=target.speed, reverse=target.reverse,
+                        fade_in=target.fade_in, fade_out=target.fade_out,
+                        transition_in=target.transition_in)
+        self.clips.append(new_clip)
+
+        target.enabled = False
+        target.archived = True
+        consumed = []
+        for op in ops:
+            op.enabled = False
+            op.archived = True
+            consumed.append(op.id)
+
+        record = BakeRecord(
+            id=_new_id("bake"), baked_media_id=baked_id, baked_clip_id=new_clip.id,
+            replaced_clip_ids=[target.id], consumed_mosh_op_ids=consumed)
         self.bake_records.append(record)
         return record
 

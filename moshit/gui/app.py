@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
-    QMainWindow, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QMainWindow,
+    QMessageBox, QPushButton, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
 from ..engine import EngineConfig, _ext_for_profile
@@ -38,6 +39,104 @@ QSlider::handle:horizontal { background:#9fb4d6; width:12px; margin:-5px 0;
 QToolBar { background:#1c1f24; border:0; spacing:4px; padding:3px; }
 QStatusBar { background:#1c1f24; color:#9fb4d6; }
 """
+
+
+class ProjectSettingsDialog(QDialog):
+    """Choose the sequence geometry and frame rate.
+
+    Everything imported is normalised to these, so they are picked up front
+    (before any media is imported). A handful of presets fill the fields; the
+    spin boxes allow any custom size.
+    """
+
+    PRESETS = [
+        ("720p · 1280×720 @ 30", 1280, 720, 30.0),
+        ("1080p · 1920×1080 @ 30", 1920, 1080, 30.0),
+        ("1080p · 1920×1080 @ 24", 1920, 1080, 24.0),
+        ("720p · 1280×720 @ 60", 1280, 720, 60.0),
+        ("SD · 640×480 @ 30", 640, 480, 30.0),
+        ("Vertical · 1080×1920 @ 30", 1080, 1920, 30.0),
+    ]
+
+    def __init__(self, parent, width: int, height: int, fps: float):
+        super().__init__(parent)
+        self.setWindowTitle("Project settings")
+        form = QFormLayout(self)
+
+        self.w_spin = QSpinBox()
+        self.w_spin.setRange(16, 7680)
+        self.w_spin.setSingleStep(2)
+        self.h_spin = QSpinBox()
+        self.h_spin.setRange(16, 4320)
+        self.h_spin.setSingleStep(2)
+        self.fps_spin = QDoubleSpinBox()
+        self.fps_spin.setRange(1.0, 120.0)
+        self.fps_spin.setDecimals(3)
+        self.w_spin.setValue(int(width))
+        self.h_spin.setValue(int(height))
+        self.fps_spin.setValue(float(fps))
+
+        self.preset = QComboBox()
+        self.preset.addItem("Custom…")
+        for label, w, h, f in self.PRESETS:
+            self.preset.addItem(label, (w, h, f))
+        self.preset.currentIndexChanged.connect(self._apply_preset)
+
+        form.addRow("Preset", self.preset)
+        form.addRow("Width", self.w_spin)
+        form.addRow("Height", self.h_spin)
+        form.addRow("Frame rate", self.fps_spin)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self._select_matching_preset()
+
+    def _apply_preset(self, idx: int) -> None:
+        data = self.preset.itemData(idx)
+        if data:
+            w, h, f = data
+            self.w_spin.setValue(w)
+            self.h_spin.setValue(h)
+            self.fps_spin.setValue(f)
+
+    def _select_matching_preset(self) -> None:
+        cur = (self.w_spin.value(), self.h_spin.value(), float(self.fps_spin.value()))
+        for i in range(1, self.preset.count()):
+            if self.preset.itemData(i) == cur:
+                self.preset.setCurrentIndex(i)
+                return
+        self.preset.setCurrentIndex(0)
+
+    def values(self):
+        return self.w_spin.value(), self.h_spin.value(), float(self.fps_spin.value())
+
+
+class ExportDialog(QDialog):
+    """Pick a delivery format and whether to mux source audio."""
+
+    def __init__(self, parent, profiles):
+        super().__init__(parent)
+        self.setWindowTitle("Export")
+        form = QFormLayout(self)
+        self.fmt = QComboBox()
+        self.fmt.addItems(profiles)
+        self.audio = QCheckBox("Include audio from source clips")
+        self.audio.setChecked(True)
+        self.audio.setToolTip("Clips keep their source audio (clean edits stay "
+                              "perfectly in sync; baked clips are silent).")
+        form.addRow("Format", self.fmt)
+        form.addRow(self.audio)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self):
+        return self.fmt.currentText(), self.audio.isChecked()
 
 
 class MainWindow(QMainWindow):
@@ -90,6 +189,7 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self.statusBar().showMessage("Ready. Import a video to begin.")
         self._wire()
+        self._build_shortcuts()
         self.timeline.set_project(self.controller.project)
 
     # -- toolbar ------------------------------------------------------------ #
@@ -99,6 +199,7 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         m = self.menuBar().addMenu("&File")
         a_new = m.addAction("&New project")
+        a_new.setShortcut("Ctrl+N")
         a_new.triggered.connect(self._new_project)
         a_open = m.addAction("&Open project…")
         a_open.setShortcut("Ctrl+O")
@@ -107,9 +208,15 @@ class MainWindow(QMainWindow):
         a_save.setShortcut("Ctrl+S")
         a_save.triggered.connect(self._save_project)
         m.addSeparator()
+        a_settings = m.addAction("Project se&ttings…")
+        a_settings.triggered.connect(self._project_settings)
+        m.addSeparator()
         a_exp = m.addAction("&Export…")
         a_exp.setShortcut("Ctrl+E")
         a_exp.triggered.connect(self._export)
+        a_frame = m.addAction("Save &frame as image…")
+        a_frame.setShortcut("Ctrl+Shift+S")
+        a_frame.triggered.connect(self._save_frame)
         m.addSeparator()
         a_quit = m.addAction("&Quit")
         a_quit.setShortcut("Ctrl+Q")
@@ -124,6 +231,13 @@ class MainWindow(QMainWindow):
         self.act_redo.triggered.connect(self.controller.redo)
         self.act_undo.setEnabled(False)
         self.act_redo.setEnabled(False)
+        edit.addSeparator()
+        a_dup = edit.addAction("&Duplicate clip")
+        a_dup.setShortcut("Ctrl+D")
+        a_dup.triggered.connect(self._duplicate_selected)
+        a_split = edit.addAction("&Split at playhead")
+        a_split.setShortcut("S")
+        a_split.triggered.connect(self.timeline.request_split_at_playhead)
 
         gen = self.menuBar().addMenu("&Generate")
         for label, kind in (("&Zoom in", "zoom_in"), ("Zoom &out", "zoom_out"),
@@ -179,6 +293,19 @@ class MainWindow(QMainWindow):
         h.addStretch(1)
         return strip
 
+    def _build_shortcuts(self) -> None:
+        """Playback/transport keys, scoped to the window. Editable widgets
+        consume their own text keys first, so these only fire when focus is on
+        the preview/timeline/library rather than a parameter field."""
+        for seq, slot in (
+            ("Space", self.preview.toggle),
+            (",", lambda: self.preview.step(-1)),
+            (".", lambda: self.preview.step(1)),
+            ("Home", self.preview.go_start),
+            ("End", self.preview.go_end),
+        ):
+            QShortcut(QKeySequence(seq), self, activated=slot)
+
     # -- signal wiring ------------------------------------------------------ #
 
     def _wire(self) -> None:
@@ -204,11 +331,17 @@ class MainWindow(QMainWindow):
         self.timeline.removeRequested.connect(self._on_remove)
         self.timeline.seekRequested.connect(self._on_seek)
         self.timeline.splitRequested.connect(self.controller.split_clip)
+        self.timeline.duplicateRequested.connect(self.controller.duplicate_clip)
         self.preview.frameChanged.connect(self._on_preview_frame)
 
-        self.inspector.applyRequested.connect(self._on_apply)
+        self.inspector.effectAddRequested.connect(self._on_effect_add)
+        self.inspector.effectUpdateRequested.connect(self._on_effect_update)
+        self.inspector.effectRemoveRequested.connect(self.controller.remove_effect)
+        self.inspector.effectMoveRequested.connect(self.controller.move_effect)
+        self.inspector.effectEnabledChanged.connect(self.controller.set_effect_enabled)
         self.inspector.bakeRequested.connect(self._on_bake)
         self.inspector.revertRequested.connect(lambda: c.revert_last_bake())
+        self.inspector.clipPropsChanged.connect(self._on_clip_props)
 
     # -- handlers ----------------------------------------------------------- #
 
@@ -251,16 +384,24 @@ class MainWindow(QMainWindow):
             return
         media = self.controller.project.media.get(clip.media_id)
         label = media.label if media else clip_id
-        op = self.controller.active_op_for_clip(clip_id)
         self.inspector.set_enabled_for_clip(
-            clip_id, label,
-            mode=op.mode if op else None,
-            params=op.params if op else None)
+            clip_id, label, clip=clip,
+            effects=self.controller.clip_effects(clip_id))
 
-    def _on_apply(self, mode: str, params: dict) -> None:
+    def _on_clip_props(self, props: dict) -> None:
         if not self._selected_clip:
             return
-        self.controller.set_mosh(self._selected_clip, mode, params)
+        self.controller.set_clip_props(self._selected_clip, props)
+        self._schedule_auto_refresh(immediate=True)
+
+    def _on_effect_add(self, mode: str, params: dict) -> None:
+        if not self._selected_clip:
+            return
+        self.controller.add_effect(self._selected_clip, mode, params)
+        self._schedule_auto_refresh(immediate=True)
+
+    def _on_effect_update(self, op_id: str, mode: str, params: dict) -> None:
+        self.controller.update_effect(op_id, mode, params)
         self._schedule_auto_refresh(immediate=True)
 
     def _set_auto_refresh(self, on: bool) -> None:
@@ -290,11 +431,11 @@ class MainWindow(QMainWindow):
     def _on_bake(self) -> None:
         if not self._selected_clip:
             return
-        op = self.controller.active_op_for_clip(self._selected_clip)
-        if not op:
-            self.statusBar().showMessage("Apply an effect to this clip before baking.")
+        effects = self.controller.clip_effects(self._selected_clip)
+        if not any(e["enabled"] for e in effects):
+            self.statusBar().showMessage("Add or enable an effect before baking.")
             return
-        self.controller.bake(op.id)
+        self.controller.bake_clip(self._selected_clip)
 
     def _on_trim(self, clip_id: str, in_pt: int, out_pt: int) -> None:
         self.controller.trim_clip(
@@ -348,12 +489,48 @@ class MainWindow(QMainWindow):
     def _new_project(self) -> None:
         if not self._maybe_save():
             return
-        self.controller.new_project()
+        cfg = self.controller.config
+        dlg = ProjectSettingsDialog(self, cfg.width, cfg.height, cfg.fps)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        w, h, fps = dlg.values()
+        self.controller.new_project()        # clears media so settings can change
+        self.controller.set_project_config(width=w, height=h, fps=fps)
         self._selected_clip = None
         self.library.list.clear()
         self.inspector.set_enabled_for_clip(None, None)
         self.preview.set_frames([], 30.0)
         self._set_dirty(False)
+
+    def _project_settings(self) -> None:
+        if self.controller.has_media:
+            QMessageBox.information(
+                self, "Project settings",
+                "Resolution and frame rate are locked once media is imported "
+                "(every clip is normalised to them).\nStart a New project to "
+                "change them.")
+            return
+        cfg = self.controller.config
+        dlg = ProjectSettingsDialog(self, cfg.width, cfg.height, cfg.fps)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            w, h, fps = dlg.values()
+            self.controller.set_project_config(width=w, height=h, fps=fps)
+
+    def _duplicate_selected(self) -> None:
+        if self._selected_clip:
+            self.controller.duplicate_clip(self._selected_clip)
+        else:
+            self.statusBar().showMessage("Select a clip to duplicate.")
+
+    def _save_frame(self) -> None:
+        if self.preview.frame_count() == 0:
+            self.statusBar().showMessage("Render a preview first, then save a frame.")
+            return
+        idx = self.preview.current_index()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save frame", f"frame_{idx:05d}.png", "Images (*.png *.jpg)")
+        if path:
+            self.controller.export_frame(idx, path)
 
     def _open_project(self) -> None:
         if not self._maybe_save():
@@ -390,14 +567,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export",
                                 "No export encoders available in this ffmpeg build.")
             return
-        profile, ok = QInputDialog.getItem(self, "Export", "Format:", profiles, 0, False)
-        if not ok:
+        dlg = ExportDialog(self, profiles)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        profile, audio = dlg.values()
         suffix = _ext_for_profile(profile)
         path, _ = QFileDialog.getSaveFileName(self, "Export to", f"moshit{suffix}",
                                               f"*{suffix}")
         if path:
-            self.controller.export(profile, path)
+            self.controller.export(profile, path, audio)
 
     def _on_busy(self, busy: bool, message: str) -> None:
         for act in (self.act_import, self.act_preview, self.act_export):

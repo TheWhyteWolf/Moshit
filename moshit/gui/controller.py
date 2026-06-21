@@ -119,6 +119,35 @@ class AppController(QObject):
     def motion_labels(self) -> List[str]:
         return [m.label for m in self.project.media.values()]
 
+    def set_project_config(self, *, width: int, height: int, fps: float,
+                           gop: Optional[int] = None,
+                           qscale: Optional[int] = None) -> bool:
+        """Change the sequence geometry/fps. Only allowed before any media is
+        imported, since every clip is normalised to these on import.
+
+        ``self.config`` is shared by the engine and the project, so mutating it
+        in place updates both. Returns False (with an error) if media exists.
+        """
+        if self.project.media:
+            self.error.emit("Project settings can only change before importing "
+                            "media. Start a new project to change them.")
+            return False
+        self.config.width = max(2, int(width))
+        self.config.height = max(2, int(height))
+        self.config.fps = max(1.0, float(fps))
+        if gop is not None:
+            self.config.gop = max(1, int(gop))
+        if qscale is not None:
+            self.config.qscale = max(1, int(qscale))
+        self.project_changed.emit()
+        self.status.emit(f"Sequence: {self.config.width}x{self.config.height} "
+                         f"@ {self.config.fps:g}fps")
+        return True
+
+    @property
+    def has_media(self) -> bool:
+        return bool(self.project.media)
+
     # -- the actual work (synchronous; directly testable) ------------------- #
 
     def _do_import(self, path, role):
@@ -130,10 +159,11 @@ class AppController(QObject):
         frames, fps, _ = self.decoder.decode(out, max_width=720)
         return frames, fps
 
-    def _do_export(self, profile, path):
+    def _do_export(self, profile, path, audio=True):
         out = self._dir / "export_src.avi"
-        self.project.render(self.engine, out)
-        return self.engine.export(out, path, profile)
+        r = self.project.render(self.engine, out, profile=profile,
+                                export_path=str(path), audio=audio)
+        return r["export"]
 
     def _do_bake(self, op_id):
         return self.project.bake_op(self.engine, op_id)
@@ -235,11 +265,24 @@ class AppController(QObject):
         self.preview_done.emit()
         self.status.emit("Preview updated.")
 
-    def export(self, profile: str, path) -> None:
+    def export(self, profile: str, path, audio: bool = True) -> None:
         def done(p):
             self.status.emit(f"Exported → {p}")
-        self._run(lambda: self._do_export(profile, path), done,
+        self._run(lambda: self._do_export(profile, path, audio), done,
                   f"Exporting {profile}…")
+
+    def export_frame(self, frame_index: int, path) -> None:
+        """Save one frame of the current preview render as a full-resolution
+        image. Requires a preview to have been rendered (``preview.avi``)."""
+        src = self._dir / "preview.avi"
+        if not src.exists():
+            self.error.emit("Render a preview first, then save a frame.")
+            return
+
+        def done(p):
+            self.status.emit(f"Saved frame → {p}")
+        self._run(lambda: (self.ff.snapshot(src, path, frame_index), Path(path))[1],
+                  done, "Saving frame…")
 
     def bake(self, op_id: str) -> None:
         def done(_rec):
@@ -247,6 +290,14 @@ class AppController(QObject):
             self.project_changed.emit()
             self.status.emit("Baked (revertible).")
         self._run(lambda: self._do_bake(op_id), done, "Baking…")
+
+    def bake_clip(self, clip_id: str) -> None:
+        def done(_rec):
+            self._clear_undo()
+            self.project_changed.emit()
+            self.status.emit("Baked effect stack (revertible).")
+        self._run(lambda: self.project.bake_clip(self.engine, clip_id), done,
+                  "Baking…")
 
     # -- undo / redo (snapshots of the editable timeline state) ------------- #
 
@@ -307,24 +358,87 @@ class AppController(QObject):
         self.status.emit(f"Added {media.label} to the {track} track")
         return clip
 
-    def set_mosh(self, clip_id: str, mode: str, params: dict):
-        """Set (or update in place) the mosh op on a clip."""
+    # -- effect stack ------------------------------------------------------- #
+
+    def clip_effects(self, clip_id: str) -> List[dict]:
+        """The clip's effect stack as plain dicts for the inspector."""
+        return [{"id": o.id, "mode": o.mode, "params": dict(o.params),
+                 "enabled": o.enabled}
+                for o in self.project.clip_ops(clip_id)]
+
+    def add_effect(self, clip_id: str, mode: str, params: dict):
         self._push_undo()
-        for op in self.project.mosh_ops:
-            if op.target_clip_id == clip_id and op.enabled and not op.archived:
-                op.mode = mode
-                op.params = dict(params)
-                self.project_changed.emit()
-                return op
         op = self.project.add_mosh(mode, params, clip_id)
+        self.project_changed.emit()
+        self.status.emit(f"Added {mode} to the effect stack")
+        return op
+
+    def update_effect(self, op_id: str, mode: str, params: dict):
+        try:
+            op = self.project.op(op_id)
+        except KeyError:
+            return None
+        if op.mode == mode and op.params == params:
+            return op
+        self._push_undo()
+        op.mode = mode
+        op.params = dict(params)
         self.project_changed.emit()
         return op
 
-    def active_op_for_clip(self, clip_id: str):
-        for op in self.project.mosh_ops:
-            if op.target_clip_id == clip_id and op.enabled and not op.archived:
-                return op
-        return None
+    def remove_effect(self, op_id: str) -> None:
+        self._push_undo()
+        if not self.project.remove_mosh(op_id):
+            self._undo.pop()                       # nothing removed; drop the snapshot
+            return
+        self.project_changed.emit()
+        self.status.emit("Removed effect")
+
+    def move_effect(self, op_id: str, delta: int) -> None:
+        snap = self._snapshot()
+        if not self.project.move_mosh(op_id, delta):
+            return
+        self._commit_undo(snap)
+        self.project_changed.emit()
+
+    def set_effect_enabled(self, op_id: str, on: bool) -> None:
+        try:
+            op = self.project.op(op_id)
+        except KeyError:
+            return
+        if op.enabled == on:
+            return
+        self._push_undo()
+        op.enabled = on
+        self.project_changed.emit()
+        self.status.emit(("Enabled " if on else "Disabled ") + op.mode)
+
+    def set_clip_props(self, clip_id: str, props: dict):
+        """Set a main clip's finishing properties (speed/reverse/fades/crossfade).
+
+        No-ops (and records no undo) when nothing actually changes, so simply
+        re-selecting a clip never dirties the project.
+        """
+        try:
+            c = self.project.clip(clip_id)
+        except KeyError:
+            return None
+        speed = max(0.1, min(8.0, float(props.get("speed", c.speed))))
+        reverse = bool(props.get("reverse", c.reverse))
+        fade_in = max(0, int(props.get("fade_in", c.fade_in)))
+        fade_out = max(0, int(props.get("fade_out", c.fade_out)))
+        trans = max(0, int(props.get("transition_in", c.transition_in)))
+        if (speed, reverse, fade_in, fade_out, trans) == (
+                c.speed, c.reverse, c.fade_in, c.fade_out, c.transition_in):
+            return c
+        self._push_undo()
+        c.speed, c.reverse = speed, reverse
+        c.fade_in, c.fade_out, c.transition_in = fade_in, fade_out, trans
+        if c.track == "main":
+            self._repack_main()        # speed changes length -> reposition the rest
+        self.project_changed.emit()
+        self.status.emit("Clip updated.")
+        return c
 
     def revert_last_bake(self) -> None:
         if not self.project.bake_records:
@@ -405,6 +519,21 @@ class AppController(QObject):
             self._repack_main()
         self.project_changed.emit()
         self.status.emit("Split clip.")
+
+    def duplicate_clip(self, clip_id: str):
+        try:
+            c = self.project.clip(clip_id)
+        except KeyError:
+            return None
+        if c.archived:
+            return None
+        self._push_undo()
+        new = self.project.duplicate_clip(clip_id)
+        if new.track == "main":
+            self._repack_main()
+        self.project_changed.emit()
+        self.status.emit("Duplicated clip.")
+        return new
 
     # -- project persistence ------------------------------------------------ #
 
