@@ -100,11 +100,14 @@ class MoshOp:
     target_clip_id: str
     enabled: bool = True
     archived: bool = False
+    region_start: int = 0              # apply only to frames [start, end) of its
+    region_end: Optional[int] = None   # input; None end = through the last frame
 
     def to_dict(self) -> Dict:
         return {"id": self.id, "mode": self.mode, "params": self.params,
                 "target_clip_id": self.target_clip_id,
-                "enabled": self.enabled, "archived": self.archived}
+                "enabled": self.enabled, "archived": self.archived,
+                "region_start": self.region_start, "region_end": self.region_end}
 
     @classmethod
     def from_dict(cls, d: Dict) -> "MoshOp":
@@ -171,6 +174,16 @@ class Project:
     def _ops_for_clip(self, clip_id: str) -> List[MoshOp]:
         return [o for o in self.mosh_ops
                 if o.target_clip_id == clip_id and o.enabled and not o.archived]
+
+    @staticmethod
+    def _op_region(op: MoshOp, n: int):
+        """The frame ``range`` an op applies to within its *n*-frame input, or
+        None for the whole thing (clamped; an empty/full span means None)."""
+        start = max(0, min(int(op.region_start or 0), n))
+        end = n if op.region_end is None else max(start, min(int(op.region_end), n))
+        if start >= end or (start == 0 and end == n):
+            return None
+        return range(start, end)
 
     def _motion_frames(self) -> Dict[str, List[Frame]]:
         # Any imported clip can drive motion; keyed by its (unique) label.
@@ -387,7 +400,8 @@ class Project:
             for op in self._ops_for_clip(c.id):
                 frames = engine.mosh(
                     _as_avivideo(frames, media), op.mode, op.params,
-                    motion_clips=_wrap_motion(motion))
+                    motion_clips=_wrap_motion(motion),
+                    region=self._op_region(op, len(frames)))
             segs.append((c, media, frames))
 
         # Per-clip finished (post-speed) length; crossfade overlap handled below.
@@ -464,7 +478,8 @@ class Project:
         frames = self._clip_frames(target)
         motion = self._motion_frames()
         moshed = engine.mosh(_as_avivideo(frames, media), op.mode, op.params,
-                             motion_clips=_wrap_motion(motion))
+                             motion_clips=_wrap_motion(motion),
+                             region=self._op_region(op, len(frames)))
 
         # write moshed region, then re-encode (bake) to a clean moshable clip
         raw = engine.write_moshed(moshed, media, engine._tmp(".avi"))
@@ -514,7 +529,8 @@ class Project:
         ops = self._ops_for_clip(clip_id)
         for op in ops:
             frames = engine.mosh(_as_avivideo(frames, media), op.mode, op.params,
-                                 motion_clips=_wrap_motion(motion))
+                                 motion_clips=_wrap_motion(motion),
+                                 region=self._op_region(op, len(frames)))
 
         raw = engine.write_moshed(frames, media, engine._tmp(".avi"))
         baked_id = _new_id("media")

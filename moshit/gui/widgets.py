@@ -755,8 +755,8 @@ class PreviewWidget(QWidget):
 # --------------------------------------------------------------------------- #
 
 class InspectorPanel(QWidget):
-    effectAddRequested = Signal(str, dict)         # mode, params
-    effectUpdateRequested = Signal(str, str, dict)  # op_id, mode, params
+    effectAddRequested = Signal(str, dict, object)        # mode, params, region
+    effectUpdateRequested = Signal(str, str, dict, object)  # op_id, mode, params, region
     effectRemoveRequested = Signal(str)            # op_id
     effectMoveRequested = Signal(str, int)         # op_id, delta (-1 up / +1 down)
     effectEnabledChanged = Signal(str, bool)       # op_id, enabled
@@ -821,6 +821,8 @@ class InspectorPanel(QWidget):
         self._form = QFormLayout(self._form_host)
         self._form.setContentsMargins(0, 4, 0, 4)
         layout.addWidget(self._form_host)
+
+        layout.addWidget(self._build_region_row())
 
         self.apply_btn = QPushButton("Apply to selected effect")
         self.apply_btn.clicked.connect(self._emit_update)
@@ -898,6 +900,52 @@ class InspectorPanel(QWidget):
         self.xfade_spin.setValue(int(getattr(clip, "transition_in", 0)))
         self._populating = False
 
+    # -- effect region (apply to a frame range) ----------------------------- #
+
+    def _build_region_row(self) -> QWidget:
+        host = QWidget()
+        row = QHBoxLayout(host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self.region_chk = QCheckBox("Limit to frames")
+        self.region_chk.setToolTip("Apply this effect to only a frame range of "
+                                   "its input (the clip, for the first effect).")
+        self.region_start = QSpinBox()
+        self.region_start.setRange(0, 1_000_000)
+        self.region_end = QSpinBox()
+        self.region_end.setRange(0, 1_000_000)
+        self.region_end.setSpecialValueText("end")     # 0 shows as "end" (= None)
+        self.region_chk.toggled.connect(self._sync_region)
+        row.addWidget(self.region_chk)
+        row.addWidget(self.region_start)
+        row.addWidget(QLabel("–"))
+        row.addWidget(self.region_end)
+        row.addStretch(1)
+        self._region_host = host
+        return host
+
+    def _sync_region(self, *_a) -> None:
+        on = self.region_chk.isChecked()
+        self.region_start.setEnabled(on)
+        self.region_end.setEnabled(on)
+
+    def _editor_region(self):
+        if not self.region_chk.isChecked():
+            return None
+        end = self.region_end.value()
+        return [self.region_start.value(), (None if end == 0 else end)]
+
+    def _populate_region(self, region) -> None:
+        if region:
+            self.region_chk.setChecked(True)
+            self.region_start.setValue(int(region[0]))
+            self.region_end.setValue(0 if region[1] is None else int(region[1]))
+        else:
+            self.region_chk.setChecked(False)
+            self.region_start.setValue(0)
+            self.region_end.setValue(0)
+        self._sync_region()
+
     # -- external state ----------------------------------------------------- #
 
     def set_motion_labels(self, labels: List[str]) -> None:
@@ -916,6 +964,7 @@ class InspectorPanel(QWidget):
         self.mode_combo.setEnabled(on)
         self.bake_btn.setEnabled(on)
         self._form_host.setEnabled(on)
+        self._region_host.setEnabled(on)
         self._clip_group.setEnabled(on)
         self.effect_list.setEnabled(on)
         if on:
@@ -954,6 +1003,7 @@ class InspectorPanel(QWidget):
             self.effect_list.setCurrentRow(row)   # -> _on_effect_row populates editor
         else:
             self._selected_op = None
+            self._populate_region(None)
             self._update_stack_buttons()
 
     def _on_effect_row(self, row: int) -> None:
@@ -963,8 +1013,10 @@ class InspectorPanel(QWidget):
             e = self._effects[row]
             self._selected_op = e["id"]
             self._load_effect(e["mode"], e["params"])
+            self._populate_region(e.get("region"))
         else:
             self._selected_op = None
+            self._populate_region(None)
         self._update_stack_buttons()
 
     def _load_effect(self, mode: str, params: dict) -> None:
@@ -1052,14 +1104,15 @@ class InspectorPanel(QWidget):
     def _emit_add(self) -> None:
         mode, params = self._editor_mode_params()
         if mode is not None:
-            self.effectAddRequested.emit(mode, params)
+            self.effectAddRequested.emit(mode, params, self._editor_region())
 
     def _emit_update(self) -> None:
         if not self._selected_op:
             return
         mode, params = self._editor_mode_params()
         if mode is not None:
-            self.effectUpdateRequested.emit(self._selected_op, mode, params)
+            self.effectUpdateRequested.emit(self._selected_op, mode, params,
+                                            self._editor_region())
 
     def _emit_remove(self) -> None:
         if self._selected_op:

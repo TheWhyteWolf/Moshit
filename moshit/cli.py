@@ -635,6 +635,39 @@ def cmd_selftest(args) -> int:
            "automated pframe_duplicate(factor 1->3) is deterministic (22 frames)",
            failures)
 
+    print("\nI. Region-scoped moshing")
+    iproj = Project(name="i", assets_dir=str(tmp / "assets_i"))
+    ip = tmp / "i.avi"
+    _synth_avi(ip, "I" + "P" * 9)                       # 10 frames, 9 P
+    idest = iproj.assets_dir / "imedia.avi"
+    idest.write_bytes(ip.read_bytes())
+    icav = parse_avi(idest)
+    iproj.media["imedia"] = MediaItem(
+        id="imedia", source_path=str(ip), label="i", role="main",
+        intermediate_path=str(idest), width=icav.width, height=icav.height,
+        fps=icav.fps, nb_frames=len(icav.frames))
+    iproj._parsed["imedia"] = icav
+    ic = iproj.add_clip("imedia", "main")
+    iop = iproj.add_mosh("pframe_duplicate", {"factor": 2}, ic.id)
+
+    _check(iproj.render(fake, tmp / "i_whole.avi")["frames"] == 19,
+           "whole-clip dup: 9 P -> 18 P (19 frames)", failures)
+    iop.region_start, iop.region_end = 0, 5             # frames 0-4 = I + 4 P
+    _check(iproj.render(fake, tmp / "i_region.avi")["frames"] == 14,
+           "region [0,5) duplicates only its 4 P-frames (14)", failures)
+    _check(Project._op_region(iop, 10) == range(0, 5),
+           "_op_region builds the clamped range", failures)
+    iop.region_start, iop.region_end = 0, None
+    _check(Project._op_region(iop, 10) is None,
+           "full / open-ended region resolves to None (whole clip)", failures)
+    iop.region_start, iop.region_end = 8, 3
+    _check(Project._op_region(iop, 10) is None,
+           "inverted region resolves to None", failures)
+    iop.region_start, iop.region_end = 2, 6
+    irel = Project.load(iproj.save(tmp / "i.json"))
+    _check(irel.op(iop.id).region_start == 2 and irel.op(iop.id).region_end == 6,
+           "op region survives JSON round-trip", failures)
+
     print()
     if failures:
         print(f"SELFTEST FAILED: {len(failures)} check(s) failed")

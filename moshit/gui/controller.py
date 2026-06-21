@@ -360,29 +360,45 @@ class AppController(QObject):
 
     # -- effect stack ------------------------------------------------------- #
 
+    @staticmethod
+    def _region_tuple(region):
+        """Normalise a GUI region (None or [start, end]) to (start, end|None)."""
+        if not region:
+            return (0, None)
+        start, end = region
+        return (max(0, int(start)), None if end is None else int(end))
+
     def clip_effects(self, clip_id: str) -> List[dict]:
         """The clip's effect stack as plain dicts for the inspector."""
-        return [{"id": o.id, "mode": o.mode, "params": dict(o.params),
-                 "enabled": o.enabled}
-                for o in self.project.clip_ops(clip_id)]
+        out = []
+        for o in self.project.clip_ops(clip_id):
+            region = ((o.region_start, o.region_end)
+                      if (o.region_start or o.region_end is not None) else None)
+            out.append({"id": o.id, "mode": o.mode, "params": dict(o.params),
+                        "enabled": o.enabled, "region": region})
+        return out
 
-    def add_effect(self, clip_id: str, mode: str, params: dict):
+    def add_effect(self, clip_id: str, mode: str, params: dict, region=None):
         self._push_undo()
         op = self.project.add_mosh(mode, params, clip_id)
+        op.region_start, op.region_end = self._region_tuple(region)
         self.project_changed.emit()
         self.status.emit(f"Added {mode} to the effect stack")
         return op
 
-    def update_effect(self, op_id: str, mode: str, params: dict):
+    def update_effect(self, op_id: str, mode: str, params: dict, region=None):
         try:
             op = self.project.op(op_id)
         except KeyError:
             return None
-        if op.mode == mode and op.params == params:
+        new_region = self._region_tuple(region)
+        if (op.mode == mode and op.params == params
+                and (op.region_start, op.region_end) == new_region):
             return op
         self._push_undo()
         op.mode = mode
         op.params = dict(params)
+        op.region_start, op.region_end = new_region
         self.project_changed.emit()
         return op
 

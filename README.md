@@ -137,6 +137,12 @@ effect processes, so it survives effects that change the frame count. Built-in
 automatable params include `bitrot` intensity, `pframe_duplicate` factor, and
 `surge` intensity; effects opt in (see *Writing an effect*).
 
+**Region.** Each effect can be limited to a frame range of its input — tick
+**Limit to frames** and set a start/end (leave end at `end` to run to the last
+frame). So you can glitch just the middle of a clip, or stack effects that hit
+different parts. Automation ramps over the region when both are set, and the
+range is keyed to the effect's input, so for the first effect it's the clip.
+
 **Generated motion (transforms).** The **Generate** menu makes procedural motion
 sources — zoom in/out, horizontal/vertical pan, and rotate — and drops them on
 the motion track. Each is a static, detailed texture moved by the chosen

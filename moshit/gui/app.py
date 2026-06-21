@@ -394,14 +394,14 @@ class MainWindow(QMainWindow):
         self.controller.set_clip_props(self._selected_clip, props)
         self._schedule_auto_refresh(immediate=True)
 
-    def _on_effect_add(self, mode: str, params: dict) -> None:
+    def _on_effect_add(self, mode: str, params: dict, region) -> None:
         if not self._selected_clip:
             return
-        self.controller.add_effect(self._selected_clip, mode, params)
+        self.controller.add_effect(self._selected_clip, mode, params, region)
         self._schedule_auto_refresh(immediate=True)
 
-    def _on_effect_update(self, op_id: str, mode: str, params: dict) -> None:
-        self.controller.update_effect(op_id, mode, params)
+    def _on_effect_update(self, op_id: str, mode: str, params: dict, region) -> None:
+        self.controller.update_effect(op_id, mode, params, region)
         self._schedule_auto_refresh(immediate=True)
 
     def _set_auto_refresh(self, on: bool) -> None:
