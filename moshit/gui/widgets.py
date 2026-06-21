@@ -24,8 +24,73 @@ from ..modes.base import Param
 # Schema -> widget
 # --------------------------------------------------------------------------- #
 
+def _make_spin(param: Param):
+    if param.kind == "int":
+        s = QSpinBox()
+        s.setRange(int(param.lo) if param.lo is not None else -1_000_000,
+                   int(param.hi) if param.hi is not None else 1_000_000)
+    else:
+        s = QDoubleSpinBox()
+        s.setDecimals(2)
+        s.setSingleStep(0.1)
+        s.setRange(float(param.lo) if param.lo is not None else -1e6,
+                   float(param.hi) if param.hi is not None else 1e6)
+    return s
+
+
+class AutoParamWidget(QWidget):
+    """A numeric control with an **A**(utomate) toggle. Off, it's a plain value;
+    on, it becomes a *start → end* ramp and reports a keyframe spec dict."""
+
+    def __init__(self, param: Param):
+        super().__init__()
+        self._is_int = param.kind == "int"
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+        self.auto_chk = QCheckBox("A")
+        self.auto_chk.setToolTip("Automate: ramp this value across the clip "
+                                 "(start → end)")
+        self.start = _make_spin(param)
+        default = param.default if param.default is not None else 0
+        self.start.setValue(int(default) if self._is_int else float(default))
+        self.arrow = QLabel("→")
+        self.end = _make_spin(param)
+        self.end.setValue(self.start.value())
+        for w in (self.auto_chk, self.start, self.arrow, self.end):
+            lay.addWidget(w)
+        self.auto_chk.toggled.connect(self._sync)
+        self._sync(False)
+
+    def _sync(self, on: bool) -> None:
+        self.arrow.setVisible(on)
+        self.end.setVisible(on)
+
+    def get_value(self):
+        if not self.auto_chk.isChecked():
+            return self.start.value()
+        return {"__auto__": True, "interp": "linear",
+                "keys": [[0.0, self.start.value()], [1.0, self.end.value()]]}
+
+    def set_value(self, value) -> None:
+        coerce = int if self._is_int else float
+        if isinstance(value, dict) and value.get("__auto__"):
+            keys = sorted(value.get("keys", []), key=lambda k: k[0])
+            self.auto_chk.setChecked(True)
+            if keys:
+                self.start.setValue(coerce(keys[0][1]))
+                self.end.setValue(coerce(keys[-1][1]))
+        else:
+            self.auto_chk.setChecked(False)
+            self.start.setValue(coerce(value))
+        self._sync(self.auto_chk.isChecked())
+
+
 def build_param_widget(param: Param) -> Tuple[QWidget, Callable]:
     """Return (control, getter) for a mode parameter. getter() -> current value."""
+    if param.kind in ("int", "float") and getattr(param, "automatable", False):
+        w = AutoParamWidget(param)
+        return w, w.get_value
     if param.kind == "bool":
         w = QCheckBox()
         w.setChecked(bool(param.default))
@@ -958,7 +1023,9 @@ class InspectorPanel(QWidget):
                 continue
             value = params[name]
             w = getattr(getter, "__self__", None)   # the widget bound to the getter
-            if isinstance(w, QCheckBox):
+            if isinstance(w, AutoParamWidget):
+                w.set_value(value)
+            elif isinstance(w, QCheckBox):
                 w.setChecked(bool(value))
             elif isinstance(w, QSpinBox):
                 w.setValue(int(value))

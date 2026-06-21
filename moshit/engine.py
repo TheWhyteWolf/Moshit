@@ -22,7 +22,7 @@ from typing import Dict, List, Optional
 from . import avi
 from .avi import AviVideo, Frame
 from .ffmpeg import FFmpeg
-from .modes import MoshContext, get_mode, load_modes
+from .modes import MoshContext, get_mode, load_modes, resolve_automation
 
 
 @dataclass
@@ -111,14 +111,17 @@ class MoshEngine:
         mode = get_mode(mode_name)
         values = mode.resolve(params)
         clips = {lbl: clip.frames for lbl, clip in (motion_clips or {}).items()}
+        body = list(base.frames if region is None
+                    else base.frames[region.start:region.stop])
+        automation = resolve_automation(values)    # mutates values -> start scalars
         ctx = MoshContext(fps=base.fps, width=base.width, height=base.height,
-                          clips=clips, log=lambda m: None)
+                          clips=clips, log=lambda m: None,
+                          automation=automation, n_frames=len(body))
         if region is None:
-            return mode.apply(list(base.frames), ctx, **values)
-        head = base.frames[:region.start]
-        body = base.frames[region.start:region.stop]
-        tail = base.frames[region.stop:]
-        return head + mode.apply(list(body), ctx, **values) + tail
+            return mode.apply(body, ctx, **values)
+        head = list(base.frames[:region.start])
+        tail = list(base.frames[region.stop:])
+        return head + mode.apply(body, ctx, **values) + tail
 
     # -- stage 3: write / bake / export ------------------------------------- #
 

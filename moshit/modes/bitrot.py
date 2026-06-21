@@ -24,7 +24,8 @@ class Bitrot(MoshMode):
     description = "Corrupt bytes inside P-frames for blocky compression artefacts."
     params = [
         Param("intensity", "float", 0.25, lo=0.0, hi=1.0, label="Affected frames",
-              help="Fraction of P-frames that get corrupted (0–1)."),
+              help="Fraction of P-frames that get corrupted (0–1).",
+              automatable=True),
         Param("hits", "int", 6, lo=1, hi=512, label="Byte flips per frame",
               help="How many bytes to scramble in each affected frame."),
         Param("skip_header", "int", 32, lo=8, hi=256, label="Protect header bytes",
@@ -35,14 +36,15 @@ class Bitrot(MoshMode):
     def apply(self, frames: List[Frame], ctx: MoshContext, *,
               intensity: float = 0.25, hits: int = 6, skip_header: int = 32,
               seed: int = 0) -> List[Frame]:
-        intensity = max(0.0, min(1.0, float(intensity)))
+        base_intensity = max(0.0, min(1.0, float(intensity)))
         hits = max(1, int(hits))
         skip_header = max(8, int(skip_header))
         rng = random.Random(seed)
         out: List[Frame] = []
-        for f in frames:
+        for i, f in enumerate(frames):
+            inten = max(0.0, min(1.0, float(ctx.auto("intensity", i, base_intensity))))
             if (f.is_pframe and len(f.data) > skip_header + 8
-                    and rng.random() < intensity):
+                    and rng.random() < inten):
                 buf = bytearray(f.data)
                 for _ in range(hits):
                     idx = rng.randint(skip_header, len(buf) - 1)

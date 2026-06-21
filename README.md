@@ -128,6 +128,15 @@ effect's mode and parameters, then **Apply to selected effect**. **Bake stack**
 freezes the whole chain into one clip (reversible), leaving the clip's finishing
 editable.
 
+**Parameter automation.** Numeric parameters that an effect marks *automatable*
+get an **A** toggle in the inspector. Switch it on and the single value becomes a
+**start → end** ramp, evaluated across the clip — so a glitch can build, e.g.
+`bitrot` corruption rising from 0 to 0.9, or a `pframe_duplicate` bloom ramping
+`1× → 3×`. The ramp is keyed to normalised position (0–1) over the frames the
+effect processes, so it survives effects that change the frame count. Built-in
+automatable params include `bitrot` intensity, `pframe_duplicate` factor, and
+`surge` intensity; effects opt in (see *Writing an effect*).
+
 **Generated motion (transforms).** The **Generate** menu makes procedural motion
 sources — zoom in/out, horizontal/vertical pan, and rotate — and drops them on
 the motion track. Each is a static, detailed texture moved by the chosen
@@ -303,6 +312,23 @@ class EveryOther(MoshMode):
 It will appear in `moshit modes`, in the GUI inspector, and via
 `--mode every_other`. (A mode file is ordinary Python and runs on load — treat
 third-party modes like any script you install.)
+
+To let a numeric parameter be **automated** (ramped over the clip), mark it
+`Param(..., automatable=True)` and read its per-frame value inside the loop with
+`ctx.auto(name, i, default)`, passing the input-frame index `i`. When the param
+isn't automated, `ctx.auto` just returns `default` (your static value), so the
+same code path serves both:
+
+```python
+params = [Param("amount", "float", 0.5, lo=0.0, hi=1.0, automatable=True)]
+
+def apply(self, frames, ctx, *, amount=0.5):
+    out = []
+    for i, f in enumerate(frames):
+        a = ctx.auto("amount", i, amount)   # ramped if automated, else `amount`
+        ...
+    return out
+```
 
 ## Known limits (v1)
 

@@ -33,6 +33,7 @@ class Param:
     choices: tuple = ()
     label: str = ""
     help: str = ""
+    automatable: bool = False       # effect honors ctx.auto(name, i) for this param
 
     def describe(self) -> str:
         rng = ""
@@ -43,12 +44,54 @@ class Param:
         return f"{self.name} ({self.kind}{rng}, default={self.default!r})"
 
 
+def _build_evaluator(spec: Dict) -> Callable[[float], float]:
+    """Turn an automation spec into ``pos(0..1) -> value`` (clamped, linear)."""
+    keys = sorted((list(k) for k in spec.get("keys", [])), key=lambda k: k[0])
+    if not keys:
+        return lambda pos: 0.0
+    if len(keys) == 1:
+        v = keys[0][1]
+        return lambda pos: v
+
+    def ev(pos: float) -> float:
+        if pos <= keys[0][0]:
+            return keys[0][1]
+        if pos >= keys[-1][0]:
+            return keys[-1][1]
+        for (p0, v0), (p1, v1) in zip(keys, keys[1:]):
+            if p0 <= pos <= p1:
+                t = (pos - p0) / (p1 - p0) if p1 > p0 else 0.0
+                return v0 + (v1 - v0) * t
+        return keys[-1][1]
+
+    return ev
+
+
+def is_automation(value: Any) -> bool:
+    return isinstance(value, dict) and bool(value.get("__auto__"))
+
+
+def resolve_automation(values: Dict[str, Any]) -> Dict[str, Callable[[float], float]]:
+    """Replace any automated param specs in *values* (in place) with their start
+    scalar, and return ``{name: evaluator}`` for the ones that were automated."""
+    automation: Dict[str, Callable[[float], float]] = {}
+    for name in list(values):
+        v = values[name]
+        if is_automation(v):
+            ev = _build_evaluator(v)
+            automation[name] = ev
+            values[name] = ev(0.0)          # static fallback = value at the start
+    return automation
+
+
 @dataclass
 class MoshContext:
     """Runtime context handed to :meth:`MoshMode.apply`.
 
     Gives a mode the geometry/fps of the timeline and read access to other
     sources by label -- notably the motion-source track for splice effects.
+    ``automation`` maps a parameter name to a ``pos(0..1) -> value`` curve;
+    pointwise effects read it via :meth:`auto` to vary a value across the clip.
     """
 
     fps: float
@@ -56,6 +99,8 @@ class MoshContext:
     height: int
     clips: Dict[str, List[Frame]] = field(default_factory=dict)
     log: Callable[[str], None] = lambda msg: None
+    automation: Dict[str, Callable[[float], float]] = field(default_factory=dict)
+    n_frames: int = 0
 
     def get_clip(self, ref: str) -> List[Frame]:
         if ref not in self.clips:
@@ -66,6 +111,16 @@ class MoshContext:
 
     def clip_labels(self) -> List[str]:
         return sorted(self.clips)
+
+    def auto(self, name: str, i: int, default: Any = None) -> Any:
+        """Value of automated param *name* at input-frame index *i* (else
+        *default*). Position is ``i / (n_frames - 1)`` across what the effect
+        processes, so it's robust to effects that change the frame count."""
+        ev = self.automation.get(name)
+        if ev is None:
+            return default
+        pos = (i / (self.n_frames - 1)) if self.n_frames > 1 else 0.0
+        return ev(pos)
 
 
 class MoshMode:

@@ -20,7 +20,13 @@ from . import __version__
 from .avi import Frame, parse_avi, write_avi
 from .engine import EngineConfig, MoshEngine, _ext_for_profile
 from .ffmpeg import FFmpeg, FFmpegError
-from .modes import MoshContext, available_modes, get_mode, load_modes
+from .modes import (
+    MoshContext,
+    available_modes,
+    get_mode,
+    load_modes,
+    resolve_automation,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -91,7 +97,8 @@ def cmd_modes(args) -> int:
         print(f"\n{name}\n  {mode.description}")
         for p in mode.params:
             req = " (required)" if p.default is None else ""
-            print(f"    - {p.describe()}{req}")
+            auto = " (automatable)" if getattr(p, "automatable", False) else ""
+            print(f"    - {p.describe()}{req}{auto}")
             if p.help:
                 print(f"        {p.help}")
     return 0
@@ -285,9 +292,15 @@ class _FakeEngine:
         mode = get_mode(mode_name)
         values = mode.resolve(params)
         clips = {l: c.frames for l, c in (motion_clips or {}).items()}
+        body = list(base.frames if region is None
+                    else base.frames[region.start:region.stop])
+        automation = resolve_automation(values)
         ctx = MoshContext(fps=base.fps, width=base.width, height=base.height,
-                          clips=clips)
-        return mode.apply(list(base.frames), ctx, **values)
+                          clips=clips, automation=automation, n_frames=len(body))
+        if region is None:
+            return mode.apply(body, ctx, **values)
+        return (list(base.frames[:region.start]) + mode.apply(body, ctx, **values)
+                + list(base.frames[region.stop:]))
 
     def write_moshed(self, frames, template, out_avi):
         write_avi(out_avi, frames, template)
@@ -579,6 +592,48 @@ def cmd_selftest(args) -> int:
     _check(grec.baked_clip_id in {c.id for c in gproj.clips}
            and len(gproj.clip_ops(grec.baked_clip_id)) == 0,
            "bake_clip yields a baked clip with an empty stack", failures)
+
+    print("\nH. Parameter automation (keyframed ramps)")
+    from .modes.base import _build_evaluator
+
+    ev = _build_evaluator({"keys": [[0.0, 0.0], [1.0, 1.0]]})
+    _check(abs(ev(0.0)) < 1e-9 and abs(ev(0.5) - 0.5) < 1e-9
+           and abs(ev(1.0) - 1.0) < 1e-9,
+           "linear evaluator ramps 0 -> 0.5 -> 1", failures)
+    _check(abs(ev(-1.0)) < 1e-9 and abs(ev(2.0) - 1.0) < 1e-9,
+           "evaluator clamps outside the keyframe range", failures)
+
+    vals = {"factor": {"__auto__": True, "keys": [[0.0, 1], [1.0, 3]]}}
+    auto = resolve_automation(vals)
+    _check(vals["factor"] == 1 and "factor" in auto,
+           "resolve_automation swaps the spec for its start value", failures)
+    actx = MoshContext(fps=30, width=8, height=8, automation=auto, n_frames=11)
+    _check(actx.auto("factor", 0, 1) == 1 and actx.auto("factor", 10, 1) == 3,
+           "ctx.auto evaluates across n_frames (1 -> 3)", failures)
+    _check(actx.auto("missing", 5, 7) == 7,
+           "ctx.auto returns the default for an un-automated param", failures)
+
+    hproj = Project(name="h", assets_dir=str(tmp / "assets_h"))
+    hp = tmp / "h.avi"
+    _synth_avi(hp, "I" + "P" * 10)                      # 1 I + 10 P
+    hdest = hproj.assets_dir / "hmedia.avi"
+    hdest.write_bytes(hp.read_bytes())
+    hcav = parse_avi(hdest)
+    hproj.media["hmedia"] = MediaItem(
+        id="hmedia", source_path=str(hp), label="h", role="main",
+        intermediate_path=str(hdest), width=hcav.width, height=hcav.height,
+        fps=hcav.fps, nb_frames=len(hcav.frames))
+    hproj._parsed["hmedia"] = hcav
+    hclip = hproj.add_clip("hmedia", "main")
+    hproj.add_mosh("pframe_duplicate",
+                   {"factor": {"__auto__": True, "keys": [[0.0, 1], [1.0, 3]]}},
+                   hclip.id)
+    hr = hproj.render(fake, tmp / "h_render.avi")
+    _check(11 < hr["frames"] < 31,
+           "automated factor lands between constant 1x (11) and 3x (31)", failures)
+    _check(hr["frames"] == 22,
+           "automated pframe_duplicate(factor 1->3) is deterministic (22 frames)",
+           failures)
 
     print()
     if failures:
