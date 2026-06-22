@@ -45,13 +45,32 @@ class Param:
 
 
 def _build_evaluator(spec: Dict) -> Callable[[float], float]:
-    """Turn an automation spec into ``pos(0..1) -> value`` (clamped, linear)."""
-    keys = sorted((list(k) for k in spec.get("keys", [])), key=lambda k: k[0])
+    """Turn an automation spec into ``pos(0..1) -> value`` (clamped).
+
+    Any number of ``keys`` (``[pos, value]``, sorted) is supported; ``interp``
+    selects the easing between them: ``"linear"`` (default), ``"hold"`` (step --
+    the most recent key's value), or ``"smooth"`` (smoothstep ease in/out).
+    """
+    keys = sorted((list(k[:2]) for k in spec.get("keys", [])), key=lambda k: k[0])
+    interp = spec.get("interp", "linear")
     if not keys:
         return lambda pos: 0.0
     if len(keys) == 1:
         v = keys[0][1]
         return lambda pos: v
+
+    if interp == "hold":
+        def ev_hold(pos: float) -> float:
+            val = keys[0][1]
+            for p, v in keys:
+                if pos + 1e-9 >= p:
+                    val = v
+                else:
+                    break
+            return val
+        return ev_hold
+
+    smooth = interp == "smooth"
 
     def ev(pos: float) -> float:
         if pos <= keys[0][0]:
@@ -61,6 +80,8 @@ def _build_evaluator(spec: Dict) -> Callable[[float], float]:
         for (p0, v0), (p1, v1) in zip(keys, keys[1:]):
             if p0 <= pos <= p1:
                 t = (pos - p0) / (p1 - p0) if p1 > p0 else 0.0
+                if smooth:
+                    t = t * t * (3 - 2 * t)
                 return v0 + (v1 - v0) * t
         return keys[-1][1]
 

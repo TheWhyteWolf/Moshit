@@ -649,6 +649,22 @@ def cmd_selftest(args) -> int:
     _check(abs(ev(-1.0)) < 1e-9 and abs(ev(2.0) - 1.0) < 1e-9,
            "evaluator clamps outside the keyframe range", failures)
 
+    # multi-keyframe: a 3-point curve up-then-down
+    mk = _build_evaluator({"keys": [[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]]})
+    _check(abs(mk(0.25) - 0.5) < 1e-9 and abs(mk(0.5) - 1.0) < 1e-9
+           and abs(mk(0.75) - 0.5) < 1e-9,
+           "multi-keyframe curve interpolates each segment", failures)
+    # hold (step): value jumps at keys, no interpolation
+    hold = _build_evaluator({"interp": "hold",
+                             "keys": [[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]]})
+    _check(hold(0.25) == 0.0 and hold(0.5) == 1.0 and hold(0.75) == 1.0
+           and hold(1.0) == 0.0, "hold interp steps between keys", failures)
+    # smooth: eased, but still hits the keys exactly and 0.5 at the midpoint
+    sm = _build_evaluator({"interp": "smooth", "keys": [[0.0, 0.0], [1.0, 1.0]]})
+    _check(abs(sm(0.0)) < 1e-9 and abs(sm(1.0) - 1.0) < 1e-9
+           and abs(sm(0.5) - 0.5) < 1e-9 and sm(0.25) < 0.25,
+           "smooth interp eases in/out (slower at the ends)", failures)
+
     vals = {"factor": {"__auto__": True, "keys": [[0.0, 1], [1.0, 3]]}}
     auto = resolve_automation(vals)
     _check(vals["factor"] == 1 and "factor" in auto,

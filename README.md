@@ -136,10 +136,12 @@ freezes the whole chain into one clip (reversible), leaving the clip's finishing
 editable.
 
 **Parameter automation.** Numeric parameters that an effect marks *automatable*
-get an **A** toggle in the inspector. Switch it on and the single value becomes a
-**start → end** ramp, evaluated across the clip — so a glitch can build, e.g.
-`bitrot` corruption rising from 0 to 0.9, or a `pframe_duplicate` bloom ramping
-`1× → 3×`. The ramp is keyed to normalised position (0–1) over the frames the
+get an **A** toggle in the inspector. Switch it on and **Curve…** opens a keyframe
+editor: add any number of points (each a normalised position 0–1 and a value),
+choose an easing — **linear**, **smooth** (eased in/out), or **hold** (stepped) —
+and watch the curve preview. So a glitch can build and release (e.g. `bitrot`
+corruption rising 0 → 0.9 then back, or a `pframe_duplicate` bloom that peaks mid
+clip), not just ramp once. The curve is keyed to position over the frames the
 effect processes, so it survives effects that change the frame count. Built-in
 automatable params include `bitrot` intensity, `pframe_duplicate` factor, and
 `surge` intensity; effects opt in (see *Writing an effect*).

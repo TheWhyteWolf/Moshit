@@ -11,13 +11,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 from PySide6.QtCore import Qt, QPoint, QRect, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
-    QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QPushButton, QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from ..modes import available_modes, get_mode
-from ..modes.base import Param
+from ..modes.base import Param, _build_evaluator
 
 
 # --------------------------------------------------------------------------- #
@@ -38,52 +38,229 @@ def _make_spin(param: Param):
     return s
 
 
+class _CurvePreview(QWidget):
+    """Tiny live plot of an automation curve (used by the keyframe dialog)."""
+
+    def __init__(self, get_spec: Callable, lo, hi):
+        super().__init__()
+        self._get = get_spec
+        self._lo, self._hi = lo, hi
+        self.setMinimumHeight(90)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#14171c"))
+        spec = self._get()
+        keys = spec.get("keys", [])
+        if not keys:
+            p.end()
+            return
+        vals = [k[1] for k in keys]
+        lo = self._lo if self._lo is not None else min(vals)
+        hi = self._hi if self._hi is not None else max(vals)
+        if hi <= lo:
+            hi = lo + 1.0
+        ox, oy = 5, 5
+        w, h = self.width() - 10, self.height() - 10
+        ev = _build_evaluator(spec)
+
+        def xy(pos, val):
+            return (int(ox + max(0.0, min(1.0, pos)) * w),
+                    int(oy + h - (val - lo) / (hi - lo) * h))
+
+        poly = QPolygon([QPoint(*xy(i / (w - 1), ev(i / (w - 1))))
+                         for i in range(max(2, w))])
+        p.setPen(QColor("#9fb4d6"))
+        p.drawPolyline(poly)
+        p.setPen(QColor("#ff5470"))
+        p.setBrush(QColor("#ff5470"))
+        for kp, kv in keys:
+            p.drawEllipse(QPoint(*xy(kp, kv)), 3, 3)
+        p.end()
+
+
+class KeyframeDialog(QDialog):
+    """Edit an automation curve: any number of keyframes plus an easing mode,
+    with a live preview."""
+
+    def __init__(self, parent, param: Param, spec: dict):
+        super().__init__(parent)
+        self.setWindowTitle(f"Automate: {param.label or param.name}")
+        self._param = param
+        self._is_int = param.kind == "int"
+        self._lo = param.lo
+        self._hi = param.hi
+
+        v = QVBoxLayout(self)
+        self.preview = _CurvePreview(self._collect, self._lo, self._hi)
+        v.addWidget(self.preview)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Easing"))
+        self.interp = QComboBox()
+        self.interp.addItems(["linear", "smooth", "hold"])
+        self.interp.setCurrentText(spec.get("interp", "linear"))
+        self.interp.currentTextChanged.connect(lambda *_: self.preview.update())
+        top.addWidget(self.interp)
+        top.addStretch(1)
+        add_btn = QPushButton("+ Keyframe")
+        add_btn.clicked.connect(lambda: self._add_row(0.5, self._mid()))
+        top.addWidget(add_btn)
+        v.addLayout(top)
+
+        self._rows_host = QWidget()
+        self._rows = QVBoxLayout(self._rows_host)
+        self._rows.setContentsMargins(0, 0, 0, 0)
+        self._rows.setSpacing(2)
+        v.addWidget(self._rows_host)
+
+        keys = sorted(spec.get("keys") or [[0.0, self._mid()], [1.0, self._mid()]],
+                      key=lambda k: k[0])
+        for kp, kv in keys:
+            self._add_row(kp, kv)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        v.addWidget(buttons)
+
+    def _mid(self):
+        if self._lo is not None and self._hi is not None:
+            m = (self._lo + self._hi) / 2
+            return int(m) if self._is_int else round(m, 2)
+        return 0
+
+    def _add_row(self, pos, val) -> None:
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        ps = QDoubleSpinBox()
+        ps.setRange(0.0, 1.0)
+        ps.setSingleStep(0.05)
+        ps.setDecimals(2)
+        ps.setValue(float(pos))
+        vs = _make_spin(self._param)
+        vs.setValue(int(val) if self._is_int else float(val))
+        rm = QPushButton("✕")
+        rm.setMaximumWidth(28)
+        ps.valueChanged.connect(lambda *_: self.preview.update())
+        vs.valueChanged.connect(lambda *_: self.preview.update())
+        rm.clicked.connect(lambda: self._remove_row(row))
+        h.addWidget(QLabel("pos"))
+        h.addWidget(ps)
+        h.addWidget(QLabel("val"))
+        h.addWidget(vs, 1)
+        h.addWidget(rm)
+        row._pos, row._val = ps, vs
+        self._rows.addWidget(row)
+        self.preview.update()
+
+    def _remove_row(self, row) -> None:
+        if self._rows.count() <= 2:           # keep at least two keyframes
+            return
+        row.setParent(None)
+        row.deleteLater()
+        self.preview.update()
+
+    def _collect(self) -> dict:
+        keys = []
+        for i in range(self._rows.count()):
+            row = self._rows.itemAt(i).widget()
+            if row is not None:
+                keys.append([row._pos.value(), row._val.value()])
+        return {"__auto__": True, "interp": self.interp.currentText(), "keys": keys}
+
+    def values(self) -> dict:
+        spec = self._collect()
+        spec["keys"] = sorted(spec["keys"], key=lambda k: k[0])
+        return spec
+
+
 class AutoParamWidget(QWidget):
     """A numeric control with an **A**(utomate) toggle. Off, it's a plain value;
-    on, it becomes a *start → end* ramp and reports a keyframe spec dict."""
+    on, it reports a keyframe spec (edited via **Curve…** -- any number of
+    keyframes with linear/hold/smooth easing)."""
 
     def __init__(self, param: Param):
         super().__init__()
+        self._param = param
         self._is_int = param.kind == "int"
+        default = param.default if param.default is not None else 0
+        self._default = int(default) if self._is_int else float(default)
+        self._spec = None                     # set when automation is enabled
+
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(3)
         self.auto_chk = QCheckBox("A")
-        self.auto_chk.setToolTip("Automate: ramp this value across the clip "
-                                 "(start → end)")
-        self.start = _make_spin(param)
-        default = param.default if param.default is not None else 0
-        self.start.setValue(int(default) if self._is_int else float(default))
-        self.arrow = QLabel("→")
-        self.end = _make_spin(param)
-        self.end.setValue(self.start.value())
-        for w in (self.auto_chk, self.start, self.arrow, self.end):
+        self.auto_chk.setToolTip("Automate this value across the clip")
+        self.value = _make_spin(param)
+        self.value.setValue(self._default)
+        self.value.valueChanged.connect(self._on_value)
+        self.curve_btn = QPushButton("Curve…")
+        self.curve_btn.setMaximumWidth(60)
+        self.curve_btn.setToolTip("Edit keyframes (multi-point + easing)")
+        self.curve_btn.clicked.connect(self._edit_curve)
+        for w in (self.auto_chk, self.value, self.curve_btn):
             lay.addWidget(w)
-        self.auto_chk.toggled.connect(self._sync)
-        self._sync(False)
+        self.auto_chk.toggled.connect(self._on_toggle)
+        self._sync()
 
-    def _sync(self, on: bool) -> None:
-        self.arrow.setVisible(on)
-        self.end.setVisible(on)
+    def _ramp(self, value):
+        return {"__auto__": True, "interp": "linear",
+                "keys": [[0.0, value], [1.0, value]]}
+
+    def _sync(self) -> None:
+        self.curve_btn.setVisible(self.auto_chk.isChecked())
+
+    def _on_toggle(self, on: bool) -> None:
+        if on and self._spec is None:
+            self._spec = self._ramp(self.value.value())
+        self._sync()
+
+    def _on_value(self, v) -> None:
+        if self.auto_chk.isChecked() and self._spec and self._spec["keys"]:
+            self._spec["keys"][0][1] = v      # inline spin edits the first key
+
+    def _edit_curve(self) -> None:
+        if self._spec is None:
+            self._spec = self._ramp(self.value.value())
+        dlg = KeyframeDialog(self, self._param, self._spec)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._spec = dlg.values()
+            keys = self._spec.get("keys")
+            if keys:
+                self.value.blockSignals(True)
+                self.value.setValue(int(keys[0][1]) if self._is_int
+                                    else float(keys[0][1]))
+                self.value.blockSignals(False)
 
     def get_value(self):
         if not self.auto_chk.isChecked():
-            return self.start.value()
-        return {"__auto__": True, "interp": "linear",
-                "keys": [[0.0, self.start.value()], [1.0, self.end.value()]]}
+            return self.value.value()
+        return {"__auto__": True, "interp": self._spec.get("interp", "linear"),
+                "keys": [list(k) for k in self._spec.get("keys", [])]}
 
     def set_value(self, value) -> None:
         coerce = int if self._is_int else float
         if isinstance(value, dict) and value.get("__auto__"):
-            keys = sorted(value.get("keys", []), key=lambda k: k[0])
+            self._spec = {
+                "__auto__": True, "interp": value.get("interp", "linear"),
+                "keys": [[float(k[0]), coerce(k[1])]
+                         for k in sorted(value.get("keys", []), key=lambda k: k[0])]}
             self.auto_chk.setChecked(True)
-            if keys:
-                self.start.setValue(coerce(keys[0][1]))
-                self.end.setValue(coerce(keys[-1][1]))
+            first = self._spec["keys"][0][1] if self._spec["keys"] else self._default
+            self.value.blockSignals(True)
+            self.value.setValue(first)
+            self.value.blockSignals(False)
         else:
             self.auto_chk.setChecked(False)
-            self.start.setValue(coerce(value))
-        self._sync(self.auto_chk.isChecked())
+            self._spec = None
+            self.value.blockSignals(True)
+            self.value.setValue(coerce(value))
+            self.value.blockSignals(False)
+        self._sync()
 
 
 def build_param_widget(param: Param) -> Tuple[QWidget, Callable]:
@@ -1280,8 +1457,7 @@ class InspectorPanel(QWidget):
                         ) if has_range else None
             if isinstance(w, AutoParamWidget):
                 if has_range:
-                    w.auto_chk.setChecked(False)
-                    w.start.setValue(rand_num)
+                    w.set_value(rand_num)          # static (automation off)
             elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
                 if has_range:
                     w.setValue(rand_num)

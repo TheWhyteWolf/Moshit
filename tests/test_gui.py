@@ -65,13 +65,25 @@ def test_presets_save_and_apply(win):
 
 
 def test_inspector_automation_control(win):
-    from moshit.gui.widgets import AutoParamWidget
+    from moshit.gui.widgets import AutoParamWidget, KeyframeDialog
     insp = win.inspector
     insp.mode_combo.setCurrentText("pframe_duplicate")
     w = insp._param_widgets["factor"]
     assert isinstance(w, AutoParamWidget)
+    # enable automation -> a 2-point ramp from the current value
+    w.value.setValue(2)
     w.auto_chk.setChecked(True)
-    w.start.setValue(1)
-    w.end.setValue(3)
     value = insp._getters["factor"]()
-    assert isinstance(value, dict) and value["keys"] == [[0.0, 1], [1.0, 3]]
+    assert isinstance(value, dict) and value["__auto__"] and len(value["keys"]) == 2
+
+    # the keyframe dialog round-trips a multi-point curve with easing
+    from moshit.modes.base import get_mode
+    factor = next(p for p in get_mode("pframe_duplicate").params if p.name == "factor")
+    dlg = KeyframeDialog(None, factor,
+                         {"__auto__": True, "interp": "smooth",
+                          "keys": [[0.0, 1], [0.5, 4], [1.0, 2]]})
+    spec = dlg.values()
+    assert spec["interp"] == "smooth" and len(spec["keys"]) == 3
+    w.set_value(spec)
+    out = w.get_value()
+    assert out["interp"] == "smooth" and len(out["keys"]) == 3
