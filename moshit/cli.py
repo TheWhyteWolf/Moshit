@@ -664,6 +664,11 @@ def cmd_selftest(args) -> int:
     _check(abs(sm(0.0)) < 1e-9 and abs(sm(1.0) - 1.0) < 1e-9
            and abs(sm(0.5) - 0.5) < 1e-9 and sm(0.25) < 0.25,
            "smooth interp eases in/out (slower at the ends)", failures)
+    # per-keyframe easing: hold for the first segment, linear for the second
+    pk = _build_evaluator({"keys": [[0.0, 0.0, "hold"],
+                                    [0.5, 1.0, "linear"], [1.0, 0.0]]})
+    _check(pk(0.25) == 0.0 and abs(pk(0.75) - 0.5) < 1e-9,
+           "per-keyframe easing mixes hold + linear segments", failures)
 
     vals = {"factor": {"__auto__": True, "keys": [[0.0, 1], [1.0, 3]]}}
     auto = resolve_automation(vals)

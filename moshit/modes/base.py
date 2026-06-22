@@ -47,40 +47,34 @@ class Param:
 def _build_evaluator(spec: Dict) -> Callable[[float], float]:
     """Turn an automation spec into ``pos(0..1) -> value`` (clamped).
 
-    Any number of ``keys`` (``[pos, value]``, sorted) is supported; ``interp``
-    selects the easing between them: ``"linear"`` (default), ``"hold"`` (step --
-    the most recent key's value), or ``"smooth"`` (smoothstep ease in/out).
+    Any number of keys is supported. A key is ``[pos, value]`` or
+    ``[pos, value, easing]``; the easing applies to the *segment after* that key
+    -- ``"linear"`` (default), ``"smooth"`` (smoothstep), or ``"hold"`` (step).
+    The curve-level ``interp`` is the default easing for keys that don't carry
+    their own (keeping older 2-element specs working).
     """
-    keys = sorted((list(k[:2]) for k in spec.get("keys", [])), key=lambda k: k[0])
-    interp = spec.get("interp", "linear")
+    default = spec.get("interp", "linear")
+    keys = sorted(
+        ((float(k[0]), k[1], (k[2] if len(k) > 2 else default))
+         for k in spec.get("keys", [])),
+        key=lambda k: k[0])
     if not keys:
         return lambda pos: 0.0
     if len(keys) == 1:
         v = keys[0][1]
         return lambda pos: v
 
-    if interp == "hold":
-        def ev_hold(pos: float) -> float:
-            val = keys[0][1]
-            for p, v in keys:
-                if pos + 1e-9 >= p:
-                    val = v
-                else:
-                    break
-            return val
-        return ev_hold
-
-    smooth = interp == "smooth"
-
     def ev(pos: float) -> float:
         if pos <= keys[0][0]:
             return keys[0][1]
         if pos >= keys[-1][0]:
             return keys[-1][1]
-        for (p0, v0), (p1, v1) in zip(keys, keys[1:]):
-            if p0 <= pos <= p1:
+        for (p0, v0, e0), (p1, v1, _e1) in zip(keys, keys[1:]):
+            if p0 <= pos < p1:                # exclusive upper -> clean steps
+                if e0 == "hold":
+                    return v0
                 t = (pos - p0) / (p1 - p0) if p1 > p0 else 0.0
-                if smooth:
+                if e0 == "smooth":
                     t = t * t * (3 - 2 * t)
                 return v0 + (v1 - v0) * t
         return keys[-1][1]

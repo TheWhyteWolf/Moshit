@@ -74,8 +74,8 @@ class _CurvePreview(QWidget):
         p.drawPolyline(poly)
         p.setPen(QColor("#ff5470"))
         p.setBrush(QColor("#ff5470"))
-        for kp, kv in keys:
-            p.drawEllipse(QPoint(*xy(kp, kv)), 3, 3)
+        for k in keys:
+            p.drawEllipse(QPoint(*xy(k[0], k[1])), 3, 3)
         p.end()
 
 
@@ -96,15 +96,10 @@ class KeyframeDialog(QDialog):
         v.addWidget(self.preview)
 
         top = QHBoxLayout()
-        top.addWidget(QLabel("Easing"))
-        self.interp = QComboBox()
-        self.interp.addItems(["linear", "smooth", "hold"])
-        self.interp.setCurrentText(spec.get("interp", "linear"))
-        self.interp.currentTextChanged.connect(lambda *_: self.preview.update())
-        top.addWidget(self.interp)
+        top.addWidget(QLabel("Keyframes  (pos · value · ease→next)"))
         top.addStretch(1)
         add_btn = QPushButton("+ Keyframe")
-        add_btn.clicked.connect(lambda: self._add_row(0.5, self._mid()))
+        add_btn.clicked.connect(lambda: self._add_row(0.5, self._mid(), "linear"))
         top.addWidget(add_btn)
         v.addLayout(top)
 
@@ -114,10 +109,11 @@ class KeyframeDialog(QDialog):
         self._rows.setSpacing(2)
         v.addWidget(self._rows_host)
 
+        default = spec.get("interp", "linear")
         keys = sorted(spec.get("keys") or [[0.0, self._mid()], [1.0, self._mid()]],
                       key=lambda k: k[0])
-        for kp, kv in keys:
-            self._add_row(kp, kv)
+        for k in keys:
+            self._add_row(k[0], k[1], k[2] if len(k) > 2 else default)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                                    | QDialogButtonBox.StandardButton.Cancel)
@@ -131,7 +127,7 @@ class KeyframeDialog(QDialog):
             return int(m) if self._is_int else round(m, 2)
         return 0
 
-    def _add_row(self, pos, val) -> None:
+    def _add_row(self, pos, val, ease="linear") -> None:
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
@@ -142,17 +138,21 @@ class KeyframeDialog(QDialog):
         ps.setValue(float(pos))
         vs = _make_spin(self._param)
         vs.setValue(int(val) if self._is_int else float(val))
+        es = QComboBox()
+        es.addItems(["linear", "smooth", "hold"])
+        es.setCurrentText(ease if ease in ("linear", "smooth", "hold") else "linear")
+        es.setToolTip("Easing from this keyframe to the next")
         rm = QPushButton("✕")
         rm.setMaximumWidth(28)
         ps.valueChanged.connect(lambda *_: self.preview.update())
         vs.valueChanged.connect(lambda *_: self.preview.update())
+        es.currentTextChanged.connect(lambda *_: self.preview.update())
         rm.clicked.connect(lambda: self._remove_row(row))
-        h.addWidget(QLabel("pos"))
         h.addWidget(ps)
-        h.addWidget(QLabel("val"))
         h.addWidget(vs, 1)
+        h.addWidget(es)
         h.addWidget(rm)
-        row._pos, row._val = ps, vs
+        row._pos, row._val, row._ease = ps, vs, es
         self._rows.addWidget(row)
         self.preview.update()
 
@@ -168,8 +168,11 @@ class KeyframeDialog(QDialog):
         for i in range(self._rows.count()):
             row = self._rows.itemAt(i).widget()
             if row is not None:
-                keys.append([row._pos.value(), row._val.value()])
-        return {"__auto__": True, "interp": self.interp.currentText(), "keys": keys}
+                keys.append([row._pos.value(), row._val.value(),
+                             row._ease.currentText()])
+        # interp mirrors the first key's easing for any curve-level consumer
+        return {"__auto__": True, "interp": keys[0][2] if keys else "linear",
+                "keys": keys}
 
     def values(self) -> dict:
         spec = self._collect()
@@ -247,7 +250,8 @@ class AutoParamWidget(QWidget):
         if isinstance(value, dict) and value.get("__auto__"):
             self._spec = {
                 "__auto__": True, "interp": value.get("interp", "linear"),
-                "keys": [[float(k[0]), coerce(k[1])]
+                "keys": [([float(k[0]), coerce(k[1])]
+                          + ([k[2]] if len(k) > 2 else []))
                          for k in sorted(value.get("keys", []), key=lambda k: k[0])]}
             self.auto_chk.setChecked(True)
             first = self._spec["keys"][0][1] if self._spec["keys"] else self._default
