@@ -57,17 +57,22 @@ def _preset(name: str):
 def transfer_raw(base_frames: List[bytes], motion_frames: List[bytes],
                  width: int, height: int, *, hold: bool = True,
                  accumulate: bool = True, strength: float = 1.0,
-                 preset: str = "fast", use_opencl: bool = True) -> List[bytes]:
+                 preset: str = "fast", use_opencl: bool = True,
+                 out_len=None, region=None) -> List[bytes]:
     """Warp *base_frames* by the optical flow of *motion_frames*.
 
-    Frames are RGB24 bytes (``width*height*3`` each). The result has one frame
-    per motion frame: frame 0 is the unwarped base, and frame ``t`` is the base
-    warped by the flow accumulated through motion frame ``t``.
+    Frames are RGB24 bytes (``width*height*3`` each). Frame 0 is the unwarped
+    base; frame ``i`` is the base warped by the flow accumulated through motion
+    frame ``min(i, last)`` (the flow holds once the motion ends).
 
     * ``hold`` -- warp the base's first frame throughout (the held "melt", like
-      motion_splice holding its keyframe); else warp the t-th base frame.
+      motion_splice holding its keyframe); else warp the i-th base frame.
     * ``accumulate`` -- sum flow over time (drifting smear) vs. instantaneous.
     * ``strength`` -- scale the displacement.
+    * ``out_len`` -- number of output frames (default ``len(motion)``). Pass
+      ``len(base)`` to use it as a *length-preserving clip effect*.
+    * ``region`` -- ``(start, end)`` output frames to warp; outside it the base
+      passes through unchanged.
     """
     import cv2
     import numpy as np
@@ -82,6 +87,8 @@ def transfer_raw(base_frames: List[bytes], motion_frames: List[bytes],
 
     base = [to_arr(b) for b in base_frames]
     motion = [to_arr(b) for b in motion_frames]
+    n_out = int(out_len) if out_len else len(motion)
+    r0, r1 = region if region else (0, n_out)
 
     use_cl = bool(use_opencl) and cv2.ocl.haveOpenCL()
     cv2.ocl.setUseOpenCL(use_cl)
@@ -97,19 +104,24 @@ def transfer_raw(base_frames: List[bytes], motion_frames: List[bytes],
     acc = np.zeros((h, w, 2), np.float32)
     prev_gray = cv2.cvtColor(motion[0], cv2.COLOR_RGB2GRAY)
 
-    out = [np.ascontiguousarray(base[0], np.uint8)]
-    for t in range(1, len(motion)):
-        gray = cv2.cvtColor(motion[t], cv2.COLOR_RGB2GRAY)
-        flow = get(dis.calc(um(prev_gray), um(gray), None))
-        if flow.shape[:2] != (h, w):
-            flow = cv2.resize(flow, (w, h))
-        acc = acc + flow * float(strength) if accumulate else flow * float(strength)
-        mapx = gx + acc[..., 0]
-        mapy = gy + acc[..., 1]
-        src = base[0] if hold else base[min(t, len(base) - 1)]
-        warped = get(cv2.remap(um(src), um(mapx), um(mapy), cv2.INTER_LINEAR,
-                               borderMode=cv2.BORDER_REFLECT))
+    out = []
+    mi = 0                                   # how far motion has accumulated
+    for i in range(n_out):
+        target = min(i, len(motion) - 1)
+        while mi < target:                   # advance motion flow in step with i
+            mi += 1
+            gray = cv2.cvtColor(motion[mi], cv2.COLOR_RGB2GRAY)
+            fl = get(dis.calc(um(prev_gray), um(gray), None))
+            if fl.shape[:2] != (h, w):
+                fl = cv2.resize(fl, (w, h))
+            acc = acc + fl * float(strength) if accumulate else fl * float(strength)
+            prev_gray = gray
+        src = base[0] if hold else base[min(i, len(base) - 1)]
+        if not (r0 <= i < r1) or not acc.any():
+            out.append(np.ascontiguousarray(src, np.uint8))   # passthrough
+            continue
+        warped = get(cv2.remap(um(src), um(gx + acc[..., 0]), um(gy + acc[..., 1]),
+                               cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT))
         out.append(np.ascontiguousarray(warped, np.uint8))
-        prev_gray = gray
 
     return [f.tobytes() for f in out]

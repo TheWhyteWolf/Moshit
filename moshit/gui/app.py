@@ -241,6 +241,7 @@ class MainWindow(QMainWindow):
         self._build_shortcuts()
         self.timeline.set_project(self.controller.project)
         self.inspector.set_presets(self.controller.preset_names())
+        self.inspector.set_flow_sources(self.controller.media_choices())
 
     # -- toolbar ------------------------------------------------------------ #
 
@@ -399,6 +400,7 @@ class MainWindow(QMainWindow):
         self.inspector.revertRequested.connect(lambda: c.revert_last_bake())
         self.inspector.clipPropsChanged.connect(self._on_clip_props)
         self.inspector.flowTransferRequested.connect(self._on_flow_transfer)
+        self.inspector.flowChanged.connect(self._on_flow_changed)
 
     # -- handlers ----------------------------------------------------------- #
 
@@ -418,6 +420,7 @@ class MainWindow(QMainWindow):
         self._set_dirty(True)
         self.timeline.set_project(self.controller.project)
         self.inspector.set_motion_labels(self.controller.motion_labels())
+        self.inspector.set_flow_sources(self.controller.media_choices())
         self.act_undo.setEnabled(self.controller.can_undo)
         self.act_redo.setEnabled(self.controller.can_redo)
         # keep inspector in sync with the selected clip's current op
@@ -441,6 +444,7 @@ class MainWindow(QMainWindow):
             return
         media = self.controller.project.media.get(clip.media_id)
         label = media.label if media else clip_id
+        self.inspector.set_flow_sources(self.controller.media_choices())
         self.inspector.set_enabled_for_clip(
             clip_id, label, clip=clip,
             effects=self.controller.clip_effects(clip_id))
@@ -516,6 +520,12 @@ class MainWindow(QMainWindow):
             return
         motion_id, params = dlg.values()
         self.controller.apply_optical_flow(self._selected_clip, motion_id, **params)
+
+    def _on_flow_changed(self, flow_transfer) -> None:
+        if not self._selected_clip:
+            return
+        self.controller.set_flow_transfer(self._selected_clip, flow_transfer)
+        self._schedule_auto_refresh(immediate=True)
 
     def _set_auto_refresh(self, on: bool) -> None:
         self.auto_refresh = on

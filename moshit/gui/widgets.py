@@ -963,7 +963,8 @@ class InspectorPanel(QWidget):
     pixelFxAddRequested = Signal(str)              # pixel mode name
     pixelFxRemoveRequested = Signal(int)           # index in the clip's pixel list
     pixelFxParamsChanged = Signal(int, dict)       # index, params
-    flowTransferRequested = Signal()               # optical-flow transfer
+    flowTransferRequested = Signal()               # optical-flow transfer (bake)
+    flowChanged = Signal(object)                    # live flow_transfer dict / None
     bakeRequested = Signal()
     revertRequested = Signal()
     clipPropsChanged = Signal(dict)                # speed/reverse/fades/transition
@@ -990,6 +991,7 @@ class InspectorPanel(QWidget):
         layout.addWidget(self.clip_lbl)
         layout.addWidget(self._build_clip_group())
         layout.addWidget(self._build_pixel_group())
+        layout.addWidget(self._build_flow_group())
 
         layout.addWidget(_heading("Effects (top → bottom)"))
         self.effect_list = QListWidget()
@@ -1252,6 +1254,128 @@ class InspectorPanel(QWidget):
         params = {name: getter() for name, getter in self._pixel_getters.items()}
         self.pixelFxParamsChanged.emit(self._pixel_sel, params)
 
+    # -- flow FX (live optical-flow warp) ----------------------------------- #
+
+    def _build_flow_group(self) -> QWidget:
+        group = QWidget()
+        v = QVBoxLayout(group)
+        v.setContentsMargins(0, 0, 0, 4)
+        v.setSpacing(3)
+        v.addWidget(_heading("Flow FX (motion warp)"))
+
+        r1 = QHBoxLayout()
+        self.flow_source = QComboBox()
+        self.flow_source.setToolTip("Warp this clip by another clip's motion "
+                                    "((none) = off; appearance-free)")
+        self.flow_strength = QDoubleSpinBox()
+        self.flow_strength.setRange(0.1, 5.0)
+        self.flow_strength.setSingleStep(0.1)
+        self.flow_strength.setValue(1.0)
+        r1.addWidget(QLabel("Motion"))
+        r1.addWidget(self.flow_source, 1)
+        r1.addWidget(QLabel("×"))
+        r1.addWidget(self.flow_strength)
+        v.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        self.flow_hold = QCheckBox("Hold")
+        self.flow_hold.setChecked(True)
+        self.flow_accum = QCheckBox("Accumulate")
+        self.flow_accum.setChecked(True)
+        self.flow_preset = QComboBox()
+        self.flow_preset.addItems(["ultrafast", "fast", "medium"])
+        self.flow_preset.setCurrentText("fast")
+        r2.addWidget(self.flow_hold)
+        r2.addWidget(self.flow_accum)
+        r2.addWidget(self.flow_preset)
+        r2.addStretch(1)
+        v.addLayout(r2)
+
+        r3 = QHBoxLayout()
+        self.flow_region_chk = QCheckBox("Limit to frames")
+        self.flow_region_start = QSpinBox()
+        self.flow_region_start.setRange(0, 1_000_000)
+        self.flow_region_end = QSpinBox()
+        self.flow_region_end.setRange(0, 1_000_000)
+        self.flow_region_end.setSpecialValueText("end")
+        r3.addWidget(self.flow_region_chk)
+        r3.addWidget(self.flow_region_start)
+        r3.addWidget(QLabel("–"))
+        r3.addWidget(self.flow_region_end)
+        r3.addStretch(1)
+        v.addLayout(r3)
+
+        self.flow_source.currentIndexChanged.connect(self._emit_flow)
+        self.flow_strength.valueChanged.connect(self._emit_flow)
+        self.flow_hold.toggled.connect(self._emit_flow)
+        self.flow_accum.toggled.connect(self._emit_flow)
+        self.flow_preset.currentTextChanged.connect(self._emit_flow)
+        self.flow_region_chk.toggled.connect(self._sync_flow_region)
+        self.flow_region_chk.toggled.connect(self._emit_flow)
+        self.flow_region_start.valueChanged.connect(self._emit_flow)
+        self.flow_region_end.valueChanged.connect(self._emit_flow)
+        self._flow_group = group
+        return group
+
+    def set_flow_sources(self, choices) -> None:
+        cur = self.flow_source.currentData()
+        self._populating = True
+        self.flow_source.clear()
+        self.flow_source.addItem("(none)", None)
+        for label, media_id in choices:
+            self.flow_source.addItem(label, media_id)
+        idx = self.flow_source.findData(cur)
+        self.flow_source.setCurrentIndex(idx if idx >= 0 else 0)
+        self._populating = False
+
+    def _sync_flow_region(self, *_a) -> None:
+        on = self.flow_region_chk.isChecked()
+        self.flow_region_start.setEnabled(on)
+        self.flow_region_end.setEnabled(on)
+
+    def _emit_flow(self, *_a) -> None:
+        if self._populating:
+            return
+        media_id = self.flow_source.currentData()
+        if not media_id:
+            self.flowChanged.emit(None)
+            return
+        ft = {"source": media_id, "strength": self.flow_strength.value(),
+              "hold": self.flow_hold.isChecked(),
+              "accumulate": self.flow_accum.isChecked(),
+              "preset": self.flow_preset.currentText()}
+        if self.flow_region_chk.isChecked():
+            ft["region_start"] = self.flow_region_start.value()
+            end = self.flow_region_end.value()
+            ft["region_end"] = None if end == 0 else end
+        self.flowChanged.emit(ft)
+
+    def _populate_flow(self, ft) -> None:
+        self._populating = True
+        if ft:
+            idx = self.flow_source.findData(ft.get("source"))
+            self.flow_source.setCurrentIndex(idx if idx >= 0 else 0)
+            self.flow_strength.setValue(float(ft.get("strength", 1.0)))
+            self.flow_hold.setChecked(bool(ft.get("hold", True)))
+            self.flow_accum.setChecked(bool(ft.get("accumulate", True)))
+            self.flow_preset.setCurrentText(ft.get("preset", "fast"))
+            has_region = "region_start" in ft or ft.get("region_end") is not None
+            self.flow_region_chk.setChecked(has_region)
+            self.flow_region_start.setValue(int(ft.get("region_start", 0) or 0))
+            self.flow_region_end.setValue(0 if ft.get("region_end") is None
+                                          else int(ft["region_end"]))
+        else:
+            self.flow_source.setCurrentIndex(0)
+            self.flow_strength.setValue(1.0)
+            self.flow_hold.setChecked(True)
+            self.flow_accum.setChecked(True)
+            self.flow_preset.setCurrentText("fast")
+            self.flow_region_chk.setChecked(False)
+            self.flow_region_start.setValue(0)
+            self.flow_region_end.setValue(0)
+        self._sync_flow_region()
+        self._populating = False
+
     # -- effect region (apply to a frame range) ----------------------------- #
 
     def _build_region_row(self) -> QWidget:
@@ -1323,16 +1447,19 @@ class InspectorPanel(QWidget):
         self._region_host.setEnabled(on)
         self._clip_group.setEnabled(on)
         self._pixel_group.setEnabled(on)
+        self._flow_group.setEnabled(on)
         self.effect_list.setEnabled(on)
         if on:
             self.clip_lbl.setText(f"Clip: <b>{label}</b>")
             self._populate_clip_props(clip if clip is not None else object())
             self.set_clip_pixel_fx(getattr(clip, "pixel_effects", []))
+            self._populate_flow(getattr(clip, "flow_transfer", None))
             self.set_clip_effects(effects or [])
         else:
             self.clip_lbl.setText("Select a clip on the main track.")
             self._populate_clip_props(object())        # reset to defaults
             self.set_clip_pixel_fx([])
+            self._populate_flow(None)
             self.set_clip_effects([])
         self._update_stack_buttons()
 

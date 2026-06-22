@@ -319,6 +319,23 @@ class AppController(QObject):
         """(label, media_id) for every imported clip -- candidate flow drivers."""
         return [(m.label, m.id) for m in self.project.media.values()]
 
+    def set_flow_transfer(self, clip_id: str, flow_transfer) -> None:
+        """Set (or clear, with None) a clip's live optical-flow warp."""
+        try:
+            c = self.project.clip(clip_id)
+        except KeyError:
+            return
+        if c.flow_transfer == flow_transfer:
+            return
+        if flow_transfer and not self.flow_available():
+            self.error.emit("Optical-flow needs OpenCV + numpy: "
+                            "pip install 'moshit[flow]'")
+            return
+        self._push_undo()
+        c.flow_transfer = dict(flow_transfer) if flow_transfer else None
+        self.project_changed.emit()
+        self.status.emit("Flow FX updated." if flow_transfer else "Flow FX removed.")
+
     def apply_optical_flow(self, base_clip_id: str, motion_media_id: str,
                            **params) -> None:
         if not self.flow_available():

@@ -79,12 +79,13 @@ class Clip:
     fade_out: int = 0              # frames to fade to black at the tail
     transition_in: int = 0         # crossfade frames from the previous main clip
     pixel_effects: List = field(default_factory=list)  # [{name, params}] FFmpeg FX
+    flow_transfer: Optional[Dict] = None   # live optical-flow warp (see render)
 
     def has_finish(self) -> bool:
         """True if this clip needs the pixel-domain finish pass."""
         return (self.speed != 1.0 or self.reverse or self.fade_in > 0
                 or self.fade_out > 0 or self.transition_in > 0
-                or bool(self.pixel_effects))
+                or bool(self.pixel_effects) or self.flow_transfer is not None)
 
     def to_dict(self) -> Dict:
         return self.__dict__.copy()
@@ -176,6 +177,12 @@ class Project:
     def _ops_for_clip(self, clip_id: str) -> List[MoshOp]:
         return [o for o in self.mosh_ops
                 if o.target_clip_id == clip_id and o.enabled and not o.archived]
+
+    def _flow_motion_media(self, source):
+        """Resolve a flow effect's motion source (a media id or label)."""
+        if source in self.media:
+            return self.media[source]
+        return next((m for m in self.media.values() if m.label == source), None)
 
     def _pixel_filters(self, clip: Clip) -> List[str]:
         """FFmpeg filter strings for a clip's pixel effects (skips unknown ones)."""
@@ -450,8 +457,30 @@ class Project:
             prev_len = mlen
 
         if needs_finish:
-            seg_avis = [engine.write_moshed(frames, media, engine._tmp(".avi"))
-                        for c, media, frames in segs]
+            from . import flow as _flow
+            seg_avis = []
+            for c, media, frames in segs:
+                seg = engine.write_moshed(frames, media, engine._tmp(".avi"))
+                ft = c.flow_transfer
+                motion_m = self._flow_motion_media(ft.get("source")) if ft else None
+                if ft and motion_m is not None and _flow.available():
+                    n = len(frames)
+                    rs = max(0, int(ft.get("region_start", 0) or 0))
+                    re = ft.get("region_end")
+                    region = ((rs, n if re is None else min(int(re), n))
+                              if (rs > 0 or re is not None) else None)
+                    warped = engine.optical_flow_transfer(
+                        seg, motion_m.intermediate_path, engine._tmp(".avi"),
+                        hold=ft.get("hold", True),
+                        accumulate=ft.get("accumulate", True),
+                        strength=float(ft.get("strength", 1.0)),
+                        preset=ft.get("preset", "fast"), out_len=n, region=region)
+                    try:
+                        Path(seg).unlink()
+                    except OSError:
+                        pass
+                    seg = warped
+                seg_avis.append(seg)
             meta = [{"n": len(frames), "speed": c.speed, "reverse": c.reverse,
                      "fade_in": c.fade_in, "fade_out": c.fade_out,
                      "transition_in": c.transition_in,

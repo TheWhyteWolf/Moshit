@@ -168,12 +168,18 @@ aberration), `hue_rotate`, `pixelate`, `noise`, `echo` (frame ghosting), and
 crossfade it, *and* shift its channels — and bake/persist like the other clip
 finishing. `moshit modes` lists them under their own heading.
 
-**Optical-flow transfer (appearance-free motion transfer).** Select a clip and
-click **Optical-flow transfer…** to warp its pixels by the *motion* of another
-clip — dense optical flow drives the warp, so only the base's pixels are
-resampled and **none of the driver's appearance bleeds in** (the clean
-counterpart to `motion_splice`). Pick a motion source, a strength, and hold-vs-
-follow / accumulate options; it renders a new, reversible clip onto the timeline.
+**Optical-flow transfer (appearance-free motion transfer).** Warp a clip's pixels
+by the *motion* of another clip — dense optical flow drives the warp, so only the
+base's pixels are resampled and **none of the driver's appearance bleeds in** (the
+clean counterpart to `motion_splice`). Two ways to use it:
+
+- **Flow FX** (live) — the inspector's Flow FX panel: pick a motion source, a
+  strength, hold-vs-follow / accumulate, and an optional frame range. It's a live,
+  region-scoped clip effect that re-renders as you tweak and composes with the
+  mosh stack, speed/fade and pixel FX (length-preserving).
+- **Optical-flow transfer…** (bake) — the button renders a new, reversible clip
+  onto the timeline (a flat result, no recompute).
+
 This is the one GPU-capable corner: with the `flow` extra installed, OpenCV's
 OpenCL backend runs the flow and the warp on the GPU (AMD via Mesa rusticl,
 Intel, or NVIDIA), falling back to CPU. From the CLI:

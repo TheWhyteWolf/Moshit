@@ -161,12 +161,15 @@ class MoshEngine:
 
     def optical_flow_transfer(self, base_src, motion_src, out_avi, *,
                               hold: bool = True, accumulate: bool = True,
-                              strength: float = 1.0, preset: str = "fast") -> Path:
+                              strength: float = 1.0, preset: str = "fast",
+                              out_len=None, region=None) -> Path:
         """Warp *base_src*'s pixels by the optical flow of *motion_src* into a
         fresh moshable AVI (appearance-free motion transfer).
 
         Both inputs should already be at the project geometry (i.e. normalised
-        intermediates). Needs the optional ``flow`` extra (OpenCV + numpy)."""
+        intermediates). ``out_len`` (default = motion length) and ``region`` make
+        it usable as a length-preserving, region-scoped clip effect. Needs the
+        optional ``flow`` extra (OpenCV + numpy)."""
         from . import flow
         if not flow.available():
             raise FlowUnavailable(
@@ -177,7 +180,7 @@ class MoshEngine:
         motion = list(self.ff.decode_rgb_raw(motion_src, w, h))
         warped = flow.transfer_raw(base, motion, w, h, hold=hold,
                                    accumulate=accumulate, strength=strength,
-                                   preset=preset)
+                                   preset=preset, out_len=out_len, region=region)
         return self.ff.encode_rgb_raw(warped, out_avi, width=w, height=h,
                                       fps=self.config.fps,
                                       qscale=self.config.qscale, gop=self.config.gop)

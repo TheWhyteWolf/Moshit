@@ -68,6 +68,26 @@ def test_project_apply_and_revert(engine, project, make_clip):
 
 
 @requires_ffmpeg
+def test_live_flow_effect_preserves_length(engine, project, make_clip, tmp_path,
+                                           probe):
+    bm = project.import_media(engine, make_clip("base.mp4"), label="base",
+                              role="main")
+    mm = project.import_media(engine, make_clip("mot.mp4"), label="mot",
+                              role="motion")
+    clip = project.add_clip(bm.id, "main")
+    n = len(project._parsed[bm.id].frames)
+    # whole-clip flow warp
+    clip.flow_transfer = {"source": mm.id, "strength": 1.5}
+    assert clip.has_finish()
+    out = tmp_path / "flow.avi"
+    assert project.render(engine, out)["frames"] == n and probe.nframes(out) == n
+    # region-scoped flow still preserves length
+    clip.flow_transfer["region_start"] = 4
+    clip.flow_transfer["region_end"] = 12
+    assert project.render(engine, tmp_path / "flowr.avi")["frames"] == n
+
+
+@requires_ffmpeg
 def test_encode_rgb_raw_reports_errors(tmp_path):
     from moshit.ffmpeg import FFmpeg, FFmpegError
     ff = FFmpeg()

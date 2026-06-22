@@ -788,6 +788,16 @@ def cmd_selftest(args) -> int:
     _check(kproj._pixel_filters(kc) == ["rgbashift=rh=5:bh=-5:rv=2:bv=-2"],
            "_pixel_filters builds known filters and skips unknown ones", failures)
 
+    # live optical-flow effect: a clip property (pure-Python checks only here)
+    kc.flow_transfer = {"source": "kmedia", "strength": 1.5, "region_start": 2}
+    _check(kc.has_finish(), "a clip with flow_transfer needs the finish pass",
+           failures)
+    kfrel = Project.load(kproj.save(tmp / "kflow.json"))
+    _check(kfrel.clip(kc.id).flow_transfer["source"] == "kmedia"
+           and kfrel.clip(kc.id).flow_transfer["region_start"] == 2,
+           "flow_transfer survives JSON round-trip", failures)
+    kc.flow_transfer = None                        # clear before the bake below
+
     kproj.add_mosh("pframe_duplicate", {"factor": 2}, kc.id)
     krec = kproj.bake_clip(fake, kc.id)
     _check([pe["name"] for pe in kproj.clip(krec.baked_clip_id).pixel_effects]
