@@ -99,6 +99,7 @@ class AppController(QObject):
         self.pool = QThreadPool.globalInstance()
         self._busy = False
         self._pending: Optional[Callable] = None
+        self._active_worker = None             # keep the running QRunnable alive
         self._cleaned = False
         self._undo: List = []                 # snapshots of (clips, mosh_ops)
         self._redo: List = []
@@ -180,6 +181,10 @@ class AppController(QObject):
         worker = _Worker(fn)
         worker.signals.finished.connect(self._on_finished)   # queued -> main thread
         worker.signals.error.connect(self._on_error)
+        # Retain a Python reference: QThreadPool owns the C++ runnable, but
+        # without this the Python wrapper (and its signals) can be GC'd mid-run
+        # -- corrupting long tasks like the flow transfer and losing the result.
+        self._active_worker = worker
         self.pool.start(worker)
 
     @Slot(object)
@@ -248,6 +253,7 @@ class AppController(QObject):
         worker.signals.batch.connect(self._on_preview_batch)
         worker.signals.done.connect(self._on_preview_done)
         worker.signals.error.connect(self._on_error)
+        self._active_worker = worker           # retain (see _run)
         self.pool.start(worker)
 
     @Slot(int, float)

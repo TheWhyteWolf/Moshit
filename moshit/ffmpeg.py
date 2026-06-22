@@ -474,23 +474,40 @@ class FFmpeg:
 
     def encode_rgb_raw(self, frames, dst, *, width: int, height: int, fps: float,
                        qscale: int = 3, gop: int = 250) -> Path:
-        """Encode an iterable of RGB24 byte frames to a moshable MPEG-4 AVI."""
+        """Encode an iterable of RGB24 byte frames to a moshable MPEG-4 AVI.
+
+        stdout/stderr are redirected (not inherited) -- otherwise, when this runs
+        on a Qt ``QThreadPool`` worker (e.g. the GUI's flow transfer), the
+        inherited fds break the encoder's pipe mid-write.
+        """
+        import tempfile
+        errlog = tempfile.TemporaryFile()
         proc = subprocess.Popen(
             [self.ffmpeg, "-hide_banner", "-loglevel", "error",
              "-f", "rawvideo", "-pix_fmt", "rgb24",
              "-s", f"{int(width)}x{int(height)}", "-r", str(fps), "-i", "-",
              "-c:v", "mpeg4", "-q:v", str(qscale), "-bf", "0",
              "-g", str(max(1, int(gop))), "-pix_fmt", "yuv420p", "-y", str(dst)],
-            stdin=subprocess.PIPE)
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errlog)
         try:
             for f in frames:
                 proc.stdin.write(f)
+        except BrokenPipeError:
+            pass                              # encoder exited early; surfaced below
         finally:
             if proc.stdin:
-                proc.stdin.close()
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
             proc.wait()
         if proc.returncode not in (0, None):
-            raise FFmpegError(f"rgb encode failed (exit {proc.returncode})")
+            errlog.seek(0)
+            tail = "\n".join(errlog.read().decode("utf-8", "replace")
+                             .strip().splitlines()[-8:])
+            errlog.close()
+            raise FFmpegError(f"rgb encode failed (exit {proc.returncode}):\n{tail}")
+        errlog.close()
         return Path(dst)
 
     def snapshot(self, src, dst, frame_index: int) -> None:

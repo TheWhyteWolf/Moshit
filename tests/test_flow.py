@@ -67,6 +67,59 @@ def test_project_apply_and_revert(engine, project, make_clip):
     assert project.clip(clip.id).enabled and rec.baked_media_id not in project.media
 
 
+@requires_ffmpeg
+def test_encode_rgb_raw_reports_errors(tmp_path):
+    from moshit.ffmpeg import FFmpeg, FFmpegError
+    ff = FFmpeg()
+    bad = tmp_path / "missing_dir" / "x.avi"          # parent does not exist
+    with pytest.raises(FFmpegError):
+        ff.encode_rgb_raw([b"\x00" * 48], bad, width=4, height=4, fps=24)
+
+
+@requires_ffmpeg
+def test_async_optical_flow_via_controller(tmp_path, monkeypatch):
+    """The off-thread flow path (QThreadPool worker) must complete and add a
+    derived clip -- driven with a real idle event loop, like the GUI."""
+    pytest.importorskip("PySide6")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    try:
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import QEventLoop, QTimer
+        QApplication.instance() or QApplication([])
+    except Exception as exc:
+        pytest.skip(f"Qt unavailable: {exc}")
+    from moshit.gui.controller import AppController
+    from moshit.engine import EngineConfig
+    from moshit.ffmpeg import FFmpeg
+
+    ff = FFmpeg()
+
+    def mk(name, src):
+        p = tmp_path / name
+        ff._run(["-f", "lavfi", "-i", src, "-pix_fmt", "yuv420p", "-y", str(p)],
+                "make")
+        return str(p)
+
+    a = mk("a.mp4", "testsrc=size=128x96:rate=24:duration=0.5")
+    b = mk("b.mp4", "testsrc2=size=128x96:rate=24:duration=0.5")
+    c = AppController(config=EngineConfig(width=128, height=96, fps=24.0, gop=12))
+
+    def run_op(call):                                  # main idles in exec()
+        loop = QEventLoop()
+        c.busy.connect(lambda busy, _m: loop.quit() if not busy else None)
+        QTimer.singleShot(60000, loop.quit)            # safety net
+        call()
+        loop.exec()
+
+    run_op(lambda: c.import_media(a, "main"))
+    run_op(lambda: c.import_media(b, "motion"))
+    ids = {m.role: m.id for m in c.project.media.values()}
+    clip = c.add_clip_for_media(ids["main"], "main")
+    run_op(lambda: c.apply_optical_flow(clip.id, ids["motion"], strength=1.5))
+    assert any(m.derived for m in c.project.media.values())
+    c.cleanup()
+
+
 def test_flow_dialog_values():
     pytest.importorskip("PySide6")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
