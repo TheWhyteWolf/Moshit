@@ -782,6 +782,7 @@ class InspectorPanel(QWidget):
     pixelFxAddRequested = Signal(str)              # pixel mode name
     pixelFxRemoveRequested = Signal(int)           # index in the clip's pixel list
     pixelFxParamsChanged = Signal(int, dict)       # index, params
+    flowTransferRequested = Signal()               # optical-flow transfer
     bakeRequested = Signal()
     revertRequested = Signal()
     clipPropsChanged = Signal(dict)                # speed/reverse/fades/transition
@@ -881,6 +882,12 @@ class InspectorPanel(QWidget):
         preset_row.addWidget(self.preset_apply_btn)
         preset_row.addWidget(self.preset_del_btn)
         layout.addLayout(preset_row)
+
+        self.flow_btn = QPushButton("Optical-flow transfer…")
+        self.flow_btn.setToolTip("Warp this clip's pixels by another clip's motion "
+                                 "(appearance-free; GPU via OpenCV/OpenCL)")
+        self.flow_btn.clicked.connect(lambda: self.flowTransferRequested.emit())
+        layout.addWidget(self.flow_btn)
 
         row = QHBoxLayout()
         self.bake_btn = QPushButton("Bake stack")
@@ -1127,6 +1134,7 @@ class InspectorPanel(QWidget):
         on = clip_id is not None
         self.mode_combo.setEnabled(on)
         self.bake_btn.setEnabled(on)
+        self.flow_btn.setEnabled(on)
         self.random_btn.setEnabled(on)
         self.preset_save_btn.setEnabled(on)
         self.preset_apply_btn.setEnabled(on)

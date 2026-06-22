@@ -587,6 +587,49 @@ class Project:
         self.bake_records.append(record)
         return record
 
+    def apply_optical_flow(self, engine: MoshEngine, base_clip_id: str,
+                           motion_media_id: str, **params) -> BakeRecord:
+        """Replace a clip with an appearance-free, flow-warped version of its
+        footage driven by *motion_media_id*. Reversible (a :class:`BakeRecord`,
+        like :meth:`bake_clip`); the original clip is archived, not deleted."""
+        target = self.clip(base_clip_id)
+        base_media = self.media[target.media_id]
+        motion_media = self.media[motion_media_id]
+
+        warped_id = _new_id("media")
+        warped_path = (self.assets_dir / f"{warped_id}.avi") if self.assets_dir \
+            else engine._tmp(".avi")
+        engine.optical_flow_transfer(base_media.intermediate_path,
+                                     motion_media.intermediate_path,
+                                     warped_path, **params)
+        warped_av = avi.parse_avi(warped_path)
+
+        derived = MediaItem(
+            id=warped_id, source_path=base_media.source_path,
+            label=f"flow_{target.id}", role="main",
+            intermediate_path=str(warped_path), width=warped_av.width,
+            height=warped_av.height, fps=warped_av.fps,
+            nb_frames=len(warped_av.frames), derived=True)
+        self.media[warped_id] = derived
+        self._parsed[warped_id] = warped_av
+
+        new_clip = Clip(id=_new_id("clip"), media_id=warped_id, track="main",
+                        start=target.start, in_point=0,
+                        out_point=len(warped_av.frames),
+                        speed=target.speed, reverse=target.reverse,
+                        fade_in=target.fade_in, fade_out=target.fade_out,
+                        transition_in=target.transition_in,
+                        pixel_effects=[dict(pe) for pe in target.pixel_effects])
+        self.clips.append(new_clip)
+
+        target.enabled = False
+        target.archived = True
+        record = BakeRecord(
+            id=_new_id("bake"), baked_media_id=warped_id, baked_clip_id=new_clip.id,
+            replaced_clip_ids=[target.id], consumed_mosh_op_ids=[])
+        self.bake_records.append(record)
+        return record
+
     def revert_bake(self, bake_record_id: str) -> None:
         """Undo a bake: restore archived clips/ops, drop the baked clip+media."""
         rec = next((r for r in self.bake_records if r.id == bake_record_id), None)

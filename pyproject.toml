@@ -16,6 +16,9 @@ dependencies = []
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.5"]
+# Optical-flow motion transfer. OpenCV's OpenCL backend runs it on the GPU
+# (incl. AMD via Mesa rusticl); CPU fallback otherwise.
+flow = ["opencv-python-headless>=4.6", "numpy>=1.21"]
 test = ["pytest>=7"]
 
 [project.scripts]

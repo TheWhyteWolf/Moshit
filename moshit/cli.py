@@ -3,6 +3,7 @@
     moshit probe                     show what this ffmpeg build can do
     moshit modes                     list effects and their parameters
     moshit mosh ...                  mosh a base clip with a motion source
+    moshit flow ...                  appearance-free optical-flow motion transfer
     moshit demo-project ...          end-to-end non-destructive project demo
     moshit render-project p.json     render a saved project
     moshit selftest                  pure-Python checks (no ffmpeg needed)
@@ -87,6 +88,11 @@ def cmd_probe(args) -> int:
     if "vaapi" in ff.capabilities().hwaccels:
         ok = ff.probe_hwaccel("vaapi")
         print(f"  vaapi runtime test: {'works' if ok else 'not usable here'}")
+    from . import flow
+    if flow.available():
+        print(f"  optical flow (opencv): yes -- {flow.backend()}")
+    else:
+        print("  optical flow (opencv): MISSING (pip install 'moshit[flow]')")
     return 0
 
 
@@ -155,6 +161,36 @@ def cmd_mosh(args) -> int:
         print(f"exporting [{args.export}] -> {ep}")
         eng.export(out, ep, args.export, hwaccel=args.hwaccel)
         print(f"exported -> {ep}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# flow  (appearance-free optical-flow motion transfer; needs opencv)
+# --------------------------------------------------------------------------- #
+
+def cmd_flow(args) -> int:
+    from . import flow
+    if not flow.available():
+        raise SystemExit("Optical-flow transfer needs OpenCV + numpy. Install "
+                         "with: pip install 'moshit[flow]'")
+    eng = _engine(args)
+    print(f"flow backend: {flow.backend()}")
+    print(f"normalising base:   {args.base}")
+    base = eng.normalize_clip(args.base, label="base")
+    print(f"normalising motion: {args.motion}")
+    motion = eng.normalize_clip(args.motion, label="motion", single_keyframe=True)
+    print(f"  base:   {base.summary()}")
+    print(f"  motion: {motion.summary()}")
+    out = eng.optical_flow_transfer(
+        base.source, motion.source, args.out,
+        hold=not args.follow, accumulate=not args.no_accumulate,
+        strength=args.strength, preset=args.preset)
+    print(f"flow-warped -> {out}  ({len(motion.frames)} frames)")
+    if args.export:
+        ep = Path(args.export_out) if args.export_out else out.with_suffix(
+            _ext_for_profile(args.export))
+        eng.export(out, ep, args.export, hwaccel=args.hwaccel)
+        print(f"exported [{args.export}] -> {ep}")
     return 0
 
 
@@ -778,6 +814,25 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--hwaccel", default=None, help="e.g. vaapi (H.264/H.265 export)")
     _add_engine_opts(sp)
     sp.set_defaults(func=cmd_mosh)
+
+    sp = sub.add_parser("flow",
+                        help="appearance-free optical-flow motion transfer (opencv)")
+    sp.add_argument("--base", required=True, help="appearance source (held pixels)")
+    sp.add_argument("--motion", required=True, help="motion source (drives the flow)")
+    sp.add_argument("--out", required=True, help="output warped .avi")
+    sp.add_argument("--strength", type=float, default=1.0, help="displacement scale")
+    sp.add_argument("--preset", default="fast",
+                    choices=["ultrafast", "fast", "medium"], help="DIS flow preset")
+    sp.add_argument("--follow", action="store_true",
+                    help="warp each base frame instead of holding the first")
+    sp.add_argument("--no-accumulate", action="store_true",
+                    help="use instantaneous flow (no drifting accumulation)")
+    sp.add_argument("--export", default=None,
+                    help="also export: h264_mp4|h265_mp4|prores_mov|ffv1_mkv|vp9_webm")
+    sp.add_argument("--export-out", default=None)
+    sp.add_argument("--hwaccel", default=None)
+    _add_engine_opts(sp)
+    sp.set_defaults(func=cmd_flow)
 
     sp = sub.add_parser("demo-project",
                         help="end-to-end non-destructive project demo")

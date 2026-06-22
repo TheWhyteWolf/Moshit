@@ -299,6 +299,38 @@ class AppController(QObject):
         self._run(lambda: self.project.bake_clip(self.engine, clip_id), done,
                   "Baking…")
 
+    # -- optical-flow motion transfer --------------------------------------- #
+
+    def flow_available(self) -> bool:
+        from ..flow import available
+        return available()
+
+    def flow_backend(self) -> str:
+        from ..flow import backend
+        return backend()
+
+    def media_choices(self):
+        """(label, media_id) for every imported clip -- candidate flow drivers."""
+        return [(m.label, m.id) for m in self.project.media.values()]
+
+    def apply_optical_flow(self, base_clip_id: str, motion_media_id: str,
+                           **params) -> None:
+        if not self.flow_available():
+            self.error.emit("Optical-flow transfer needs OpenCV + numpy: "
+                            "pip install 'moshit[flow]'")
+            return
+
+        def work():
+            return self.project.apply_optical_flow(
+                self.engine, base_clip_id, motion_media_id, **params)
+
+        def done(_rec):
+            self._clear_undo()
+            self.project_changed.emit()
+            self.status.emit(f"Optical-flow transfer applied "
+                             f"({self.flow_backend()}); revertible.")
+        self._run(work, done, "Optical-flow transfer…")
+
     # -- undo / redo (snapshots of the editable timeline state) ------------- #
 
     def _snapshot(self):

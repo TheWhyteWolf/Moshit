@@ -25,6 +25,10 @@ from .ffmpeg import FFmpeg
 from .modes import MoshContext, get_mode, load_modes, resolve_automation
 
 
+class FlowUnavailable(RuntimeError):
+    """Raised when optical-flow transfer is used without the optional deps."""
+
+
 @dataclass
 class EngineConfig:
     """Project-wide normalisation target. All clips are coerced to these."""
@@ -154,6 +158,29 @@ class MoshEngine:
         Returns the written path, or None if there was no real audio to place.
         """
         return self.ff.build_audio_track(plan, dst, fps=fps or self.config.fps)
+
+    def optical_flow_transfer(self, base_src, motion_src, out_avi, *,
+                              hold: bool = True, accumulate: bool = True,
+                              strength: float = 1.0, preset: str = "fast") -> Path:
+        """Warp *base_src*'s pixels by the optical flow of *motion_src* into a
+        fresh moshable AVI (appearance-free motion transfer).
+
+        Both inputs should already be at the project geometry (i.e. normalised
+        intermediates). Needs the optional ``flow`` extra (OpenCV + numpy)."""
+        from . import flow
+        if not flow.available():
+            raise FlowUnavailable(
+                "Optical-flow transfer needs OpenCV + numpy. Install them with: "
+                "pip install 'moshit[flow]'")
+        w, h = self.config.width, self.config.height
+        base = list(self.ff.decode_rgb_raw(base_src, w, h))
+        motion = list(self.ff.decode_rgb_raw(motion_src, w, h))
+        warped = flow.transfer_raw(base, motion, w, h, hold=hold,
+                                   accumulate=accumulate, strength=strength,
+                                   preset=preset)
+        return self.ff.encode_rgb_raw(warped, out_avi, width=w, height=h,
+                                      fps=self.config.fps,
+                                      qscale=self.config.qscale, gop=self.config.gop)
 
     def finish_clips(self, segments, meta, dst):
         """Pixel-domain finish pass: apply per-clip speed/reverse/fade/pixel-FX

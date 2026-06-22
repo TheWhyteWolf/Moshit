@@ -443,6 +443,56 @@ class FFmpeg:
              "-g", str(max(1, gop)), "-pix_fmt", "yuv420p", str(dst_avi)],
             f"bake {Path(src_avi).name}")
 
+    def decode_rgb_raw(self, src, width: int, height: int):
+        """Yield each frame of *src* as raw RGB24 bytes at *width* x *height*.
+
+        Frames are scaled to the requested geometry, so the byte length is always
+        ``width*height*3``. Kept numpy-free -- callers (e.g. :mod:`moshit.flow`)
+        wrap the bytes in arrays themselves.
+        """
+        w, h = int(width), int(height)
+        frame_bytes = w * h * 3
+        proc = subprocess.Popen(
+            [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(src),
+             "-vf", f"scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while True:
+                buf = b""
+                while len(buf) < frame_bytes:
+                    chunk = proc.stdout.read(frame_bytes - len(buf))
+                    if not chunk:
+                        break
+                    buf += chunk
+                if len(buf) < frame_bytes:
+                    break
+                yield buf
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            proc.wait()
+
+    def encode_rgb_raw(self, frames, dst, *, width: int, height: int, fps: float,
+                       qscale: int = 3, gop: int = 250) -> Path:
+        """Encode an iterable of RGB24 byte frames to a moshable MPEG-4 AVI."""
+        proc = subprocess.Popen(
+            [self.ffmpeg, "-hide_banner", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", "rgb24",
+             "-s", f"{int(width)}x{int(height)}", "-r", str(fps), "-i", "-",
+             "-c:v", "mpeg4", "-q:v", str(qscale), "-bf", "0",
+             "-g", str(max(1, int(gop))), "-pix_fmt", "yuv420p", "-y", str(dst)],
+            stdin=subprocess.PIPE)
+        try:
+            for f in frames:
+                proc.stdin.write(f)
+        finally:
+            if proc.stdin:
+                proc.stdin.close()
+            proc.wait()
+        if proc.returncode not in (0, None):
+            raise FFmpegError(f"rgb encode failed (exit {proc.returncode})")
+        return Path(dst)
+
     def snapshot(self, src, dst, frame_index: int) -> None:
         """Write a single decoded frame (*frame_index*, 0-based) as an image.
 

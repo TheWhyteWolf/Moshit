@@ -140,6 +140,54 @@ class ExportDialog(QDialog):
         return self.fmt.currentText(), self.audio.isChecked()
 
 
+class FlowDialog(QDialog):
+    """Pick a motion driver and parameters for an optical-flow transfer."""
+
+    def __init__(self, parent, choices, backend: str):
+        super().__init__(parent)
+        self.setWindowTitle("Optical-flow transfer")
+        form = QFormLayout(self)
+
+        self.motion = QComboBox()
+        for label, media_id in choices:
+            self.motion.addItem(label, media_id)
+
+        self.strength = QDoubleSpinBox()
+        self.strength.setRange(0.1, 5.0)
+        self.strength.setSingleStep(0.1)
+        self.strength.setValue(1.0)
+        self.preset = QComboBox()
+        self.preset.addItems(["ultrafast", "fast", "medium"])
+        self.preset.setCurrentText("fast")
+        self.hold = QCheckBox("Hold first frame (melt)")
+        self.hold.setChecked(True)
+        self.accumulate = QCheckBox("Accumulate flow (drift)")
+        self.accumulate.setChecked(True)
+
+        form.addRow("Motion source", self.motion)
+        form.addRow("Strength", self.strength)
+        form.addRow("Quality", self.preset)
+        form.addRow(self.hold)
+        form.addRow(self.accumulate)
+        backend_lbl = QLabel(f"Compute: {backend}")
+        backend_lbl.setStyleSheet("color:#8a92a6;")
+        form.addRow(backend_lbl)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self):
+        return self.motion.currentData(), {
+            "hold": self.hold.isChecked(),
+            "accumulate": self.accumulate.isChecked(),
+            "strength": self.strength.value(),
+            "preset": self.preset.currentText(),
+        }
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: Optional[EngineConfig] = None,
                  ffmpeg_bin: Optional[str] = None,
@@ -350,6 +398,7 @@ class MainWindow(QMainWindow):
         self.inspector.bakeRequested.connect(self._on_bake)
         self.inspector.revertRequested.connect(lambda: c.revert_last_bake())
         self.inspector.clipPropsChanged.connect(self._on_clip_props)
+        self.inspector.flowTransferRequested.connect(self._on_flow_transfer)
 
     # -- handlers ----------------------------------------------------------- #
 
@@ -446,6 +495,27 @@ class MainWindow(QMainWindow):
         if self._selected_clip:
             self.controller.update_pixel_fx(self._selected_clip, index, params)
             self._schedule_auto_refresh(immediate=True)
+
+    def _on_flow_transfer(self) -> None:
+        if not self._selected_clip:
+            self.statusBar().showMessage("Select a main clip to transfer motion onto.")
+            return
+        if not self.controller.flow_available():
+            QMessageBox.warning(
+                self, "Optical-flow transfer",
+                "This needs OpenCV + numpy (GPU via OpenCL when available).\n\n"
+                "    pip install 'moshit[flow]'")
+            return
+        choices = self.controller.media_choices()
+        if not choices:
+            QMessageBox.information(self, "Optical-flow transfer",
+                                    "Import a clip to drive the motion first.")
+            return
+        dlg = FlowDialog(self, choices, self.controller.flow_backend())
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        motion_id, params = dlg.values()
+        self.controller.apply_optical_flow(self._selected_clip, motion_id, **params)
 
     def _set_auto_refresh(self, on: bool) -> None:
         self.auto_refresh = on

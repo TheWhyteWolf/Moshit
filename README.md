@@ -34,7 +34,13 @@ bitstream, with the AVI index used only as a cross-check. The heavy lifting
 - Python 3.9+
 - FFmpeg with the `mpeg4` encoder (effectively every normal build); `ffmpeg` and
   `ffprobe` must be on your `PATH`
-- PySide6 — only if you want the GUI
+- PySide6 — only if you want the GUI (`pip install 'moshit[gui]'`)
+- OpenCV + numpy — only for **optical-flow motion transfer**
+  (`pip install 'moshit[flow]'`); it runs on the GPU via OpenCV's OpenCL backend
+  (including AMD through Mesa rusticl), CPU otherwise
+
+The core engine and CLI themselves have **no** third-party Python dependencies;
+the GUI and optical flow are opt-in extras.
 
 On Arch:
 
@@ -42,7 +48,8 @@ On Arch:
 sudo pacman -S ffmpeg
 ```
 
-Check what your FFmpeg build can do:
+Check what your FFmpeg build can do (and whether optical flow is available and
+GPU-backed):
 
 ```sh
 python -m moshit.cli probe
@@ -159,14 +166,29 @@ aberration), `hue_rotate`, `pixelate`, `noise`, `echo` (frame ghosting), and
 crossfade it, *and* shift its channels — and bake/persist like the other clip
 finishing. `moshit modes` lists them under their own heading.
 
+**Optical-flow transfer (appearance-free motion transfer).** Select a clip and
+click **Optical-flow transfer…** to warp its pixels by the *motion* of another
+clip — dense optical flow drives the warp, so only the base's pixels are
+resampled and **none of the driver's appearance bleeds in** (the clean
+counterpart to `motion_splice`). Pick a motion source, a strength, and hold-vs-
+follow / accumulate options; it renders a new, reversible clip onto the timeline.
+This is the one GPU-capable corner: with the `flow` extra installed, OpenCV's
+OpenCL backend runs the flow and the warp on the GPU (AMD via Mesa rusticl,
+Intel, or NVIDIA), falling back to CPU. From the CLI:
+
+```sh
+python -m moshit.cli flow --base footage.mp4 --motion fire.mp4 \
+    --strength 1.5 --out warped.avi --export h264_mp4 --export-out warped.mp4
+```
+
 **Generated motion (transforms).** The **Generate** menu makes procedural motion
 sources — zoom in/out, horizontal/vertical pan, and rotate — and drops them on
 the motion track. Each is a static, detailed texture moved by the chosen
 transform, so it carries that geometry as codec motion vectors: pick one as a
 `motion_splice` (or `motion_weave`) source and the zoom/pan/rotate is transferred
 onto your base clip. The source's texture bleeds through along with the motion —
-that is the motion-transfer look. (Appearance-free geometric transforms would
-need synthetic motion-vector frames, a separate future route.)
+that is the motion-transfer look. (For *appearance-free* transfer — motion with
+no source texture bleeding through — use **Optical-flow transfer** above.)
 
 **Where files go.** Imported clips are transcoded to a moshable intermediate, and
 baked clips and preview renders are written to a per-session temporary folder.
@@ -391,6 +413,7 @@ Remaining basic-editing polish:
   still lays clips out contiguously (with a corner marker) rather than drawing
   the true overlap; a compositing track is the longer-term home for that.
 
-And, on the glitch side:
-
-- A pixel-domain optical-flow effect (GPU) for appearance-free motion transfer.
+On the glitch side, the big roadmap item — a GPU optical-flow effect for
+appearance-free motion transfer — now ships (see **Optical-flow transfer**).
+Remaining ideas: per-clip optical-flow as a live, region-scoped *effect* (rather
+than a bake-style derived clip), and multi-keyframe automation curves with easing.
