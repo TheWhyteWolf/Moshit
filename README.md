@@ -127,7 +127,8 @@ clean, pixel-domain edits — distinct from the codec-domain mosh effects — so
 compose with moshing: you can mosh a clip *and* slow it, reverse it, or dissolve
 into it. They only kick in a re-encode when used; plain moshing keeps the fast
 codec-only path. Speed shows on the timeline as a `2×` badge (reverse `⇄`, fades
-`⊳`/`⊲`), and a crossfade shows as a corner wedge on the clip it fades into.
+`⊳`/`⊲`), and a crossfade shows as a hatched overlap band where the two clips
+dissolve — the same region the renderer blends.
 
 **Effect stacks.** A clip holds a *stack* of effects, applied top to bottom — so
 glitches compound (e.g. `pframe_duplicate` → `bitrot` → `pframe_shuffle`). The
@@ -400,10 +401,10 @@ def apply(self, frames, ctx, *, amount=0.5):
 
 ## Known limits (v1)
 
-- The main track is a sequence of clips laid out contiguously; a mosh targets one
-  clip and may pull motion from a clip on the motion track. A crossfade overlaps
-  two clips at render time, but the timeline still draws them edge-to-edge (with a
-  marker) — full compositing tracks are future work.
+- The main track is a single sequence of clips; a mosh targets one clip and may
+  pull motion from a clip on the motion track. A crossfade overlaps two clips at
+  render time, and the timeline now draws that true overlap (a hatched band) —
+  but independent, freely stacked compositing tracks are still future work.
 - Clip trims snap to the nearest preceding keyframe so every clip stays
   decodable (GOP-based editing; for frame-exact cuts, use a smaller GOP).
 - Audio is reassembled from the original sources and muxed on **export** (the
@@ -419,16 +420,16 @@ def apply(self, frames, ctx, *, amount=0.5):
 
 Planned, in order:
 
-1. **Visual crossfade overlap** — crossfades render correctly, but the timeline
-   still lays clips out contiguously (with a corner marker) rather than drawing
-   the true overlap; a compositing track is the longer-term home for that.
-2. **Undo/redo** — snapshot-based edit history over the JSON project model.
-3. **Clip split at playhead** — split one clip into two, GOP-snapped so both
+1. **Undo/redo** — snapshot-based edit history over the JSON project model.
+2. **Clip split at playhead** — split one clip into two, GOP-snapped so both
    halves stay decodable.
-4. **Audio waveform in the timeline** — draw the assembled track under the
+3. **Audio waveform in the timeline** — draw the assembled track under the
    timeline (pairs with synced preview audio).
-5. **Beat-synced keyframes** — onset/beat detection that auto-places automation
+4. **Beat-synced keyframes** — onset/beat detection that auto-places automation
    keyframes (e.g. drive `iframe_pulse`/`surge` on the beat).
+
+Done: **visual crossfade overlap** — the timeline draws crossfading clips with
+their true overlap (a hatched band) and a frame-accurate, overlap-aware ruler.
 
 On the glitch side, the signature systems have all landed: GPU optical-flow
 motion transfer (see **Optical-flow transfer**), per-clip optical-flow as a

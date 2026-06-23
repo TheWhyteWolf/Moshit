@@ -79,6 +79,22 @@ def test_preview_audio_builds_and_mutes(qapp, tmp_path, monkeypatch):
     c.cleanup()
 
 
+def test_timeline_crossfade_overlap_layout(qapp):
+    from moshit.gui.widgets import TimelineWidget
+    from moshit.project import Project, Clip, MediaItem
+    tl = TimelineWidget()
+    proj = Project()
+    proj.media["m"] = MediaItem(id="m", source_path="x", label="x", role="main",
+                                intermediate_path="x", nb_frames=20)
+    proj.clips.append(Clip(id="a", media_id="m", track="main"))
+    proj.clips.append(Clip(id="b", media_id="m", track="main", transition_in=8))
+    tl.set_project(proj)
+    lay = [(c.id, start, length, trans) for c, start, length, trans
+           in tl._main_layout()]
+    assert lay == [("a", 0, 20, 0), ("b", 12, 20, 8)]   # b overlaps a's tail by 8
+    assert tl._main_length() == 32                       # 20 + 20 - 8 (matches render)
+
+
 def test_effect_stack_region_and_pixel_fx(win):
     ctl = win.controller
     _seed_clip(ctl, "c")

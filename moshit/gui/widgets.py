@@ -447,8 +447,29 @@ class TimelineWidget(QWidget):
         return [c for c in self._project.clips
                 if c.track == "motion" and not c.archived]
 
+    def _main_layout(self):
+        """Main-track layout as ``[(clip, start, length, trans), ...]`` in frames.
+
+        Crossfading clips overlap the previous one by their (clamped) transition,
+        so the laid-out total matches the rendered timeline (which is shorter than
+        the contiguous sum by every overlap) and the playhead stays frame-accurate.
+        """
+        out = []
+        cursor = 0
+        prev_len = 0
+        for i, clip in enumerate(self._main_clips()):
+            length = self._project._clip_length(clip)
+            trans = (min(int(getattr(clip, "transition_in", 0)), length, prev_len)
+                     if i > 0 else 0)
+            start = cursor - trans
+            out.append((clip, start, length, trans))
+            cursor = start + length
+            prev_len = length
+        return out
+
     def _main_length(self) -> int:
-        return sum(self._project._clip_length(c) for c in self._main_clips())
+        lay = self._main_layout()
+        return (lay[-1][1] + lay[-1][2]) if lay else 0
 
     def _track_x(self) -> Tuple[int, int]:
         return self.PAD + self.LABEL_W, self.width() - self.PAD
@@ -495,15 +516,18 @@ class TimelineWidget(QWidget):
             p.fillRect(QRect(x0, self._lane_y(lane), track_w, self.LANE_H),
                        QColor("#262b33"))
 
-        # main clips (sequential)
-        cursor = 0
-        for clip in self._main_clips():
-            length = self._project._clip_length(clip)
-            rect = QRect(int(x0 + cursor * ppf), self._lane_y(0),
+        # main clips (crossfading clips overlap the previous one)
+        bands = []
+        for clip, start, length, trans in self._main_layout():
+            rect = QRect(int(x0 + start * ppf), self._lane_y(0),
                          max(2, int(length * ppf) - 2), self.LANE_H)
             self._draw_clip(p, rect, clip, length)
             self._hits.append((rect, clip.id, "main"))
-            cursor += length
+            if trans > 0:
+                bands.append(QRect(int(x0 + start * ppf), self._lane_y(0),
+                                   max(2, int(trans * ppf)), self.LANE_H))
+        for band in bands:                            # overlay after all clips
+            self._draw_xfade_band(p, band)
 
         # motion clips
         cursor = 0
@@ -561,23 +585,39 @@ class TimelineWidget(QWidget):
         p.drawText(rect.adjusted(5, 0, -3, 0),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    f"{label}  {length}f{suffix}")
-        # crossfade-from-previous marker: a small wedge on the left edge
-        if getattr(clip, "transition_in", 0) and not motion:
-            p.setBrush(QColor("#ffd166"))
-            p.setPen(Qt.PenStyle.NoPen)
-            tl = rect.topLeft()
-            p.drawPolygon(QPolygon([QPoint(tl.x(), tl.y()),
-                                    QPoint(tl.x() + 11, tl.y()),
-                                    QPoint(tl.x(), tl.y() + 11)]))
-            p.setBrush(Qt.BrushStyle.NoBrush)
+
+    def _draw_xfade_band(self, p, rect) -> None:
+        """Shade the crossfade overlap region with a hatched translucent band."""
+        p.save()
+        p.setClipRect(rect)
+        p.fillRect(rect, QColor(255, 209, 102, 70))   # translucent yellow wash
+        p.setPen(QColor(255, 209, 102, 150))          # diagonal hatch
+        h = rect.height()
+        x = rect.left() - h
+        while x < rect.right():
+            p.drawLine(x, rect.bottom(), x + h, rect.top())
+            x += 6
+        p.setPen(QColor("#ffd166"))                   # crisp edges
+        p.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
+        p.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
+        p.restore()
 
     # -- hit testing -------------------------------------------------------- #
 
     def _hit(self, pos) -> Optional[Tuple[QRect, str, str]]:
+        # Where crossfading clips overlap, a clip near one of its trim edges wins
+        # (so both handles stay reachable); otherwise the topmost (last-drawn) clip.
+        edge_hit = None
+        body_hit = None
         for entry in self._hits:
-            if entry[0].contains(pos):
-                return entry
-        return None
+            rect = entry[0]
+            if not rect.contains(pos):
+                continue
+            body_hit = entry
+            if edge_hit is None and (abs(pos.x() - rect.left()) <= self.EDGE
+                                     or abs(pos.x() - rect.right()) <= self.EDGE):
+                edge_hit = entry
+        return edge_hit or body_hit
 
     def _drop_index(self, x: int, exclude: str) -> int:
         idx = 0
