@@ -192,6 +192,14 @@ class MoshEngine:
                                     gop=self.config.gop, qscale=self.config.qscale,
                                     width=self.config.width, height=self.config.height)
 
+    def composite(self, layers, dst, *, total_frames):
+        """Composite positioned video layers (opacity + blend + alpha) into one
+        moshable AVI. Returns the written path."""
+        return self.ff.composite_video(
+            layers, dst, total_frames=total_frames, fps=self.config.fps,
+            width=self.config.width, height=self.config.height,
+            gop=self.config.gop, qscale=self.config.qscale)
+
     # -- convenience: end-to-end two-clip mosh ------------------------------ #
 
     def mosh_two_clips(self, base_src, motion_src, out_avi, *,

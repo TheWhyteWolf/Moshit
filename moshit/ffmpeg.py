@@ -25,6 +25,16 @@ class FFmpegError(RuntimeError):
     """Raised when an ffmpeg/ffprobe invocation fails."""
 
 
+# Clip blend_mode -> ffmpeg `blend` filter all_mode. "normal" is handled
+# separately (plain alpha-over via overlay), so it isn't listed here.
+BLEND_MODES = {
+    "screen": "screen", "multiply": "multiply", "overlay": "overlay",
+    "add": "addition", "subtract": "subtract", "difference": "difference",
+    "darken": "darken", "lighten": "lighten", "hardlight": "hardlight",
+    "softlight": "softlight",
+}
+
+
 def _atempo_chain(speed: float) -> List[str]:
     """`atempo` filters whose product is *speed* (each stage stays in 0.5..2.0)."""
     s = float(speed)
@@ -398,6 +408,63 @@ class FFmpeg:
                    "-c:v", "mpeg4", "-q:v", str(qscale), "-bf", "0",
                    "-g", str(max(1, gop)), "-pix_fmt", "yuv420p", "-y", str(dst)],
                   "finish video")
+        return Path(dst)
+
+    def composite_video(self, layers: List[Dict], dst, *, total_frames: int,
+                        width: int, height: int, fps: float,
+                        gop: int = 250, qscale: int = 3) -> Path:
+        """Composite positioned layers onto a black canvas, bottom-to-top.
+
+        *layers* is ordered bottom→top; each is ``{"input", "start", "length",
+        "opacity", "blend"}`` (start/length in frames). Each input becomes a
+        full-length layer (transparent outside its [start, start+length] window),
+        scaled to ``width x height`` with its alpha set by ``opacity``. ``normal``
+        composites with a plain alpha-over (``overlay``); any other ``blend`` maps
+        through :data:`BLEND_MODES`, applied only inside the window via the layer's
+        alpha (``blend`` → ``alphamerge`` → ``overlay``), so opacity and alpha stay
+        correct. Output is a moshable MPEG-4 AVI like the finish pass.
+        """
+        tb = int(round(fps))
+        dur = max(1, int(total_frames)) / fps
+        w, h = int(width), int(height)
+        base = (f"color=c=black:s={w}x{h}:r={fps:g}:d={dur:.6f},"
+                f"format=yuv420p,settb=1/{tb}")
+        parts: List[str] = [f"{base}[acc0]"]
+        for i, lay in enumerate(layers):
+            op = max(0.0, min(1.0, float(lay.get("opacity", 1.0))))
+            start = max(0, int(lay.get("start", 0)))
+            startT = start / fps
+            chain = [f"fps={fps:g}", f"scale={w}:{h}:flags=bicubic",
+                     "format=yuva420p"]
+            if op < 1.0:
+                chain.append(f"colorchannelmixer=aa={op:.4f}")
+            chain.append(f"settb=1/{tb}")
+            if startT > 0:
+                chain.append(f"setpts=PTS+{startT:.6f}/TB")
+            parts.append(f"[{i}:v]" + ",".join(chain) + f"[c{i}]")
+            # place the (delayed) clip on a full-length transparent canvas
+            parts.append(f"color=c=black@0:s={w}x{h}:r={fps:g}:d={dur:.6f},"
+                         f"format=yuva420p,settb=1/{tb}[t{i}]")
+            parts.append(f"[t{i}][c{i}]overlay=eof_action=pass:repeatlast=0[lay{i}]")
+            mode = str(lay.get("blend", "normal"))
+            if mode == "normal" or mode not in BLEND_MODES:
+                parts.append(f"[acc{i}][lay{i}]overlay=eof_action=pass[acc{i + 1}]")
+            else:
+                fm = BLEND_MODES[mode]
+                parts.append(f"[lay{i}]split[lz{i}][la{i}]")
+                parts.append(f"[la{i}]alphaextract[am{i}]")
+                parts.append(f"[lz{i}]format=yuv420p[lr{i}]")
+                parts.append(f"[acc{i}][lr{i}]blend=all_mode={fm}[bl{i}]")
+                parts.append(f"[bl{i}][am{i}]alphamerge[bm{i}]")
+                parts.append(f"[acc{i}][bm{i}]overlay=eof_action=pass[acc{i + 1}]")
+        final = f"[acc{len(layers)}]"
+        inputs: List[str] = []
+        for lay in layers:
+            inputs += ["-i", str(lay["input"])]
+        self._run([*inputs, "-filter_complex", ";".join(parts), "-map", final,
+                   "-c:v", "mpeg4", "-q:v", str(qscale), "-bf", "0",
+                   "-g", str(max(1, gop)), "-pix_fmt", "yuv420p", "-y", str(dst)],
+                  "composite video")
         return Path(dst)
 
     def _audio_args(self, profile: str) -> List[str]:

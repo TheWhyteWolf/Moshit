@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import shutil
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as _dc_fields
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -31,9 +31,19 @@ from . import avi
 from .avi import AviVideo, Frame
 from .engine import EngineConfig, MoshEngine
 
+ROOT_SEQ_ID = "root"
+MAIN_TRACK_ID = "main"             # root sequence's first video track (legacy id)
+MOTION_TRACK_ID = "motion"         # root sequence's motion source pool (legacy id)
+
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+def _only_fields(cls, d: Dict) -> Dict:
+    """Keep just the keys that are fields of *cls* (tolerant deserialisation)."""
+    names = {f.name for f in _dc_fields(cls)}
+    return {k: v for k, v in d.items() if k in names}
 
 
 # --------------------------------------------------------------------------- #
@@ -52,25 +62,30 @@ class MediaItem:
     fps: float = 0.0
     nb_frames: int = 0
     derived: bool = False          # True for baked media
+    sequence_id: Optional[str] = None  # set when this media is a rendered precomp
+    digest: str = ""               # content hash of the source sequence (cache key)
 
     def to_dict(self) -> Dict:
         return self.__dict__.copy()
 
     @classmethod
     def from_dict(cls, d: Dict) -> "MediaItem":
-        return cls(**d)
+        return cls(**_only_fields(cls, d))
 
 
 @dataclass
 class Clip:
     id: str
     media_id: str
-    track: str                     # "main" | "motion"
+    track: str                     # track id (e.g. "main"/"motion" or a generated id)
     start: int = 0                 # timeline position, in frames
     in_point: int = 0              # trim start within media (frames)
     out_point: Optional[int] = None  # exclusive; None = end of media
     enabled: bool = True
     archived: bool = False
+    seq_id: str = ROOT_SEQ_ID      # which sequence this clip lives in
+    opacity: float = 1.0           # 0..1 layer opacity (compositing)
+    blend_mode: str = "normal"     # normal | screen | multiply | add | ...
     # -- clean-edit finishing (pixel-domain; applied in the render finish pass).
     # Defaults are inert, so a clip with all defaults takes the fast path.
     speed: float = 1.0             # 2.0 = twice as fast, 0.5 = half speed
@@ -92,7 +107,7 @@ class Clip:
 
     @classmethod
     def from_dict(cls, d: Dict) -> "Clip":
-        return cls(**d)
+        return cls(**_only_fields(cls, d))
 
 
 @dataclass
@@ -114,7 +129,44 @@ class MoshOp:
 
     @classmethod
     def from_dict(cls, d: Dict) -> "MoshOp":
-        return cls(**d)
+        return cls(**_only_fields(cls, d))
+
+
+@dataclass
+class Track:
+    """A lane within a sequence. Video tracks composite top-to-bottom by
+    ``index`` (0 = bottom); a motion track is a non-composited source pool."""
+    id: str
+    seq_id: str
+    name: str
+    index: int                     # compositing order within the sequence
+    role: str = "video"            # "video" | "motion"
+    enabled: bool = True
+
+    def to_dict(self) -> Dict:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "Track":
+        return cls(**_only_fields(cls, d))
+
+
+@dataclass
+class Sequence:
+    """A timeline of tracks. The root sequence renders to the output; any other
+    sequence can be used as a clip (a precomp) and is rendered to cached media."""
+    id: str
+    name: str = "Sequence"
+    width: int = 0                 # 0 = inherit the project config
+    height: int = 0
+    fps: float = 0.0
+
+    def to_dict(self) -> Dict:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "Sequence":
+        return cls(**_only_fields(cls, d))
 
 
 @dataclass
@@ -131,7 +183,7 @@ class BakeRecord:
 
     @classmethod
     def from_dict(cls, d: Dict) -> "BakeRecord":
-        return cls(**d)
+        return cls(**_only_fields(cls, d))
 
 
 # --------------------------------------------------------------------------- #
@@ -153,7 +205,23 @@ class Project:
         self.clips: List[Clip] = []
         self.mosh_ops: List[MoshOp] = []
         self.bake_records: List[BakeRecord] = []
+        self.sequences: List[Sequence] = []
+        self.tracks: List[Track] = []
+        self.root_seq_id = ROOT_SEQ_ID
         self._parsed: Dict[str, AviVideo] = {}     # media_id -> AviVideo (cache)
+        self._ensure_default_structure()
+
+    def _ensure_default_structure(self) -> None:
+        """Guarantee a root sequence with its legacy main/motion tracks exist."""
+        if not any(s.id == self.root_seq_id for s in self.sequences):
+            self.sequences.insert(0, Sequence(id=self.root_seq_id, name="Main"))
+        have = {t.id for t in self.tracks}
+        if MAIN_TRACK_ID not in have:
+            self.tracks.append(Track(id=MAIN_TRACK_ID, seq_id=self.root_seq_id,
+                                     name="Video 1", index=0, role="video"))
+        if MOTION_TRACK_ID not in have:
+            self.tracks.append(Track(id=MOTION_TRACK_ID, seq_id=self.root_seq_id,
+                                     name="Motion", index=0, role="motion"))
 
     # -- lookups ------------------------------------------------------------ #
 
@@ -168,6 +236,33 @@ class Project:
             if o.id == op_id:
                 return o
         raise KeyError(f"no mosh op '{op_id}'")
+
+    def sequence(self, seq_id: str) -> Sequence:
+        for s in self.sequences:
+            if s.id == seq_id:
+                return s
+        raise KeyError(f"no sequence '{seq_id}'")
+
+    def track(self, track_id: str) -> Track:
+        for t in self.tracks:
+            if t.id == track_id:
+                return t
+        raise KeyError(f"no track '{track_id}'")
+
+    def tracks_for(self, seq_id: str, role: Optional[str] = None) -> List[Track]:
+        """A sequence's tracks (optionally by role), in compositing order."""
+        return sorted((t for t in self.tracks if t.seq_id == seq_id
+                       and (role is None or t.role == role)),
+                      key=lambda t: t.index)
+
+    def video_tracks(self, seq_id: str) -> List[Track]:
+        return [t for t in self.tracks_for(seq_id, "video") if t.enabled]
+
+    def clips_for_track(self, track_id: str) -> List[Clip]:
+        """Enabled, non-archived clips on a track, ordered by start."""
+        return sorted((c for c in self.clips if c.track == track_id
+                       and c.enabled and not c.archived),
+                      key=lambda c: c.start)
 
     def _parsed_media(self, media_id: str) -> AviVideo:
         if media_id not in self._parsed:
@@ -252,6 +347,16 @@ class Project:
                  start=start, in_point=in_point, out_point=out_point)
         self.clips.append(c)
         return c
+
+    def add_track(self, seq_id: Optional[str] = None, *, role: str = "video",
+                  name: Optional[str] = None) -> Track:
+        """Add a track to a sequence (the root by default), on top of its peers."""
+        seq_id = seq_id or self.root_seq_id
+        idx = 1 + max((t.index for t in self.tracks_for(seq_id, role)), default=-1)
+        t = Track(id=_new_id("track"), seq_id=seq_id,
+                  name=name or f"Video {idx + 1}", index=idx, role=role)
+        self.tracks.append(t)
+        return t
 
     def add_mosh(self, mode: str, params: Dict, target_clip_id: str) -> MoshOp:
         self.clip(target_clip_id)                  # validate
@@ -389,12 +494,10 @@ class Project:
     # -- render (read-only) ------------------------------------------------- #
 
     def main_clips(self) -> List[Clip]:
-        return sorted((c for c in self.clips
-                       if c.track == "main" and c.enabled and not c.archived),
-                      key=lambda c: c.start)
+        return self.clips_for_track(MAIN_TRACK_ID)
 
-    def main_layout(self) -> List[Tuple[Clip, int, int, int]]:
-        """Main-track layout as ``[(clip, start, length, trans), ...]`` in frames.
+    def track_layout(self, track_id: str) -> List[Tuple[Clip, int, int, int]]:
+        """A track's clips as ``[(clip, start, length, trans), ...]`` in frames.
 
         Crossfading clips overlap the previous one by their clamped transition,
         so the laid-out total matches the rendered (shorter) timeline. Shared by
@@ -403,7 +506,7 @@ class Project:
         out: List[Tuple[Clip, int, int, int]] = []
         cursor = 0
         prev_len = 0
-        for i, clip in enumerate(self.main_clips()):
+        for i, clip in enumerate(self.clips_for_track(track_id)):
             length = self._clip_length(clip)
             trans = (min(int(getattr(clip, "transition_in", 0)), length, prev_len)
                      if i > 0 else 0)
@@ -413,21 +516,174 @@ class Project:
             prev_len = length
         return out
 
+    def main_layout(self) -> List[Tuple[Clip, int, int, int]]:
+        """Overlap-aware layout of the root sequence's first video track."""
+        return self.track_layout(MAIN_TRACK_ID)
+
     def render(self, engine: MoshEngine, out_avi, *,
                profile: Optional[str] = None, export_path=None,
-               audio: bool = False) -> Dict:
-        """Materialise the current timeline. Does not mutate the project.
+               audio: bool = False, sequence_id: Optional[str] = None) -> Dict:
+        """Materialise a sequence (the root by default). Does not mutate the
+        project.
 
-        Always returns an ``audio_plan`` (one segment per main clip, keyed to the
-        rendered video's duration). When *audio* is set and an export *profile*
-        is given, the plan is assembled into a track and muxed into the export.
-        Clean and moshed clips keep their source audio (padded/trimmed to the
-        rendered length so the track stays in sync); baked clips are silent.
+        A single-video-track sequence with every clip at full opacity and the
+        ``normal`` blend takes the existing **flat** path (codec-domain fast path,
+        or per-clip finish + crossfade fold). Otherwise its video tracks are
+        **composited** bottom-to-top (opacity + blend mode + alpha) in the pixel
+        domain. The returned ``audio_plan`` comes from the root sequence's main
+        video track; with a *profile* and *audio* it is muxed on export.
         """
-        clips = self.main_clips()
-        if not clips:
-            raise ValueError("no enabled main-track clips to render")
+        seq_id = sequence_id or self.root_seq_id
+        self._resolve_precomps(engine, seq_id)
+        vtracks = self.video_tracks(seq_id)
+        occupied = [t for t in vtracks if self.clips_for_track(t.id)]
+        if not occupied:
+            raise ValueError("no enabled video clips to render")
+        simple = len(occupied) == 1 and all(
+            abs(getattr(c, "opacity", 1.0) - 1.0) < 1e-6
+            and getattr(c, "blend_mode", "normal") == "normal"
+            for c in self.clips_for_track(occupied[0].id))
+        if simple:
+            return self._render_flat(
+                engine, out_avi, self.clips_for_track(occupied[0].id),
+                profile=profile, export_path=export_path, audio=audio)
+        return self._render_composite(
+            engine, out_avi, vtracks,
+            profile=profile, export_path=export_path, audio=audio)
 
+    def _resolve_precomps(self, engine: MoshEngine, seq_id: str,
+                          _visiting: Optional[List[str]] = None) -> None:
+        """(Re)render every sequence-backed media this sequence uses, depth-first
+        and cached by content digest, so a precomp clip decodes from a fresh
+        intermediate. Raises on a sequence cycle."""
+        _visiting = _visiting or []
+        if seq_id in _visiting:
+            chain = " -> ".join(_visiting + [seq_id])
+            raise ValueError(f"sequence cycle: {chain}")
+        stack = _visiting + [seq_id]
+        for t in self.tracks_for(seq_id):
+            for c in self.clips_for_track(t.id):
+                m = self.media.get(c.media_id)
+                if m and m.sequence_id:
+                    self._resolve_precomps(engine, m.sequence_id, stack)
+                    self._render_sequence_to_media(engine, m)
+
+    def _sequence_digest(self, seq_id: str) -> str:
+        """Content hash of a sequence (its tracks, clips, ops, and the digests of
+        any precomps it nests) -- the cache key for its rendered intermediate."""
+        import hashlib
+        clip_ids = {c.id for c in self.clips if c.seq_id == seq_id}
+        nested = sorted((m.id, m.digest) for m in self.media.values()
+                        if m.sequence_id and m.id in {c.media_id for c in self.clips
+                                                      if c.seq_id == seq_id})
+        payload = {
+            "tracks": [t.to_dict() for t in self.tracks_for(seq_id)],
+            "clips": [c.to_dict() for c in self.clips if c.seq_id == seq_id],
+            "ops": [o.to_dict() for o in self.mosh_ops
+                    if o.target_clip_id in clip_ids],
+            "geom": (self.config.width, self.config.height, self.config.fps),
+            "nested": nested,
+        }
+        blob = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha1(blob.encode()).hexdigest()
+
+    def _render_sequence_to_media(self, engine: MoshEngine,
+                                  media: MediaItem) -> None:
+        out = Path(media.intermediate_path)
+        digest = self._sequence_digest(media.sequence_id)
+        if media.digest == digest and out.exists():
+            return                                 # cache hit: nothing changed
+        self.render(engine, out, sequence_id=media.sequence_id)
+        av = avi.parse_avi(str(out))
+        media.nb_frames = len(av.frames)
+        media.width = media.width or self.config.width
+        media.height = media.height or self.config.height
+        media.fps = media.fps or self.config.fps
+        media.digest = digest
+        self._parsed[media.id] = av                # refresh the parse cache
+
+    def _audio_seg(self, clip: Clip, mlen: int, prev_len: int, idx: int,
+                   fps: float):
+        """One audio-plan segment for *clip* (see build_audio_track). A clip's
+        trim indexes its *source* media so source audio lines up; only baked
+        (derived) media can't map back, so it stays silent. Speed/reverse/fades/
+        crossfade mirror the video finish. Returns ``(segment, trans)``."""
+        media = self._parsed_media(clip.media_id)
+        item = self.media[clip.media_id]
+        snapped = self._snapped_in_point(media, clip.in_point)
+        trans = min(clip.transition_in, mlen, prev_len) if idx > 0 else 0
+        return ({
+            "source": item.source_path, "start": snapped / fps,
+            "duration": mlen / fps, "silent": item.derived,
+            "speed": clip.speed, "reverse": clip.reverse,
+            "fade_in": clip.fade_in, "fade_out": clip.fade_out,
+            "transition_in": trans,
+        }, trans)
+
+    def _export_result(self, engine: MoshEngine, out, audio_plan, frames,
+                       n_clips, *, profile, export_path, audio) -> Dict:
+        result = {"moshed_avi": out, "frames": frames,
+                  "clips_rendered": n_clips, "audio_plan": audio_plan}
+        if profile:
+            fps = self.config.fps or 30.0
+            audio_path = None
+            if audio:
+                audio_path = engine.build_audio(
+                    audio_plan, Path(out).with_suffix(".audio.wav"), fps=fps)
+                if audio_path:
+                    result["audio"] = audio_path
+            ep = Path(export_path) if export_path else Path(out).with_suffix(
+                {"h264_mp4": ".mp4", "h265_mp4": ".mp4", "prores_mov": ".mov",
+                 "ffv1_mkv": ".mkv", "vp9_webm": ".webm"}.get(profile, ".mp4"))
+            result["export"] = engine.export(out, ep, profile,
+                                             audio_path=audio_path)
+        return result
+
+    def _clip_segment(self, engine: MoshEngine, clip: Clip):
+        """Render one clip to a finished segment AVI at project geometry (mosh +
+        flow + per-clip finish chain). Returns ``(path, post_speed_length)``."""
+        from . import flow as _flow
+        media = self._parsed_media(clip.media_id)
+        frames = self._clip_frames(clip)
+        motion = self._motion_frames()
+        for op in self._ops_for_clip(clip.id):
+            frames = engine.mosh(
+                _as_avivideo(frames, media), op.mode, op.params,
+                motion_clips=_wrap_motion(motion),
+                region=self._op_region(op, len(frames)))
+        seg = engine.write_moshed(frames, media, engine._tmp(".avi"))
+        ft = clip.flow_transfer
+        motion_m = self._flow_motion_media(ft.get("source")) if ft else None
+        if ft and motion_m is not None and _flow.available():
+            n = len(frames)
+            rs = max(0, int(ft.get("region_start", 0) or 0))
+            re = ft.get("region_end")
+            region = ((rs, n if re is None else min(int(re), n))
+                      if (rs > 0 or re is not None) else None)
+            warped = engine.optical_flow_transfer(
+                seg, motion_m.intermediate_path, engine._tmp(".avi"),
+                hold=ft.get("hold", True), accumulate=ft.get("accumulate", True),
+                strength=float(ft.get("strength", 1.0)),
+                preset=ft.get("preset", "fast"), out_len=n, region=region)
+            try:
+                Path(seg).unlink()
+            except OSError:
+                pass
+            seg = warped
+        meta = [{"n": len(frames), "speed": clip.speed, "reverse": clip.reverse,
+                 "fade_in": clip.fade_in, "fade_out": clip.fade_out,
+                 "transition_in": 0, "pixel": self._pixel_filters(clip)}]
+        finished = engine.finish_clips([seg], meta, engine._tmp(".avi"))
+        try:
+            Path(seg).unlink()
+        except OSError:
+            pass
+        length = (max(1, round(len(frames) / clip.speed))
+                  if (clip.speed and clip.speed != 1.0) else len(frames))
+        return finished, length
+
+    def _render_flat(self, engine: MoshEngine, out_avi, clips, *,
+                     profile=None, export_path=None, audio=False) -> Dict:
         fps = self.config.fps or 30.0
         motion = self._motion_frames()
         needs_finish = any(c.has_finish() for c in clips)
@@ -456,23 +712,8 @@ class Project:
         total = 0
         prev_len = 0
         for idx, ((c, media, frames), mlen) in enumerate(zip(segs, finished)):
-            item = self.media[c.media_id]
-            snapped = self._snapped_in_point(media, c.in_point)
-            # The first clip can't crossfade from a previous one; the video
-            # finish ignores its transition_in, so the audio plan must too.
-            trans = min(c.transition_in, mlen, prev_len) if idx > 0 else 0
-            audio_plan.append({
-                "source": item.source_path, "start": snapped / fps,
-                "duration": mlen / fps,
-                # A clip's trim indexes its *source* media, so source audio lines
-                # up; only baked (derived) media -- re-encoded frames -- can't map
-                # back, so it stays silent. Speed/reverse/fades/crossfade mirror
-                # the video finish (see build_audio_track).
-                "silent": item.derived,
-                "speed": c.speed, "reverse": c.reverse,
-                "fade_in": c.fade_in, "fade_out": c.fade_out,
-                "transition_in": trans,
-            })
+            seg, trans = self._audio_seg(c, mlen, prev_len, idx, fps)
+            audio_plan.append(seg)
             total += mlen - trans
             prev_len = mlen
 
@@ -518,21 +759,43 @@ class Project:
                 sequence.extend(frames)
             out = engine.write_moshed(sequence, template, out_avi)
 
-        result = {"moshed_avi": out, "frames": total,
-                  "clips_rendered": len(clips), "audio_plan": audio_plan}
-        if profile:
-            audio_path = None
-            if audio:
-                audio_path = engine.build_audio(
-                    audio_plan, Path(out).with_suffix(".audio.wav"), fps=fps)
-                if audio_path:
-                    result["audio"] = audio_path
-            ep = Path(export_path) if export_path else out.with_suffix(
-                {"h264_mp4": ".mp4", "h265_mp4": ".mp4", "prores_mov": ".mov",
-                 "ffv1_mkv": ".mkv", "vp9_webm": ".webm"}.get(profile, ".mp4"))
-            result["export"] = engine.export(out, ep, profile,
-                                             audio_path=audio_path)
-        return result
+        return self._export_result(engine, out, audio_plan, total, len(clips),
+                                   profile=profile, export_path=export_path,
+                                   audio=audio)
+
+    def _render_composite(self, engine: MoshEngine, out_avi, vtracks, *,
+                          profile=None, export_path=None, audio=False) -> Dict:
+        fps = self.config.fps or 30.0
+        total = 0
+        for t in vtracks:
+            for c in self.clips_for_track(t.id):
+                total = max(total, int(c.start) + self._clip_length(c))
+        if total <= 0:
+            raise ValueError("empty composition")
+
+        layers: List[Dict] = []
+        main_lengths: List = []                    # (clip, length) on the main track
+        for t in vtracks:                          # bottom -> top by index
+            for c in self.clips_for_track(t.id):
+                seg, length = self._clip_segment(engine, c)
+                layers.append({"input": seg, "start": int(c.start),
+                               "length": length, "opacity": float(c.opacity),
+                               "blend": c.blend_mode})
+                if t.id == MAIN_TRACK_ID:
+                    main_lengths.append((c, length))
+        out = engine.composite(layers, out_avi, total_frames=total)
+        for lay in layers:                         # consumed
+            try:
+                Path(lay["input"]).unlink()
+            except OSError:
+                pass
+
+        # Audio (Phase 1): the root main track only, hard-cut (no track mixing).
+        audio_plan = [self._audio_seg(c, mlen, mlen, 0, fps)[0]
+                      for c, mlen in main_lengths]
+        return self._export_result(engine, out, audio_plan, total, len(layers),
+                                   profile=profile, export_path=export_path,
+                                   audio=audio)
 
     # -- bake (reversible) -------------------------------------------------- #
 
@@ -710,6 +973,9 @@ class Project:
         return {
             "version": self.VERSION, "name": self.name, "config": cfg,
             "assets_dir": str(self.assets_dir) if self.assets_dir else None,
+            "root_seq_id": self.root_seq_id,
+            "sequences": [s.to_dict() for s in self.sequences],
+            "tracks": [t.to_dict() for t in self.tracks],
             "media": [m.to_dict() for m in self.media.values()],
             "clips": [c.to_dict() for c in self.clips],
             "mosh_ops": [o.to_dict() for o in self.mosh_ops],
@@ -726,12 +992,21 @@ class Project:
         cfg = EngineConfig(**d.get("config", {}))
         p = cls(name=d.get("name", "untitled"), config=cfg,
                 assets_dir=d.get("assets_dir"))
+        p.root_seq_id = d.get("root_seq_id", ROOT_SEQ_ID)
+        # Pre-v-compositing saves have no sequences/tracks; _ensure_default_structure
+        # (run in __init__) already created the root sequence + main/motion tracks,
+        # and legacy clips carry track="main"/"motion" with seq_id defaulting to root.
+        if d.get("sequences"):
+            p.sequences = [Sequence.from_dict(s) for s in d["sequences"]]
+        if d.get("tracks"):
+            p.tracks = [Track.from_dict(t) for t in d["tracks"]]
         for m in d.get("media", []):
             item = MediaItem.from_dict(m)
             p.media[item.id] = item
         p.clips = [Clip.from_dict(c) for c in d.get("clips", [])]
         p.mosh_ops = [MoshOp.from_dict(o) for o in d.get("mosh_ops", [])]
         p.bake_records = [BakeRecord.from_dict(r) for r in d.get("bake_records", [])]
+        p._ensure_default_structure()              # backfill anything still missing
         return p
 
     @classmethod
