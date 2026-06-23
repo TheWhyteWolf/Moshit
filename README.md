@@ -423,7 +423,7 @@ Remaining basic-editing polish:
   still lays clips out contiguously (with a corner marker) rather than drawing
   the true overlap; a compositing track is the longer-term home for that.
 
-On the glitch side, the big roadmap item — a GPU optical-flow effect for
-appearance-free motion transfer — now ships (see **Optical-flow transfer**).
-Remaining ideas: per-clip optical-flow as a live, region-scoped *effect* (rather
-than a bake-style derived clip), and multi-keyframe automation curves with easing.
+On the glitch side, the signature systems have all landed: GPU optical-flow
+motion transfer (see **Optical-flow transfer**), per-clip optical-flow as a
+live region-scoped *effect*, and multi-keyframe automation curves with
+per-keyframe easing.
