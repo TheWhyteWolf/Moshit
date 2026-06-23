@@ -96,6 +96,29 @@ def test_preview_audio_builds_and_mutes(qapp, tmp_path, monkeypatch):
     c.cleanup()
 
 
+def test_timeline_multitrack_lanes(qapp):
+    from moshit.gui.widgets import TimelineWidget
+    from moshit.project import (Project, Clip, MediaItem,
+                                MAIN_TRACK_ID, MOTION_TRACK_ID)
+    proj = Project()
+    proj.media["m"] = MediaItem(id="m", source_path="x", label="m", role="main",
+                                intermediate_path="x", nb_frames=20)
+    proj.clips.append(Clip(id="a", media_id="m", track=MAIN_TRACK_ID))
+    v2 = proj.add_track()
+    proj.clips.append(Clip(id="c", media_id="m", track=v2.id,
+                           opacity=0.5, blend_mode="screen"))
+    proj.clips.append(Clip(id="mo", media_id="m", track=MOTION_TRACK_ID))
+    tl = TimelineWidget()
+    tl.set_sequence(proj.root_seq_id)
+    tl.set_project(proj)
+    # video tracks stack top-first; motion sits at the bottom
+    assert [t.id for t in tl._lanes()] == [v2.id, MAIN_TRACK_ID, MOTION_TRACK_ID]
+    from PySide6.QtGui import QPixmap          # paintEvent must not raise
+    tl.resize(800, 240)
+    tl.render(QPixmap(tl.size()))
+    assert ("c", v2.id) in [(cid, tr) for _r, cid, tr in tl._hits]
+
+
 def test_timeline_crossfade_overlap_layout(qapp):
     from moshit.gui.widgets import TimelineWidget
     from moshit.project import Project, Clip, MediaItem

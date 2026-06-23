@@ -400,12 +400,13 @@ class MediaLibrary(QWidget):
 # --------------------------------------------------------------------------- #
 
 class TimelineWidget(QWidget):
-    """Interactive two-track timeline: main lane on top, motion lane below.
+    """Interactive multi-track timeline for the current sequence.
 
-    Click a clip to select it. Drag its body to reorder it on the main track,
-    drag either edge to trim, and press Delete (or right-click → Remove) to take
-    it off the timeline. A frame ruler runs across the top and a playhead line
-    follows the preview.
+    Video tracks stack top-to-bottom (the topmost lane composites over the ones
+    below); a motion lane sits at the bottom. Click a clip to select it, drag its
+    body to reorder it within its track, drag either edge to trim, and press
+    Delete to remove it. Right-click an empty lane for track actions (add /
+    remove / move / enable). A frame ruler and playhead run across the top.
     """
 
     clipSelected = Signal(str)
@@ -415,6 +416,11 @@ class TimelineWidget(QWidget):
     seekRequested = Signal(float)                  # scrub position, 0..1
     splitRequested = Signal(str, int)              # clip_id, offset frames
     duplicateRequested = Signal(str)               # clip_id
+    addTrackRequested = Signal()                   # new video track
+    removeTrackRequested = Signal(str)             # track_id
+    reorderTrackRequested = Signal(str, int)       # track_id, delta (-1 up/+1 down)
+    trackEnabledToggled = Signal(str, bool)        # track_id, enabled
+    addClipToTrackRequested = Signal(str)          # track_id (uses library selection)
 
     RULER_H = 20
     WAVE_H = 22                                     # audio waveform strip
@@ -440,10 +446,22 @@ class TimelineWidget(QWidget):
         self._tool = "pointer"                      # "pointer" | "cut"
         self._cursor_x = 0
         self._waveform: Optional[List[float]] = None      # audio peak envelope
+        self._seq_id: Optional[str] = None          # sequence shown (None = root)
 
     def set_project(self, project) -> None:
         self._project = project
-        self._total = max(1, self._main_length())
+        if self._seq_id is None or not any(s.id == self._seq_id
+                                           for s in project.sequences):
+            self._seq_id = project.root_seq_id
+        self._total = self._seq_total()
+        self._update_height()
+        self.update()
+
+    def set_sequence(self, seq_id) -> None:
+        self._seq_id = seq_id
+        if self._project:
+            self._total = self._seq_total()
+            self._update_height()
         self.update()
 
     def set_play_fraction(self, frac: float) -> None:
@@ -468,12 +486,6 @@ class TimelineWidget(QWidget):
     def _main_clips(self):
         return self._project.main_clips() if self._project else []
 
-    def _motion_clips(self):
-        if not self._project:
-            return []
-        return [c for c in self._project.clips
-                if c.track == "motion" and not c.archived]
-
     def _main_layout(self):
         """Overlap-aware main-track layout (see ``Project.main_layout``)."""
         return self._project.main_layout() if self._project else []
@@ -481,6 +493,42 @@ class TimelineWidget(QWidget):
     def _main_length(self) -> int:
         lay = self._main_layout()
         return (lay[-1][1] + lay[-1][2]) if lay else 0
+
+    def _seq(self) -> str:
+        return self._seq_id or (self._project.root_seq_id if self._project else "")
+
+    def _video_tracks(self):
+        return self._project.tracks_for(self._seq(), "video") if self._project else []
+
+    def _motion_tracks(self):
+        return self._project.tracks_for(self._seq(), "motion") if self._project else []
+
+    def _lanes(self):
+        """Tracks top-to-bottom: video tracks (top layer first), then motion."""
+        return list(reversed(self._video_tracks())) + self._motion_tracks()
+
+    def _lane_index(self, track_id: str) -> int:
+        for i, t in enumerate(self._lanes()):
+            if t.id == track_id:
+                return i
+        return 0
+
+    def _track_total(self, track) -> int:
+        if track.role == "video":
+            lay = self._project.track_layout(track.id)
+            return (lay[-1][1] + lay[-1][2]) if lay else 0
+        return sum(self._project._clip_length(c)
+                   for c in self._project.clips_for_track(track.id))
+
+    def _seq_total(self) -> int:
+        if not self._project:
+            return 1
+        return max(1, max((self._track_total(t) for t in self._lanes()), default=0))
+
+    def _update_height(self) -> None:
+        n = max(2, len(self._lanes()))
+        self.setMinimumHeight(self.RULER_H + self.WAVE_H
+                              + n * (self.LANE_H + self.PAD) + self.PAD + 6)
 
     def _track_x(self) -> Tuple[int, int]:
         return self.PAD + self.LABEL_W, self.width() - self.PAD
@@ -523,36 +571,38 @@ class TimelineWidget(QWidget):
         # audio waveform strip (spans the full rendered timeline)
         self._draw_waveform(p, x0, track_w)
 
-        # lane labels + backgrounds
-        p.setPen(QColor("#8a92a6"))
-        p.drawText(self.PAD, self._lane_y(0) + 26, "main")
-        p.drawText(self.PAD, self._lane_y(1) + 26, "motion")
-        for lane in (0, 1):
-            p.fillRect(QRect(x0, self._lane_y(lane), track_w, self.LANE_H),
-                       QColor("#262b33"))
-
-        # main clips (crossfading clips overlap the previous one)
+        # lanes (video tracks top-to-bottom, motion at the bottom)
         bands = []
-        for clip, start, length, trans in self._main_layout():
-            rect = QRect(int(x0 + start * ppf), self._lane_y(0),
-                         max(2, int(length * ppf) - 2), self.LANE_H)
-            self._draw_clip(p, rect, clip, length)
-            self._hits.append((rect, clip.id, "main"))
-            if trans > 0:
-                bands.append(QRect(int(x0 + start * ppf), self._lane_y(0),
-                                   max(2, int(trans * ppf)), self.LANE_H))
+        for lane, t in enumerate(self._lanes()):
+            y = self._lane_y(lane)
+            on = getattr(t, "enabled", True)
+            p.fillRect(QRect(x0, y, track_w, self.LANE_H),
+                       QColor("#262b33") if on else QColor("#202329"))
+            p.setPen(QColor("#8a92a6") if on else QColor("#565d6b"))
+            name = t.name if len(t.name) <= 8 else t.name[:7] + "…"
+            p.drawText(self.PAD, y + 18, name)
+            if not on:
+                p.drawText(self.PAD, y + 32, "(off)")
+            if t.role == "video":
+                for clip, start, length, trans in self._project.track_layout(t.id):
+                    rect = QRect(int(x0 + start * ppf), y,
+                                 max(2, int(length * ppf) - 2), self.LANE_H)
+                    self._draw_clip(p, rect, clip, length)
+                    self._hits.append((rect, clip.id, t.id))
+                    if trans > 0:
+                        bands.append(QRect(int(x0 + start * ppf), y,
+                                           max(2, int(trans * ppf)), self.LANE_H))
+            else:                                     # motion: contiguous pool
+                cursor = 0
+                for clip in self._project.clips_for_track(t.id):
+                    length = self._project._clip_length(clip)
+                    rect = QRect(int(x0 + cursor * ppf), y,
+                                 max(2, int(length * ppf) - 2), self.LANE_H)
+                    self._draw_clip(p, rect, clip, length, motion=True)
+                    self._hits.append((rect, clip.id, t.id))
+                    cursor += length
         for band in bands:                            # overlay after all clips
             self._draw_xfade_band(p, band)
-
-        # motion clips
-        cursor = 0
-        for clip in self._motion_clips():
-            length = self._project._clip_length(clip)
-            rect = QRect(int(x0 + cursor * ppf), self._lane_y(1),
-                         max(2, int(length * ppf) - 2), self.LANE_H)
-            self._draw_clip(p, rect, clip, length, motion=True)
-            self._hits.append((rect, clip.id, "motion"))
-            cursor += length
 
         # drag feedback
         if self._drag:
@@ -595,6 +645,10 @@ class TimelineWidget(QWidget):
             badges.append("⊳")
         if getattr(clip, "fade_out", 0):
             badges.append("⊲")
+        if abs(getattr(clip, "opacity", 1.0) - 1.0) > 1e-6:
+            badges.append(f"{clip.opacity * 100:.0f}%")
+        if getattr(clip, "blend_mode", "normal") != "normal":
+            badges.append(clip.blend_mode)
         suffix = ("   " + " ".join(badges)) if badges else ""
         p.setPen(QColor("#eef1f6"))
         p.drawText(rect.adjusted(5, 0, -3, 0),
@@ -653,31 +707,46 @@ class TimelineWidget(QWidget):
                 edge_hit = entry
         return edge_hit or body_hit
 
-    def _drop_index(self, x: int, exclude: str) -> int:
+    def _is_video(self, track_id: str) -> bool:
+        try:
+            return self._project.track(track_id).role == "video"
+        except (KeyError, AttributeError):
+            return False
+
+    def _lane_at(self, y: int):
+        for i, t in enumerate(self._lanes()):
+            ly = self._lane_y(i)
+            if ly <= y <= ly + self.LANE_H:
+                return t
+        return None
+
+    def _drop_index(self, x: int, exclude: str, track: str) -> int:
         idx = 0
-        for rect, cid, track in self._hits:
-            if track != "main" or cid == exclude:
+        for rect, cid, tr in self._hits:
+            if tr != track or cid == exclude:
                 continue
             if x > rect.center().x():
                 idx += 1
         return idx
 
     def request_split_at_playhead(self) -> None:
-        """Split the main-track clip under the playhead at its current frame.
+        """Split the video clip under the playhead at its current frame.
 
         The standard NLE 'split at the cursor' action: mirrors a Cut-tool click
-        located at the playhead, so it stays consistent with the ruler.
+        at the playhead. Prefers the selected clip when it's under the playhead.
         """
         if not self._project or not self._hits:
             return
         x0, x1 = self._track_x()
         px = int(x0 + self._play_frac * max(1, x1 - x0))
-        for rect, cid, track in self._hits:
-            if track == "main" and rect.left() <= px <= rect.right():
-                offset = round((px - rect.left()) / self._ppf())
-                if offset > 0:
-                    self.splitRequested.emit(cid, offset)
-                return
+        under = [(rect, cid) for rect, cid, tr in self._hits
+                 if self._is_video(tr) and rect.left() <= px <= rect.right()]
+        if not under:
+            return
+        rect, cid = next((u for u in under if u[1] == self._selected), under[0])
+        offset = round((px - rect.left()) / self._ppf())
+        if offset > 0:
+            self.splitRequested.emit(cid, offset)
 
     # -- interaction -------------------------------------------------------- #
 
@@ -751,9 +820,9 @@ class TimelineWidget(QWidget):
         d, self._drag = self._drag, None
         dframes = round((self._cursor_x - d["press_x"]) / d["ppf"])
         if d["mode"] == "move":
-            if d["track"] == "main" and dframes != 0:
-                self.reorderRequested.emit(d["id"], self._drop_index(self._cursor_x,
-                                                                     d["id"]))
+            if self._is_video(d["track"]) and dframes != 0:
+                self.reorderRequested.emit(
+                    d["id"], self._drop_index(self._cursor_x, d["id"], d["track"]))
         elif d["mode"] == "trim_l" and dframes != 0:
             self.trimRequested.emit(d["id"], max(0, d["in"] + dframes), -1)
         elif d["mode"] == "trim_r" and dframes != 0:
@@ -769,28 +838,53 @@ class TimelineWidget(QWidget):
     def contextMenuEvent(self, event) -> None:
         from PySide6.QtWidgets import QMenu
         hit = self._hit(event.pos())
-        if not hit:
+        if hit:
+            clip_id, track = hit[1], hit[2]
+            self._selected = clip_id
+            self.clipSelected.emit(clip_id)
+            self.update()
+            menu = QMenu(self)
+            act_dup = menu.addAction("Duplicate clip")
+            act_split = (menu.addAction("Split at playhead")
+                         if self._is_video(track) else None)
+            menu.addSeparator()
+            act_remove = menu.addAction("Remove from timeline")
+            chosen = menu.exec(event.globalPos())
+            if chosen == act_dup:
+                self.duplicateRequested.emit(clip_id)
+            elif act_split is not None and chosen == act_split:
+                self.request_split_at_playhead()
+            elif chosen == act_remove:
+                self.removeRequested.emit(clip_id)
             return
-        clip_id, track = hit[1], hit[2]
-        self._selected = clip_id
-        self.clipSelected.emit(clip_id)
-        self.update()
+        # empty area: act on the lane (track) under the cursor
+        t = self._lane_at(event.pos().y())
         menu = QMenu(self)
-        act_dup = menu.addAction("Duplicate clip")
-        act_split = None
-        if track == "main":
-            act_split = menu.addAction("Split at playhead")
-        menu.addSeparator()
-        act_remove = menu.addAction("Remove from timeline")
+        act_add = menu.addAction("Add video track")
+        act_clip = act_up = act_down = act_toggle = act_rm = None
+        if t is not None and t.role == "video":
+            act_clip = menu.addAction("Add selected media here")
+            menu.addSeparator()
+            act_up = menu.addAction("Move track up")
+            act_down = menu.addAction("Move track down")
+            act_toggle = menu.addAction("Disable track" if t.enabled
+                                        else "Enable track")
+            act_rm = menu.addAction("Remove track")
         chosen = menu.exec(event.globalPos())
         if chosen is None:
             return
-        if chosen == act_dup:
-            self.duplicateRequested.emit(clip_id)
-        elif chosen == act_split:
-            self.request_split_at_playhead()
-        elif chosen == act_remove:
-            self.removeRequested.emit(clip_id)
+        if chosen == act_add:
+            self.addTrackRequested.emit()
+        elif chosen == act_clip:
+            self.addClipToTrackRequested.emit(t.id)
+        elif chosen == act_up:                        # up = toward the top layer
+            self.reorderTrackRequested.emit(t.id, +1)
+        elif chosen == act_down:
+            self.reorderTrackRequested.emit(t.id, -1)
+        elif chosen == act_toggle:
+            self.trackEnabledToggled.emit(t.id, not t.enabled)
+        elif chosen == act_rm:
+            self.removeTrackRequested.emit(t.id)
 
 
 # --------------------------------------------------------------------------- #

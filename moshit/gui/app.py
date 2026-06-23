@@ -239,6 +239,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready. Import a video to begin.")
         self._wire()
         self._build_shortcuts()
+        self.timeline.set_sequence(self.controller.current_seq_id)
         self.timeline.set_project(self.controller.project)
         self.inspector.set_presets(self.controller.preset_names())
         self.inspector.set_flow_sources(self.controller.media_choices())
@@ -381,12 +382,17 @@ class MainWindow(QMainWindow):
         c.status.connect(self.statusBar().showMessage)
 
         self.timeline.clipSelected.connect(self._on_clip_selected)
-        self.timeline.reorderRequested.connect(self.controller.reorder_main_clip)
+        self.timeline.reorderRequested.connect(self.controller.reorder_clip)
         self.timeline.trimRequested.connect(self._on_trim)
         self.timeline.removeRequested.connect(self._on_remove)
         self.timeline.seekRequested.connect(self._on_seek)
         self.timeline.splitRequested.connect(self.controller.split_clip)
         self.timeline.duplicateRequested.connect(self.controller.duplicate_clip)
+        self.timeline.addTrackRequested.connect(self.controller.add_video_track)
+        self.timeline.removeTrackRequested.connect(self.controller.remove_track)
+        self.timeline.reorderTrackRequested.connect(self.controller.reorder_track)
+        self.timeline.trackEnabledToggled.connect(self.controller.set_track_enabled)
+        self.timeline.addClipToTrackRequested.connect(self._on_add_clip_to_track)
         self.preview.frameChanged.connect(self._on_preview_frame)
 
         self.inspector.effectAddRequested.connect(self._on_effect_add)
@@ -420,8 +426,16 @@ class MainWindow(QMainWindow):
             return
         self.controller.add_clip_for_media(media_id, track)
 
+    def _on_add_clip_to_track(self, track_id: str) -> None:
+        media_id = self.library.selected_media_id()
+        if not media_id:
+            self.statusBar().showMessage("Select a media item in the library first.")
+            return
+        self.controller.add_clip_for_media(media_id, track_id)
+
     def _on_project_changed(self) -> None:
         self._set_dirty(True)
+        self.timeline.set_sequence(self.controller.current_seq_id)
         self.timeline.set_project(self.controller.project)
         self.inspector.set_motion_labels(self.controller.motion_labels())
         self.inspector.set_flow_sources(self.controller.media_choices())

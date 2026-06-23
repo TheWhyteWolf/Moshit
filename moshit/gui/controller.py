@@ -751,8 +751,13 @@ class AppController(QObject):
         except KeyError:
             pass
 
-    def reorder_main_clip(self, clip_id: str, new_index: int) -> None:
-        ordered = self._visible_main()
+    def reorder_clip(self, clip_id: str, new_index: int) -> None:
+        """Reorder a clip within its own track, repacking that track."""
+        try:
+            track_id = self.project.clip(clip_id).track
+        except KeyError:
+            return
+        ordered = self.project.clips_for_track(track_id)
         ids = [c.id for c in ordered]
         if clip_id not in ids:
             return
@@ -767,6 +772,9 @@ class AppController(QObject):
             c.start = cursor
             cursor += self.project._clip_length(c)
         self.project_changed.emit()
+
+    def reorder_main_clip(self, clip_id: str, new_index: int) -> None:
+        self.reorder_clip(clip_id, new_index)
 
     def trim_clip(self, clip_id: str, in_point=None, out_point=None) -> None:
         c = self.project.clip(clip_id)
