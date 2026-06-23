@@ -411,7 +411,6 @@ class TimelineWidget(QWidget):
     """
 
     clipSelected = Signal(str)
-    reorderRequested = Signal(str, int)            # clip_id, new index
     moveRequested = Signal(str, int)               # clip_id, new start frame
     trimRequested = Signal(str, int, int)          # clip_id, in|-1, out|-1
     removeRequested = Signal(str)
@@ -722,15 +721,6 @@ class TimelineWidget(QWidget):
             if ly <= y <= ly + self.LANE_H:
                 return t
         return None
-
-    def _drop_index(self, x: int, exclude: str, track: str) -> int:
-        idx = 0
-        for rect, cid, tr in self._hits:
-            if tr != track or cid == exclude:
-                continue
-            if x > rect.center().x():
-                idx += 1
-        return idx
 
     def request_split_at_playhead(self) -> None:
         """Split the video clip under the playhead at its current frame.

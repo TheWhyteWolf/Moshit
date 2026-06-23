@@ -567,7 +567,6 @@ class AppController(QObject):
         media = self.project.sequence_media(seq.id)
         media.nb_frames = cursor                          # provisional until rendered
         self.project.add_sequence_clip(host_track, seq.id, start=insert_start)
-        self._repack_if_video(host_track)
         self.project_changed.emit()
         self.status.emit(f"Precomposed {len(valid)} clip(s) into {name}.")
         return seq
@@ -773,52 +772,6 @@ class AppController(QObject):
         self.status.emit("Reverted last bake.")
 
     # -- timeline editing --------------------------------------------------- #
-
-    def _visible_main(self):
-        return self.project.clips_for_track(MAIN_TRACK_ID)
-
-    def _repack_track(self, track_id: str) -> None:
-        """Pack a track's visible clips contiguously by their current order."""
-        cursor = 0
-        for c in self.project.clips_for_track(track_id):
-            c.start = cursor
-            cursor += self.project._clip_length(c)
-
-    def _repack_main(self) -> None:
-        self._repack_track(MAIN_TRACK_ID)
-
-    def _repack_if_video(self, track_id: str) -> None:
-        """Repack *track_id* if it's a video track (motion is a free pool)."""
-        try:
-            if self.project.track(track_id).role == "video":
-                self._repack_track(track_id)
-        except KeyError:
-            pass
-
-    def reorder_clip(self, clip_id: str, new_index: int) -> None:
-        """Reorder a clip within its own track, repacking that track."""
-        try:
-            track_id = self.project.clip(clip_id).track
-        except KeyError:
-            return
-        ordered = self.project.clips_for_track(track_id)
-        ids = [c.id for c in ordered]
-        if clip_id not in ids:
-            return
-        self._push_undo()
-        ids.remove(clip_id)
-        new_index = max(0, min(int(new_index), len(ids)))
-        ids.insert(new_index, clip_id)
-        by_id = {c.id: c for c in ordered}
-        cursor = 0
-        for cid in ids:
-            c = by_id[cid]
-            c.start = cursor
-            cursor += self.project._clip_length(c)
-        self.project_changed.emit()
-
-    def reorder_main_clip(self, clip_id: str, new_index: int) -> None:
-        self.reorder_clip(clip_id, new_index)
 
     def trim_clip(self, clip_id: str, in_point=None, out_point=None) -> None:
         c = self.project.clip(clip_id)

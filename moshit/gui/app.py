@@ -1,8 +1,9 @@
 """Main window and application entry point for the Moshit GUI.
 
 Layout: a media library, a preview with transport, and a schema-driven effect
-inspector across the top; a two-track timeline across the bottom. The window
-holds an :class:`AppController` and wires widget signals to it.
+inspector across the top; a multi-track timeline (with a sequence switcher)
+across the bottom. The window holds an :class:`AppController` and wires widget
+signals to it.
 """
 from __future__ import annotations
 
@@ -437,7 +438,6 @@ class MainWindow(QMainWindow):
         c.status.connect(self.statusBar().showMessage)
 
         self.timeline.clipSelected.connect(self._on_clip_selected)
-        self.timeline.reorderRequested.connect(self.controller.reorder_clip)
         self.timeline.moveRequested.connect(self.controller.move_clip)
         self.timeline.trimRequested.connect(self._on_trim)
         self.timeline.removeRequested.connect(self._on_remove)

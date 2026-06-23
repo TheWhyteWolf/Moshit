@@ -416,13 +416,15 @@ class FFmpeg:
         """Composite positioned layers onto a black canvas, bottom-to-top.
 
         *layers* is ordered bottom→top; each is ``{"input", "start", "length",
-        "opacity", "blend"}`` (start/length in frames). Each input becomes a
+        "opacity", "blend", "head_fade"}`` (frame counts). Each input becomes a
         full-length layer (transparent outside its [start, start+length] window),
-        scaled to ``width x height`` with its alpha set by ``opacity``. ``normal``
-        composites with a plain alpha-over (``overlay``); any other ``blend`` maps
-        through :data:`BLEND_MODES`, applied only inside the window via the layer's
-        alpha (``blend`` → ``alphamerge`` → ``overlay``), so opacity and alpha stay
-        correct. Output is a moshable MPEG-4 AVI like the finish pass.
+        scaled to ``width x height`` with its alpha set by ``opacity`` and ramped
+        in over its first ``head_fade`` frames (the crossfade with whatever is
+        beneath it). ``normal`` composites with a plain alpha-over (``overlay``);
+        any other ``blend`` maps through :data:`BLEND_MODES`, applied only inside
+        the window via the layer's alpha (``blend`` → ``alphamerge`` →
+        ``overlay``), so opacity and alpha stay correct. Output is a moshable
+        MPEG-4 AVI like the finish pass.
         """
         tb = int(round(fps))
         dur = max(1, int(total_frames)) / fps

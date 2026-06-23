@@ -4,18 +4,18 @@ Nothing here mutates source media, and every operation is recorded so it can be
 undone:
 
 * :class:`MediaItem` is an immutable reference to a source file plus its cached
-  moshable intermediate.
-* :class:`Clip` is a *view* into a MediaItem (track, position, in/out trim).
+  moshable intermediate (or, for a precomp, a sequence's rendered output).
+* :class:`Sequence` is a timeline of :class:`Track` lanes; :class:`Clip` is a
+  *view* into a MediaItem placed on a track (free position + in/out trim).
 * :class:`MoshOp` is a *recipe* -- a mode plus parameters targeting a clip -- not
   a baked result.
-* ``render`` materialises the current timeline read-only.
+* ``render`` materialises a sequence read-only: a single contiguous video track
+  takes the codec/flat path; multiple tracks, free positions/overlaps, or
+  opacity/blend composite in the pixel domain. A sequence used as a clip (a
+  precomp) is rendered to cached, moshable media.
 * ``bake`` freezes one mosh op into a new clip but **archives** (never deletes)
   the originals and writes a :class:`BakeRecord`, so ``revert_bake`` fully
   restores the prior state.
-
-v1 timeline semantics: the main track is a sequence of non-overlapping clips; a
-mosh op targets a single main-track clip and may pull motion from a clip on the
-motion track. Overlapping/compositing tracks are future work.
 """
 from __future__ import annotations
 
@@ -506,9 +506,8 @@ class Project:
     def _clip_length(self, c: Clip) -> int:
         """Timeline length in frames, after speed (reverse keeps the count).
 
-        Crossfade overlap is a junction property and is not subtracted here, so
-        the timeline lays clips out contiguously; the rendered video is the one
-        that overlaps and is therefore shorter.
+        This is the clip's own extent; its timeline position comes from
+        ``clip.start`` and any crossfade overlap is handled by ``track_layout``.
         """
         n = self._source_len(c)
         if n and c.speed and c.speed != 1.0:
@@ -578,9 +577,10 @@ class Project:
         """Materialise a sequence (the root by default). Does not mutate the
         project.
 
-        A single-video-track sequence with every clip at full opacity and the
-        ``normal`` blend takes the existing **flat** path (codec-domain fast path,
-        or per-clip finish + crossfade fold). Otherwise its video tracks are
+        A single video track of contiguous clips at full opacity and the
+        ``normal`` blend takes the **flat** path (codec-domain fast path, or
+        per-clip finish + crossfade fold). Otherwise — multiple tracks, free
+        positions/overlaps, or any opacity/blend — its video tracks are
         **composited** bottom-to-top (opacity + blend mode + alpha) in the pixel
         domain. The returned ``audio_plan`` comes from the root sequence's main
         video track; with a *profile* and *audio* it is muxed on export.
