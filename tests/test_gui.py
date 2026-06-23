@@ -29,6 +29,18 @@ def win(qapp, tmp_path, monkeypatch):
     w.controller.cleanup()
 
 
+@pytest.fixture
+def ctl(qapp, tmp_path, monkeypatch):
+    """A bare AppController (no MainWindow) for model/controller-level tests --
+    fast, and free of the window's modal error dialogs."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from moshit.gui.controller import AppController
+    from moshit.engine import EngineConfig
+    c = AppController(config=EngineConfig(width=64, height=48, fps=24.0, gop=8))
+    yield c
+    c.cleanup()
+
+
 def _seed_clip(ctl, clip_id="c"):
     from moshit.project import Clip, MediaItem
     ctl.project.media.setdefault("m", MediaItem(
@@ -164,6 +176,37 @@ def test_inspector_beat_fill(win):
     val = insp._getters["factor"]()
     assert isinstance(val, dict) and val["__auto__"] and val["interp"] == "hold"
     assert len([k for k in val["keys"] if len(k) >= 2]) >= 3   # a pulse per beat
+
+
+def test_track_ops_and_undo(ctl):
+    from moshit.project import MAIN_TRACK_ID
+    _seed_clip(ctl, "c")                                  # media "m", clip on main
+    root = ctl.project.root_seq_id
+    t = ctl.add_video_track()
+    assert [x.id for x in ctl.project.video_tracks(root)] == [MAIN_TRACK_ID, t.id]
+    ctl.add_clip_for_media("m", t.id)
+    new_clip = ctl.project.clips_for_track(t.id)[0]
+    ctl.set_clip_props(new_clip.id, {"opacity": 0.5, "blend_mode": "screen"})
+    c = ctl.project.clip(new_clip.id)
+    assert c.opacity == 0.5 and c.blend_mode == "screen"
+
+    ctl.undo()                                            # opacity/blend
+    assert ctl.project.clip(new_clip.id).opacity == 1.0
+    ctl.undo()                                            # add clip
+    assert ctl.project.clips_for_track(t.id) == []
+    ctl.undo()                                            # add track
+    assert [x.id for x in ctl.project.video_tracks(root)] == [MAIN_TRACK_ID]
+
+
+def test_cannot_remove_only_video_track(ctl):
+    _seed_clip(ctl, "c")
+    from moshit.project import MAIN_TRACK_ID
+    ctl.remove_track(MAIN_TRACK_ID)                       # refused: it's the only one
+    assert ctl.project.video_tracks(ctl.project.root_seq_id)
+    t = ctl.add_video_track()
+    ctl.remove_track(t.id)                                # now removable
+    assert [x.id for x in ctl.project.video_tracks(ctl.project.root_seq_id)] \
+        == [MAIN_TRACK_ID]
 
 
 def test_presets_save_and_apply(win):

@@ -25,7 +25,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from ..engine import EngineConfig, MoshEngine
 from ..ffmpeg import FFmpeg
 from ..modes import load_modes
-from ..project import Project
+from ..project import Project, ROOT_SEQ_ID, MAIN_TRACK_ID, MOTION_TRACK_ID
 from .. import beats, waveform
 from .preview import PreviewDecoder
 
@@ -109,7 +109,8 @@ class AppController(QObject):
         self._preview_audio = None
         self._preview_waveform = None          # peak envelope for the timeline
         self._cleaned = False
-        self._undo: List = []                 # snapshots of (clips, mosh_ops)
+        self.current_seq_id = ROOT_SEQ_ID      # sequence the timeline is showing
+        self._undo: List = []                 # snapshots (clips, ops, tracks, seqs)
         self._redo: List = []
         self._undo_limit = 64
         # Safety net: clean the temp dir even if the window's closeEvent never
@@ -409,7 +410,9 @@ class AppController(QObject):
 
     def _snapshot(self):
         return (copy.deepcopy(self.project.clips),
-                copy.deepcopy(self.project.mosh_ops))
+                copy.deepcopy(self.project.mosh_ops),
+                copy.deepcopy(self.project.tracks),
+                copy.deepcopy(self.project.sequences))
 
     def _commit_undo(self, snap) -> None:
         self._undo.append(snap)
@@ -424,6 +427,11 @@ class AppController(QObject):
     def _restore(self, snap) -> None:
         self.project.clips = copy.deepcopy(snap[0])
         self.project.mosh_ops = copy.deepcopy(snap[1])
+        if len(snap) > 2:                      # tracks + sequences (compositing)
+            self.project.tracks = copy.deepcopy(snap[2])
+            self.project.sequences = copy.deepcopy(snap[3])
+        if not any(s.id == self.current_seq_id for s in self.project.sequences):
+            self.current_seq_id = self.project.root_seq_id   # undid into a gone seq
 
     def _clear_undo(self) -> None:
         self._undo.clear()
@@ -457,12 +465,67 @@ class AppController(QObject):
 
     def add_clip_for_media(self, media_id: str, track: str = "main"):
         media = self.project.media[media_id]
-        track = "motion" if track == "motion" else "main"
+        if track not in {t.id for t in self.project.tracks}:
+            track = "motion" if track == "motion" else "main"   # legacy fallback
         self._push_undo()
         clip = self.project.add_clip(media_id, track)
         self.project_changed.emit()
-        self.status.emit(f"Added {media.label} to the {track} track")
+        self.status.emit(f"Added {media.label} to {self.project.track(track).name}")
         return clip
+
+    # -- tracks (compositing) ----------------------------------------------- #
+
+    def add_video_track(self, seq_id: Optional[str] = None):
+        self._push_undo()
+        t = self.project.add_track(seq_id or self.current_seq_id, role="video")
+        self.project_changed.emit()
+        self.status.emit(f"Added {t.name}")
+        return t
+
+    def remove_track(self, track_id: str) -> None:
+        try:
+            t = self.project.track(track_id)
+        except KeyError:
+            return
+        if t.role != "video":
+            return
+        if len(self.project.video_tracks(t.seq_id)) <= 1:
+            self.error.emit("Can't remove the only video track.")
+            return
+        self._push_undo()
+        cids = {c.id for c in self.project.clips if c.track == track_id}
+        self.project.tracks = [x for x in self.project.tracks if x.id != track_id]
+        self.project.clips = [c for c in self.project.clips if c.track != track_id]
+        self.project.mosh_ops = [o for o in self.project.mosh_ops
+                                 if o.target_clip_id not in cids]
+        self.project_changed.emit()
+        self.status.emit(f"Removed {t.name}")
+
+    def reorder_track(self, track_id: str, delta: int) -> None:
+        try:
+            t = self.project.track(track_id)
+        except KeyError:
+            return
+        sibs = self.project.tracks_for(t.seq_id, "video")
+        idx = sibs.index(t)
+        new = idx + int(delta)
+        if not 0 <= new < len(sibs):
+            return
+        self._push_undo()
+        other = sibs[new]
+        t.index, other.index = other.index, t.index
+        self.project_changed.emit()
+
+    def set_track_enabled(self, track_id: str, enabled: bool) -> None:
+        try:
+            t = self.project.track(track_id)
+        except KeyError:
+            return
+        if t.role != "video" or t.enabled == bool(enabled):
+            return
+        self._push_undo()
+        t.enabled = bool(enabled)
+        self.project_changed.emit()
 
     # -- pixel FX (clip finishing) ------------------------------------------ #
 
@@ -641,14 +704,17 @@ class AppController(QObject):
         fade_in = max(0, int(props.get("fade_in", c.fade_in)))
         fade_out = max(0, int(props.get("fade_out", c.fade_out)))
         trans = max(0, int(props.get("transition_in", c.transition_in)))
-        if (speed, reverse, fade_in, fade_out, trans) == (
-                c.speed, c.reverse, c.fade_in, c.fade_out, c.transition_in):
+        opacity = max(0.0, min(1.0, float(props.get("opacity", c.opacity))))
+        blend = str(props.get("blend_mode", c.blend_mode))
+        if (speed, reverse, fade_in, fade_out, trans, opacity, blend) == (
+                c.speed, c.reverse, c.fade_in, c.fade_out, c.transition_in,
+                c.opacity, c.blend_mode):
             return c
         self._push_undo()
         c.speed, c.reverse = speed, reverse
         c.fade_in, c.fade_out, c.transition_in = fade_in, fade_out, trans
-        if c.track == "main":
-            self._repack_main()        # speed changes length -> reposition the rest
+        c.opacity, c.blend_mode = opacity, blend
+        self._repack_if_video(c.track)        # speed changes length -> reposition the rest
         self.project_changed.emit()
         self.status.emit("Clip updated.")
         return c
@@ -665,17 +731,25 @@ class AppController(QObject):
     # -- timeline editing --------------------------------------------------- #
 
     def _visible_main(self):
-        clips = [c for c in self.project.clips
-                 if c.track == "main" and c.enabled and not c.archived]
-        clips.sort(key=lambda c: c.start)
-        return clips
+        return self.project.clips_for_track(MAIN_TRACK_ID)
 
-    def _repack_main(self) -> None:
-        """Pack visible main-track clips contiguously by their current order."""
+    def _repack_track(self, track_id: str) -> None:
+        """Pack a track's visible clips contiguously by their current order."""
         cursor = 0
-        for c in self._visible_main():
+        for c in self.project.clips_for_track(track_id):
             c.start = cursor
             cursor += self.project._clip_length(c)
+
+    def _repack_main(self) -> None:
+        self._repack_track(MAIN_TRACK_ID)
+
+    def _repack_if_video(self, track_id: str) -> None:
+        """Repack *track_id* if it's a video track (motion is a free pool)."""
+        try:
+            if self.project.track(track_id).role == "video":
+                self._repack_track(track_id)
+        except KeyError:
+            pass
 
     def reorder_main_clip(self, clip_id: str, new_index: int) -> None:
         ordered = self._visible_main()
@@ -703,8 +777,7 @@ class AppController(QObject):
             c.in_point = max(0, min(int(in_point), cur_out - 1))
         if out_point is not None:
             c.out_point = max(c.in_point + 1, min(int(out_point), media.nb_frames))
-        if c.track == "main":
-            self._repack_main()
+        self._repack_if_video(c.track)
         self.project_changed.emit()
 
     def remove_clip(self, clip_id: str) -> None:
@@ -718,8 +791,7 @@ class AppController(QObject):
         self.project.clips = [x for x in self.project.clips if x.id != clip_id]
         self.project.mosh_ops = [o for o in self.project.mosh_ops
                                  if o.target_clip_id != clip_id]
-        if c.track == "main":
-            self._repack_main()
+        self._repack_if_video(c.track)
         self.project_changed.emit()
 
     def split_clip(self, clip_id: str, offset: int) -> None:
@@ -728,8 +800,7 @@ class AppController(QObject):
         if new is None:
             return
         self._commit_undo(snap)
-        if new.track == "main":
-            self._repack_main()
+        self._repack_if_video(new.track)
         self.project_changed.emit()
         self.status.emit("Split clip.")
 
@@ -742,8 +813,7 @@ class AppController(QObject):
             return None
         self._push_undo()
         new = self.project.duplicate_clip(clip_id)
-        if new.track == "main":
-            self._repack_main()
+        self._repack_if_video(new.track)
         self.project_changed.emit()
         self.status.emit("Duplicated clip.")
         return new
