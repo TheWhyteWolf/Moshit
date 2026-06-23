@@ -192,6 +192,8 @@ class AutoParamWidget(QWidget):
     on, it reports a keyframe spec (edited via **Curve…** -- any number of
     keyframes with linear/hold/smooth easing)."""
 
+    beatsRequested = Signal()                 # fill keyframes from the audio beats
+
     def __init__(self, param: Param):
         super().__init__()
         self._param = param
@@ -212,7 +214,11 @@ class AutoParamWidget(QWidget):
         self.curve_btn.setMaximumWidth(60)
         self.curve_btn.setToolTip("Edit keyframes (multi-point + easing)")
         self.curve_btn.clicked.connect(self._edit_curve)
-        for w in (self.auto_chk, self.value, self.curve_btn):
+        self.beats_btn = QPushButton("♪")
+        self.beats_btn.setMaximumWidth(26)
+        self.beats_btn.setToolTip("Pulse this value on the audio beats")
+        self.beats_btn.clicked.connect(self.beatsRequested)
+        for w in (self.auto_chk, self.value, self.curve_btn, self.beats_btn):
             lay.addWidget(w)
         self.auto_chk.toggled.connect(self._on_toggle)
         self._sync()
@@ -222,7 +228,21 @@ class AutoParamWidget(QWidget):
                 "keys": [[0.0, value], [1.0, value]]}
 
     def _sync(self) -> None:
-        self.curve_btn.setVisible(self.auto_chk.isChecked())
+        on = self.auto_chk.isChecked()
+        self.curve_btn.setVisible(on)
+        self.beats_btn.setVisible(on)
+
+    def beat_range(self):
+        """(low, high, is_int) the beat pulse should swing between."""
+        p = self._param
+        low = p.lo if p.lo is not None else 0
+        high = p.hi if p.hi is not None else max(self._default, low + 1)
+        return low, high, self._is_int
+
+    def apply_curve(self, spec) -> None:
+        """Set an automation spec (e.g. a beat pulse) and turn automation on."""
+        if spec and spec.get("keys"):
+            self.set_value(spec)
 
     def _on_toggle(self, on: bool) -> None:
         if on and self._spec is None:
@@ -455,24 +475,8 @@ class TimelineWidget(QWidget):
                 if c.track == "motion" and not c.archived]
 
     def _main_layout(self):
-        """Main-track layout as ``[(clip, start, length, trans), ...]`` in frames.
-
-        Crossfading clips overlap the previous one by their (clamped) transition,
-        so the laid-out total matches the rendered timeline (which is shorter than
-        the contiguous sum by every overlap) and the playhead stays frame-accurate.
-        """
-        out = []
-        cursor = 0
-        prev_len = 0
-        for i, clip in enumerate(self._main_clips()):
-            length = self._project._clip_length(clip)
-            trans = (min(int(getattr(clip, "transition_in", 0)), length, prev_len)
-                     if i > 0 else 0)
-            start = cursor - trans
-            out.append((clip, start, length, trans))
-            cursor = start + length
-            prev_len = length
-        return out
+        """Overlap-aware main-track layout (see ``Project.main_layout``)."""
+        return self._project.main_layout() if self._project else []
 
     def _main_length(self) -> int:
         lay = self._main_layout()
@@ -1127,6 +1131,7 @@ class InspectorPanel(QWidget):
         self._pixel_fx: List[dict] = []
         self._pixel_getters: Dict[str, Callable] = {}
         self._pixel_sel = -1
+        self._beat_provider: Optional[Callable] = None    # clip_id -> [pos, ...]
 
         layout = QVBoxLayout(self)
         layout.addWidget(_heading("Inspector"))
@@ -1695,11 +1700,36 @@ class InspectorPanel(QWidget):
             if param.kind == "clip_ref":
                 widget.addItems(self._motion_labels)
                 self._clip_ref_combos.append(widget)
+            if isinstance(widget, AutoParamWidget):
+                widget.beatsRequested.connect(
+                    lambda w=widget: self._fill_beats(w))
             if param.help:
                 widget.setToolTip(param.help)
             self._form.addRow(param.label or param.name, widget)
             self._getters[param.name] = getter
             self._param_widgets[param.name] = widget
+
+    def set_beat_provider(self, provider) -> None:
+        """Inject a callable ``clip_id -> [normalised beat positions]``."""
+        self._beat_provider = provider
+
+    def _fill_beats(self, widget) -> None:
+        """Populate a parameter's keyframes from the audio beats of this clip."""
+        from .. import beats
+        if not self._beat_provider or not self._clip_id:
+            self.clip_lbl.setText(
+                "<span style='color:#ffd166'>Render a preview with audio first "
+                "(unmute) to detect beats.</span>")
+            return
+        positions = self._beat_provider(self._clip_id)
+        if not positions:
+            self.clip_lbl.setText(
+                "<span style='color:#ffd166'>No beats found in this clip's "
+                "audio.</span>")
+            return
+        low, high, is_int = widget.beat_range()
+        spec = beats.pulse_curve(positions, low, high, is_int=is_int)
+        widget.apply_curve(spec)
 
     # -- presets & randomiser ----------------------------------------------- #
 

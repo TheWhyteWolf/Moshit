@@ -242,6 +242,7 @@ class MainWindow(QMainWindow):
         self.timeline.set_project(self.controller.project)
         self.inspector.set_presets(self.controller.preset_names())
         self.inspector.set_flow_sources(self.controller.media_choices())
+        self.inspector.set_beat_provider(self.controller.beat_positions)
 
     # -- toolbar ------------------------------------------------------------ #
 

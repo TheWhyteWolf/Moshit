@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from . import avi
 from .avi import AviVideo, Frame
@@ -392,6 +392,26 @@ class Project:
         return sorted((c for c in self.clips
                        if c.track == "main" and c.enabled and not c.archived),
                       key=lambda c: c.start)
+
+    def main_layout(self) -> List[Tuple[Clip, int, int, int]]:
+        """Main-track layout as ``[(clip, start, length, trans), ...]`` in frames.
+
+        Crossfading clips overlap the previous one by their clamped transition,
+        so the laid-out total matches the rendered (shorter) timeline. Shared by
+        the timeline drawing and by audio-aligned features (e.g. beat sync).
+        """
+        out: List[Tuple[Clip, int, int, int]] = []
+        cursor = 0
+        prev_len = 0
+        for i, clip in enumerate(self.main_clips()):
+            length = self._clip_length(clip)
+            trans = (min(int(getattr(clip, "transition_in", 0)), length, prev_len)
+                     if i > 0 else 0)
+            start = cursor - trans
+            out.append((clip, start, length, trans))
+            cursor = start + length
+            prev_len = length
+        return out
 
     def render(self, engine: MoshEngine, out_avi, *,
                profile: Optional[str] = None, export_path=None,

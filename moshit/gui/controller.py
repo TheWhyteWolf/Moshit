@@ -26,7 +26,7 @@ from ..engine import EngineConfig, MoshEngine
 from ..ffmpeg import FFmpeg
 from ..modes import load_modes
 from ..project import Project
-from .. import waveform
+from .. import beats, waveform
 from .preview import PreviewDecoder
 
 
@@ -285,6 +285,25 @@ class AppController(QObject):
         self._preview_muted = bool(muted)
         if not muted:
             self.refresh_preview()             # build the audio now
+
+    def beat_positions(self, clip_id: str) -> List[float]:
+        """Onsets in the preview audio that fall within *clip_id*'s span, as
+        normalised 0..1 offsets within the clip (for beat-synced automation).
+        Empty if there's no preview audio yet or the clip isn't on the main track.
+        """
+        wav = self._audio_path_cache
+        if not wav:
+            return []
+        span = next(((start, length) for clip, start, length, _t
+                     in self.project.main_layout() if clip.id == clip_id), None)
+        if not span or span[1] <= 0:
+            return []
+        fps = self.config.fps or 30.0
+        start_s, dur_s = span[0] / fps, span[1] / fps
+        if dur_s <= 0:
+            return []
+        return [(t - start_s) / dur_s for t in beats.onsets(wav)
+                if start_s <= t < start_s + dur_s]
 
     @Slot(int, float)
     def _on_preview_begin(self, total: int, fps: float):

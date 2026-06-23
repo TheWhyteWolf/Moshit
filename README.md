@@ -151,6 +151,12 @@ effect processes, so it survives effects that change the frame count. Built-in
 automatable params include `bitrot` intensity, `pframe_duplicate` factor, and
 `surge` intensity; effects opt in (see *Writing an effect*).
 
+The **♪** button next to an automatable param fills it straight from the music:
+it detects the beats in the preview audio that fall under the selected clip and
+writes a stepped (hold) curve that spikes the value on each one — so a bloom or
+bitrot burst lands on the beat. Unmute and render a preview first so there's
+audio to analyse; the detection is pure-Python (no extra dependencies).
+
 **Region.** Each effect can be limited to a frame range of its input — tick
 **Limit to frames** and set a start/end (leave end at `end` to run to the last
 frame). So you can glitch just the middle of a clip, or stack effects that hit
@@ -419,16 +425,15 @@ def apply(self, frames, ctx, *, amount=0.5):
 
 ## Roadmap
 
-Planned, in order:
+The basic-editing polish list is cleared. Recently landed: **visual crossfade
+overlap** (the timeline draws the true overlap as a hatched band, with a
+frame-accurate, overlap-aware ruler), **undo/redo** (snapshot-based history,
+Ctrl+Z / Ctrl+Shift+Z), **clip split at playhead** (GOP-snapped so both halves
+stay decodable), an **audio waveform strip** under the ruler, and **beat-synced
+keyframes** (the ♪ button pulses an automatable parameter on the audio's beats).
 
-1. **Beat-synced keyframes** — onset/beat detection that auto-places automation
-   keyframes (e.g. drive `iframe_pulse`/`surge` on the beat).
-
-Done: **visual crossfade overlap** (timeline draws the true overlap as a hatched
-band, with a frame-accurate, overlap-aware ruler), **undo/redo** (snapshot-based
-history, Ctrl+Z / Ctrl+Shift+Z), **clip split at playhead** (GOP-snapped so both
-halves stay decodable), and an **audio waveform strip** under the ruler (a
-dependency-light peak envelope of the assembled preview track).
+The bigger open item is independent, freely stacked **compositing tracks** (the
+single main track plus a motion track cover today's needs).
 
 On the glitch side, the signature systems have all landed: GPU optical-flow
 motion transfer (see **Optical-flow transfer**), per-clip optical-flow as a

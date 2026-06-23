@@ -138,6 +138,34 @@ def test_split_clip_at_playhead(win):
     assert len(ctl.project.main_clips()) == 1                # back to one clip
 
 
+def test_beat_positions_clip_to_span(win, monkeypatch):
+    import moshit.beats as beats_mod
+    ctl = win.controller
+    _seed_clip(ctl, "a")
+    _seed_clip(ctl, "b")                                 # a=[0,20], b=[20,40] frames
+    ctl._audio_path_cache = "dummy.wav"                  # truthy: skip real audio
+    fps = ctl.config.fps
+    monkeypatch.setattr(beats_mod, "onsets",
+                        lambda wav: [10 / fps, 30 / fps, 999.0])
+    a, b = ctl.beat_positions("a"), ctl.beat_positions("b")
+    assert len(a) == 1 and abs(a[0] - 0.5) < 1e-6        # the 10f onset, normalised
+    assert len(b) == 1 and abs(b[0] - 0.5) < 1e-6        # the 30f onset (999s dropped)
+
+
+def test_inspector_beat_fill(win):
+    insp = win.inspector
+    from moshit.gui.widgets import AutoParamWidget
+    insp.set_beat_provider(lambda cid: [0.25, 0.5, 0.75])
+    insp._clip_id = "c"
+    insp.mode_combo.setCurrentText("pframe_duplicate")
+    w = insp._param_widgets["factor"]
+    assert isinstance(w, AutoParamWidget)
+    insp._fill_beats(w)
+    val = insp._getters["factor"]()
+    assert isinstance(val, dict) and val["__auto__"] and val["interp"] == "hold"
+    assert len([k for k in val["keys"] if len(k) >= 2]) >= 3   # a pulse per beat
+
+
 def test_presets_save_and_apply(win):
     ctl = win.controller
     _seed_clip(ctl, "c1")
