@@ -41,6 +41,44 @@ def test_mainwindow_constructs(win):
     assert win.preview and win.timeline and win.inspector
 
 
+def test_preview_audio_builds_and_mutes(qapp, tmp_path, monkeypatch):
+    from pathlib import Path
+    from PySide6.QtCore import QEventLoop, QTimer
+    from moshit.gui.controller import AppController
+    from moshit.engine import EngineConfig
+    from moshit.ffmpeg import FFmpeg
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    ff = FFmpeg()
+    src = tmp_path / "a.mp4"
+    ff._run(["-f", "lavfi", "-i", "testsrc=size=128x96:rate=24:duration=0.5",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=0.5",
+             "-pix_fmt", "yuv420p", "-shortest", "-y", str(src)], "mk")
+    c = AppController(config=EngineConfig(width=128, height=96, fps=24.0, gop=12))
+
+    def run_op(call):
+        loop = QEventLoop()
+        c.busy.connect(lambda busy, _m: loop.quit() if not busy else None)
+        QTimer.singleShot(40000, loop.quit)
+        call()
+        loop.exec()
+
+    run_op(lambda: c.import_media(str(src), "main"))
+    c.add_clip_for_media(list(c.project.media)[0], "main")
+    got = []
+    c.preview_audio.connect(got.append)
+    run_op(lambda: c.refresh_preview())
+    assert got and got[-1] and Path(got[-1]).exists()    # audio built from source
+    first = got[-1]
+    run_op(lambda: c.refresh_preview())
+    assert got[-1] == first                              # cached on unchanged plan
+    c._preview_muted = True
+    got.clear()
+    run_op(lambda: c.refresh_preview())
+    assert got and got[-1] is None                       # muted -> no audio
+    c.cleanup()
+
+
 def test_effect_stack_region_and_pixel_fx(win):
     ctl = win.controller
     _seed_clip(ctl, "c")

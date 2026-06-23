@@ -106,9 +106,12 @@ PySide6 — no extra media libraries. The preview streams in as it decodes (you 
 it build rather than waiting on a frozen window), and your scrub position is kept
 across re-renders so iterating on an effect doesn't jump you back to the start.
 The transport has play/pause (`Space`), single-frame step (`,` / `.`),
-jump-to-start/end (`Home` / `End`), a **Loop** toggle, and a timecode readout
-(`frame / frame · mm:ss:ff`). **File → Save frame as image…** (`Ctrl+Shift+S`)
-writes the current frame as a full-resolution PNG.
+jump-to-start/end (`Home` / `End`), a **Loop** toggle, a timecode readout
+(`frame / frame · mm:ss:ff`), and a **🔊** toggle that plays the assembled
+**audio** in sync with playback (built lazily and cached, so most edits don't
+rebuild it; needs PySide6's QtMultimedia, otherwise the toggle is hidden).
+**File → Save frame as image…** (`Ctrl+Shift+S`) writes the current frame as a
+full-resolution PNG.
 
 **Sequence settings.** Every clip is normalised to one resolution and frame rate
 on import, so you pick them up front: **New project** (`Ctrl+N`) opens a settings
@@ -406,8 +409,9 @@ def apply(self, frames, ctx, *, amount=0.5):
 - Audio is reassembled from the original sources and muxed on **export** (the
   moshable intermediate stays video-only). Clean edits stay perfectly in sync;
   moshed clips keep their source audio padded/trimmed to the retimed length;
-  baked clips are silent. The **preview is silent** — audio lands in the
-  exported file — and export needs the source files still on disk.
+  baked clips are silent. The **preview plays this audio** in sync via the **🔊**
+  toggle (built lazily and cached; needs PySide6's QtMultimedia), and the same
+  track is muxed into the export — which needs the source files still on disk.
 - Baking re-encodes (one generation of MPEG-4 recompression) in exchange for a
   clean, predictable, re-moshable clip.
 
@@ -415,8 +419,6 @@ def apply(self, frames, ctx, *, amount=0.5):
 
 Remaining basic-editing polish:
 
-- **Preview audio** — audio currently lands only in the export; playing it back,
-  synced to the frame stepper, is the remaining piece of audio support.
 - **Visual crossfade overlap** — crossfades render correctly, but the timeline
   still lays clips out contiguously (with a corner marker) rather than drawing
   the true overlap; a compositing track is the longer-term home for that.

@@ -83,6 +83,7 @@ class AppController(QObject):
     preview_begin = Signal(int, float)    # (total_frames, fps) — stream start
     preview_batch = Signal(list)          # list[QImage] — a chunk of frames
     preview_done = Signal()               # stream complete
+    preview_audio = Signal(object)        # path to the preview's audio, or None
 
     def __init__(self, config: Optional[EngineConfig] = None,
                  ffmpeg_bin: Optional[str] = None,
@@ -100,6 +101,10 @@ class AppController(QObject):
         self._busy = False
         self._pending: Optional[Callable] = None
         self._active_worker = None             # keep the running QRunnable alive
+        self._preview_muted = False            # build + play preview audio
+        self._audio_plan_cache = None          # rebuild audio only when it changes
+        self._audio_path_cache = None
+        self._preview_audio = None
         self._cleaned = False
         self._undo: List = []                 # snapshots of (clips, mosh_ops)
         self._redo: List = []
@@ -245,8 +250,9 @@ class AppController(QObject):
         out = self._dir / "preview.avi"
 
         def work(emit_begin, emit_batch):
-            self.project.render(self.engine, out)
+            r = self.project.render(self.engine, out)
             self.decoder.decode_stream(out, emit_begin, emit_batch, max_width=720)
+            self._preview_audio = self._build_preview_audio(r.get("audio_plan"))
 
         worker = _StreamWorker(work)
         worker.signals.begin.connect(self._on_preview_begin)   # queued -> main
@@ -255,6 +261,24 @@ class AppController(QObject):
         worker.signals.error.connect(self._on_error)
         self._active_worker = worker           # retain (see _run)
         self.pool.start(worker)
+
+    def _build_preview_audio(self, audio_plan):
+        """Assemble the preview's audio track (worker thread). Cached by plan, so
+        edits that don't change the audio reuse the previous build."""
+        if self._preview_muted or not audio_plan:
+            return None
+        if audio_plan == self._audio_plan_cache and self._audio_path_cache:
+            return self._audio_path_cache
+        path = self.engine.build_audio(audio_plan, self._dir / "preview.wav",
+                                       fps=self.config.fps)
+        self._audio_plan_cache = audio_plan
+        self._audio_path_cache = str(path) if path else None
+        return self._audio_path_cache
+
+    def set_preview_muted(self, muted: bool) -> None:
+        self._preview_muted = bool(muted)
+        if not muted:
+            self.refresh_preview()             # build the audio now
 
     @Slot(int, float)
     def _on_preview_begin(self, total: int, fps: float):
@@ -269,6 +293,7 @@ class AppController(QObject):
         self._busy = False
         self.busy.emit(False, "")
         self.preview_done.emit()
+        self.preview_audio.emit(self._preview_audio)
         self.status.emit("Preview updated.")
 
     def export(self, profile: str, path, audio: bool = True) -> None:

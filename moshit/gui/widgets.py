@@ -16,6 +16,13 @@ from PySide6.QtWidgets import (
     QPushButton, QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
+try:
+    from PySide6.QtCore import QUrl
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+    _HAVE_QT_AUDIO = True
+except Exception:                      # QtMultimedia not built / no backend
+    _HAVE_QT_AUDIO = False
+
 from ..modes import available_modes, get_mode
 from ..modes.base import Param, _build_evaluator
 
@@ -718,6 +725,7 @@ class TimelineWidget(QWidget):
 
 class PreviewWidget(QWidget):
     frameChanged = Signal(int)
+    muteToggled = Signal(bool)
 
     def __init__(self):
         super().__init__()
@@ -727,6 +735,15 @@ class PreviewWidget(QWidget):
         self._restore_frac: Optional[float] = None
         self._streaming = False
         self._loop = False
+        self._audio_path: Optional[str] = None
+        self._muted = False
+        self._advancing = False               # distinguish auto-advance from scrubs
+        if _HAVE_QT_AUDIO:
+            self._audio_out = QAudioOutput()
+            self._player = QMediaPlayer()
+            self._player.setAudioOutput(self._audio_out)
+        else:
+            self._audio_out = self._player = None
 
         layout = QVBoxLayout(self)
         layout.addWidget(_heading("Preview"))
@@ -771,12 +788,20 @@ class PreviewWidget(QWidget):
         self.loop_chk.setToolTip("Repeat playback from the start")
         self.loop_chk.toggled.connect(self._set_loop)
 
+        self.mute_btn = QPushButton("🔊")
+        self.mute_btn.setMaximumWidth(34)
+        self.mute_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mute_btn.setToolTip("Preview audio on/off")
+        self.mute_btn.clicked.connect(self._toggle_mute)
+        self.mute_btn.setVisible(_HAVE_QT_AUDIO)
+
         self.frame_lbl = QLabel("0 / 0")
         for w in (self.start_btn, self.prev_btn, self.play_btn,
                   self.next_btn, self.end_btn):
             controls.addWidget(w)
         controls.addSpacing(8)
         controls.addWidget(self.loop_chk)
+        controls.addWidget(self.mute_btn)
         controls.addStretch(1)
         controls.addWidget(self.frame_lbl)
         layout.addLayout(controls)
@@ -795,6 +820,45 @@ class PreviewWidget(QWidget):
 
     def _set_loop(self, on: bool) -> None:
         self._loop = bool(on)
+
+    # -- audio (synced to the frame stepper) -------------------------------- #
+
+    def set_audio(self, path) -> None:
+        """Set the preview's audio track (or None to clear)."""
+        self._audio_path = path
+        if not self._player:
+            return
+        self._player.setSource(QUrl.fromLocalFile(path) if path else QUrl())
+        if self.timer.isActive():             # resync if it arrives mid-playback
+            self._audio_start()
+
+    def _audio_ms(self, idx: int) -> int:
+        return int(idx / max(1.0, self._fps) * 1000)
+
+    def _audio_start(self) -> None:
+        if self._player and self._audio_path and not self._muted:
+            self._player.setPosition(self._audio_ms(self._idx))
+            self._player.play()
+
+    def _audio_stop(self) -> None:
+        if self._player:
+            self._player.pause()
+
+    def _audio_resync(self) -> None:
+        if (self._player and not self._muted and self._player.playbackState()
+                == QMediaPlayer.PlaybackState.PlayingState):
+            self._player.setPosition(self._audio_ms(self._idx))
+
+    def _toggle_mute(self) -> None:
+        self._muted = not self._muted
+        self.mute_btn.setText("🔇" if self._muted else "🔊")
+        if self._audio_out:
+            self._audio_out.setMuted(self._muted)
+        if self._muted:
+            self._audio_stop()
+        elif self.timer.isActive():
+            self._audio_start()
+        self.muteToggled.emit(self._muted)
 
     def _timecode(self, frame: int) -> str:
         fps = max(1.0, self._fps)
@@ -816,15 +880,18 @@ class PreviewWidget(QWidget):
         if self.timer.isActive():
             self.timer.stop()
             self.play_btn.setText("Play")
+            self._audio_stop()
         elif self._frames:
             self.timer.start(int(1000 / max(1.0, self._fps)))
             self.play_btn.setText("Pause")
+            self._audio_start()
 
     def step(self, delta: int) -> None:
         if not self._frames:
             return
         self.timer.stop()
         self.play_btn.setText("Play")
+        self._audio_stop()
         self.slider.setValue(max(0, min(self._idx + int(delta),
                                         len(self._frames) - 1)))
 
@@ -928,18 +995,26 @@ class PreviewWidget(QWidget):
     def _on_slider(self, value: int) -> None:
         if value != self._idx:
             self._show(value)
+            if not self._advancing:                  # user scrub -> resync audio
+                self._audio_resync()
 
     def _advance(self) -> None:
         if not self._frames:
             return
         if self._idx + 1 >= len(self._frames):       # reached the end
             if self._loop:
+                self._advancing = True
                 self.slider.setValue(0)
+                self._advancing = False
+                self._audio_resync()                 # restart audio at the top
             else:
                 self.timer.stop()
                 self.play_btn.setText("Play")
+                self._audio_stop()
             return
+        self._advancing = True
         self.slider.setValue(self._idx + 1)          # triggers _show via _on_slider
+        self._advancing = False
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
