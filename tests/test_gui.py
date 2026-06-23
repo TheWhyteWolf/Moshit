@@ -141,11 +141,12 @@ def test_timeline_crossfade_overlap_layout(qapp):
     proj.media["m"] = MediaItem(id="m", source_path="x", label="x", role="main",
                                 intermediate_path="x", nb_frames=20)
     proj.clips.append(Clip(id="a", media_id="m", track="main"))
-    proj.clips.append(Clip(id="b", media_id="m", track="main", transition_in=8))
+    proj.clips.append(Clip(id="b", media_id="m", track="main", start=20,
+                           transition_in=8))           # butted up, legacy crossfade
     tl.set_project(proj)
     lay = [(c.id, start, length, trans) for c, start, length, trans
            in tl._main_layout()]
-    assert lay == [("a", 0, 20, 0), ("b", 12, 20, 8)]   # b overlaps a's tail by 8
+    assert lay == [("a", 0, 20, 0), ("b", 12, 20, 8)]   # b pulled back to overlap by 8
     assert tl._main_length() == 32                       # 20 + 20 - 8 (matches render)
 
 

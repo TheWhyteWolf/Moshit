@@ -546,20 +546,25 @@ class Project:
     def track_layout(self, track_id: str) -> List[Tuple[Clip, int, int, int]]:
         """A track's clips as ``[(clip, start, length, trans), ...]`` in frames.
 
-        Crossfading clips overlap the previous one by their clamped transition,
-        so the laid-out total matches the rendered (shorter) timeline. Shared by
-        the timeline drawing and by audio-aligned features (e.g. beat sync).
+        Clips are placed at their own ``start`` (gaps allowed). ``trans`` is the
+        crossfade = how many frames a clip overlaps the previous one: either set
+        explicitly by positioning (``start`` < the previous clip's end), or, for a
+        clip still butted up against the previous one, pulled back by its legacy
+        ``transition_in``. Shared by the timeline drawing, the compositor, and
+        audio-aligned features (e.g. beat sync).
         """
         out: List[Tuple[Clip, int, int, int]] = []
-        cursor = 0
+        prev_end = 0
         prev_len = 0
         for i, clip in enumerate(self.clips_for_track(track_id)):
             length = self._clip_length(clip)
-            trans = (min(int(getattr(clip, "transition_in", 0)), length, prev_len)
-                     if i > 0 else 0)
-            start = cursor - trans
+            start = max(0, int(clip.start))
+            if i > 0 and start >= prev_end and int(getattr(clip, "transition_in", 0)):
+                start = max(0, prev_end
+                            - min(int(clip.transition_in), length, prev_len))
+            trans = min(max(0, prev_end - start), length, prev_len) if i > 0 else 0
             out.append((clip, start, length, trans))
-            cursor = start + length
+            prev_end = start + length
             prev_len = length
         return out
 
@@ -586,17 +591,28 @@ class Project:
         occupied = [t for t in vtracks if self.clips_for_track(t.id)]
         if not occupied:
             raise ValueError("no enabled video clips to render")
-        simple = len(occupied) == 1 and all(
+        clips = self.clips_for_track(occupied[0].id)
+        simple = len(occupied) == 1 and self._is_contiguous(clips) and all(
             abs(getattr(c, "opacity", 1.0) - 1.0) < 1e-6
             and getattr(c, "blend_mode", "normal") == "normal"
-            for c in self.clips_for_track(occupied[0].id))
+            for c in clips)
         if simple:
             return self._render_flat(
-                engine, out_avi, self.clips_for_track(occupied[0].id),
+                engine, out_avi, clips,
                 profile=profile, export_path=export_path, audio=audio)
         return self._render_composite(
             engine, out_avi, vtracks,
             profile=profile, export_path=export_path, audio=audio)
+
+    def _is_contiguous(self, clips) -> bool:
+        """True if clips butt up start-to-end with no free-positioned gap/overlap
+        (so the codec/flat path, which concatenates in order, is faithful)."""
+        cursor = 0
+        for c in clips:
+            if int(c.start) != cursor:
+                return False
+            cursor += self._clip_length(c)
+        return True
 
     def _resolve_precomps(self, engine: MoshEngine, seq_id: str,
                           _visiting: Optional[List[str]] = None) -> None:
@@ -813,23 +829,23 @@ class Project:
     def _render_composite(self, engine: MoshEngine, out_avi, vtracks, *,
                           profile=None, export_path=None, audio=False) -> Dict:
         fps = self.config.fps or 30.0
-        total = 0
-        for t in vtracks:
-            for c in self.clips_for_track(t.id):
-                total = max(total, int(c.start) + self._clip_length(c))
+        layouts = {t.id: self.track_layout(t.id) for t in vtracks}
+        total = max((start + length
+                     for lay in layouts.values() for _c, start, length, _t in lay),
+                    default=0)
         if total <= 0:
             raise ValueError("empty composition")
 
         layers: List[Dict] = []
-        main_lengths: List = []                    # (clip, length) on the main track
+        main_seq: List = []                        # (clip, start, length, trans)
         for t in vtracks:                          # bottom -> top by index
-            for c in self.clips_for_track(t.id):
-                seg, length = self._clip_segment(engine, c)
-                layers.append({"input": seg, "start": int(c.start),
-                               "length": length, "opacity": float(c.opacity),
-                               "blend": c.blend_mode})
+            for clip, start, length, trans in layouts[t.id]:
+                seg, seglen = self._clip_segment(engine, clip)
+                layers.append({"input": seg, "start": int(start),
+                               "length": seglen, "opacity": float(clip.opacity),
+                               "blend": clip.blend_mode, "head_fade": int(trans)})
                 if t.id == MAIN_TRACK_ID:
-                    main_lengths.append((c, length))
+                    main_seq.append((clip, int(start), seglen, int(trans)))
         out = engine.composite(layers, out_avi, total_frames=total)
         for lay in layers:                         # consumed
             try:
@@ -837,12 +853,29 @@ class Project:
             except OSError:
                 pass
 
-        # Audio (Phase 1): the root main track only, hard-cut (no track mixing).
-        audio_plan = [self._audio_seg(c, mlen, mlen, 0, fps)[0]
-                      for c, mlen in main_lengths]
+        # Audio: the root main track only (no track mixing yet), placed at the
+        # clips' absolute positions with gap silence and crossfade head-trims.
+        audio_plan = self._composite_audio_plan(main_seq, fps)
         return self._export_result(engine, out, audio_plan, total, len(layers),
                                    profile=profile, export_path=export_path,
                                    audio=audio)
+
+    def _composite_audio_plan(self, main_seq, fps) -> List[Dict]:
+        plan: List[Dict] = []
+        prev_end = 0
+        prev_len = 0
+        for idx, (clip, start, length, trans) in enumerate(main_seq):
+            gap = start - prev_end
+            if gap > 0:                            # silence fills a free-position gap
+                plan.append({"source": None, "start": 0.0, "duration": gap / fps,
+                             "silent": True, "speed": 1.0, "reverse": False,
+                             "fade_in": 0, "fade_out": 0, "transition_in": 0})
+            seg, _ = self._audio_seg(clip, length, prev_len, idx, fps)
+            seg["transition_in"] = int(trans)      # the actual overlap, not legacy
+            plan.append(seg)
+            prev_end = start + length
+            prev_len = length
+        return plan
 
     # -- bake (reversible) -------------------------------------------------- #
 

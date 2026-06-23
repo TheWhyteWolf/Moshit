@@ -492,8 +492,8 @@ class TimelineWidget(QWidget):
         return self._project.main_layout() if self._project else []
 
     def _main_length(self) -> int:
-        lay = self._main_layout()
-        return (lay[-1][1] + lay[-1][2]) if lay else 0
+        return max((start + length for _c, start, length, _t in self._main_layout()),
+                   default=0)
 
     def _seq(self) -> str:
         return self._seq_id or (self._project.root_seq_id if self._project else "")
@@ -516,8 +516,8 @@ class TimelineWidget(QWidget):
 
     def _track_total(self, track) -> int:
         if track.role == "video":
-            lay = self._project.track_layout(track.id)
-            return (lay[-1][1] + lay[-1][2]) if lay else 0
+            return max((start + length for _c, start, length, _t
+                        in self._project.track_layout(track.id)), default=0)
         return sum(self._project._clip_length(c)
                    for c in self._project.clips_for_track(track.id))
 

@@ -433,9 +433,12 @@ class FFmpeg:
         for i, lay in enumerate(layers):
             op = max(0.0, min(1.0, float(lay.get("opacity", 1.0))))
             start = max(0, int(lay.get("start", 0)))
+            head = max(0, int(lay.get("head_fade", 0)))   # crossfade-in frames
             startT = start / fps
             chain = [f"fps={fps:g}", f"scale={w}:{h}:flags=bicubic",
                      "format=yuva420p"]
+            if head > 0:                                   # dissolve in over the overlap
+                chain.append(f"fade=t=in:st=0:d={head / fps:.6f}:alpha=1")
             if op < 1.0:
                 chain.append(f"colorchannelmixer=aa={op:.4f}")
             chain.append(f"settb=1/{tb}")
