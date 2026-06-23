@@ -807,6 +807,71 @@ def cmd_selftest(args) -> int:
     _check(krel.clip(krec.baked_clip_id).pixel_effects[0]["name"] == "rgb_shift",
            "pixel FX survive JSON round-trip", failures)
 
+    print("\nL. Compositing tracks & nested sequences")
+    from .project import MAIN_TRACK_ID, MOTION_TRACK_ID
+    lproj = Project(name="l", assets_dir=str(tmp / "assets_l"))
+    _check([t.id for t in lproj.video_tracks(lproj.root_seq_id)] == [MAIN_TRACK_ID]
+           and lproj.track(MOTION_TRACK_ID).role == "motion",
+           "fresh project has the root main video track + motion pool", failures)
+    lp = tmp / "l.avi"
+    _synth_avi(lp, "I" + "P" * 5)
+    ldest = lproj.assets_dir / "lmedia.avi"
+    ldest.write_bytes(lp.read_bytes())
+    lcav = parse_avi(ldest)
+    lproj.media["lmedia"] = MediaItem(
+        id="lmedia", source_path=str(lp), label="l", role="main",
+        intermediate_path=str(ldest), width=lcav.width, height=lcav.height,
+        fps=lcav.fps, nb_frames=len(lcav.frames))
+    lproj._parsed["lmedia"] = lcav
+    lproj.add_clip("lmedia", "main")
+    v2 = lproj.add_track()                          # a second video track on top
+    vclip = lproj.add_clip("lmedia", v2.id)
+    vclip.opacity, vclip.blend_mode = 0.5, "screen"
+    _check([t.id for t in lproj.video_tracks(lproj.root_seq_id)]
+           == [MAIN_TRACK_ID, v2.id],
+           "added video track stacks above main by index", failures)
+    _check(lproj.clip(vclip.id).seq_id == lproj.root_seq_id,
+           "a clip is stamped with its track's sequence", failures)
+    lrel = Project.load(lproj.save(tmp / "l.json"))
+    rc = lrel.clip(vclip.id)
+    _check(abs(rc.opacity - 0.5) < 1e-9 and rc.blend_mode == "screen",
+           "clip opacity/blend survive JSON round-trip", failures)
+    _check([t.id for t in lrel.video_tracks(lrel.root_seq_id)]
+           == [MAIN_TRACK_ID, v2.id],
+           "tracks survive JSON round-trip in compositing order", failures)
+
+    seq = lproj.add_sequence("inner")              # a precomp
+    svt = lproj.video_tracks(seq.id)[0]
+    d_empty = lproj._sequence_digest(seq.id)
+    pclip = lproj.add_sequence_clip("main", seq.id)
+    smedia = lproj.sequence_media(seq.id)
+    _check(pclip.media_id == smedia.id and smedia.sequence_id == seq.id
+           and smedia.derived,
+           "a precomp clip links to its derived, sequence-backed media", failures)
+    lproj.add_clip("lmedia", svt.id)               # fill the precomp
+    _check(lproj._sequence_digest(seq.id) != d_empty,
+           "a sequence's digest (cache key) changes when its clips change", failures)
+
+    cyc = lproj.add_sequence("cyc")
+    cvt = lproj.video_tracks(cyc.id)[0]
+    lproj.add_sequence_clip(cvt.id, cyc.id)        # a sequence containing itself
+    raised = False
+    try:
+        lproj.render(None, tmp / "cyc.avi", sequence_id=cyc.id)
+    except ValueError as exc:
+        raised = "cycle" in str(exc)
+    _check(raised, "a self-referencing sequence is rejected as a cycle", failures)
+
+    legacy = {"version": 1, "name": "old", "media": [],
+              "clips": [{"id": "lc", "media_id": "lmedia", "track": "main"}],
+              "mosh_ops": [], "bake_records": []}
+    mproj = Project.from_dict(legacy)              # pre-compositing save format
+    _check(mproj.track(MAIN_TRACK_ID).role == "video"
+           and mproj.track(MOTION_TRACK_ID).role == "motion"
+           and mproj.clip("lc").seq_id == mproj.root_seq_id,
+           "a legacy project migrates to root sequence + main/motion tracks",
+           failures)
+
     print()
     if failures:
         print(f"SELFTEST FAILED: {len(failures)} check(s) failed")
