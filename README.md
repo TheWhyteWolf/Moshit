@@ -77,10 +77,11 @@ on both tracks at once, and any imported clip can be used as a motion source.
 
 ## The app
 
-The window is a media library, a preview with transport controls, a two-track
-timeline (a main track and a motion-source track), and an effect inspector whose
-controls are generated automatically from each effect's parameter schema — so any
-effect, including ones you write yourself, gets a usable UI with no GUI code.
+The window is a media library, a preview with transport controls, a multi-track
+timeline (stacked video tracks plus a motion-source track, with a sequence
+switcher above it), and an effect inspector whose controls are generated
+automatically from each effect's parameter schema — so any effect, including ones
+you write yourself, gets a usable UI with no GUI code.
 
 **Timeline.** A scrub handle rides the ruler across the top; drag it to move
 through the preview (it also tracks playback). Two tools sit in a strip directly
@@ -295,7 +296,7 @@ GPU produces it.
 Export reassembles audio from the original source clips and muxes it in (the GUI
 export dialog has an **Include audio** toggle; `render-project` does it by
 default, disable with `--no-audio`). The audio track is built to the rendered
-video's exact length, so trims, cuts and reorders stay in sync.
+video's exact length, so trims, cuts and clip moves stay in sync.
 
 ### Non-destructive projects
 
@@ -319,12 +320,13 @@ python -m moshit.cli render-project myproject/project.json --out final.avi
 
 ### Compositing tracks & nested sequences
 
-A sequence holds one or more **video tracks**. With a single track at full
-opacity and the `normal` blend, rendering takes the usual flat path (the
-codec-domain fast path, or the per-clip finish + crossfade fold). Add a second
-track, drop a clip's **opacity**, or pick a **blend mode** (`screen`, `multiply`,
-`add`, `difference`, …) and the renderer composites the tracks bottom-to-top in
-the pixel domain — alpha-aware, so gaps show the track below.
+A sequence holds one or more **video tracks**. Clips are positioned freely on a
+track (gaps allowed); a single contiguous track at full opacity and the `normal`
+blend takes the codec-domain fast path, while anything else — a second track, a
+gap, a per-clip **opacity**, a **blend mode** (`screen`, `multiply`, `add`,
+`difference`, …), or two clips that **overlap on the same track** — composites
+bottom-to-top in the pixel domain. It's alpha-aware, so gaps show the track below
+and overlapping same-track clips **cross-dissolve**.
 
 A whole sequence can be used as a clip inside another — an After-Effects-style
 **precomp**. A precomp renders to a cached intermediate (re-rendered only when its
