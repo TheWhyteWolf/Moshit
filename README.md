@@ -420,16 +420,15 @@ def apply(self, frames, ctx, *, amount=0.5):
 
 Planned, in order:
 
-1. **Undo/redo** — snapshot-based edit history over the JSON project model.
-2. **Clip split at playhead** — split one clip into two, GOP-snapped so both
-   halves stay decodable.
-3. **Audio waveform in the timeline** — draw the assembled track under the
+1. **Audio waveform in the timeline** — draw the assembled track under the
    timeline (pairs with synced preview audio).
-4. **Beat-synced keyframes** — onset/beat detection that auto-places automation
+2. **Beat-synced keyframes** — onset/beat detection that auto-places automation
    keyframes (e.g. drive `iframe_pulse`/`surge` on the beat).
 
-Done: **visual crossfade overlap** — the timeline draws crossfading clips with
-their true overlap (a hatched band) and a frame-accurate, overlap-aware ruler.
+Done: **visual crossfade overlap** (timeline draws the true overlap as a hatched
+band, with a frame-accurate, overlap-aware ruler), **undo/redo** (snapshot-based
+history, Ctrl+Z / Ctrl+Shift+Z), and **clip split at playhead** (GOP-snapped so
+both halves stay decodable).
 
 On the glitch side, the signature systems have all landed: GPU optical-flow
 motion transfer (see **Optical-flow transfer**), per-clip optical-flow as a

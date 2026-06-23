@@ -108,6 +108,31 @@ def test_effect_stack_region_and_pixel_fx(win):
     assert ctl.project.clip("c").has_finish()
 
 
+def test_undo_redo_round_trips(win):
+    ctl = win.controller
+    _seed_clip(ctl, "c")
+    assert not ctl.can_undo
+    ctl.add_effect("c", "bitrot", {"intensity": 0.4})
+    assert [e["mode"] for e in ctl.clip_effects("c")] == ["bitrot"]
+    assert ctl.can_undo and not ctl.can_redo
+    ctl.undo()
+    assert ctl.clip_effects("c") == [] and ctl.can_redo    # effect rolled back
+    ctl.redo()
+    assert [e["mode"] for e in ctl.clip_effects("c")] == ["bitrot"]
+
+
+def test_split_clip_at_playhead(win):
+    ctl = win.controller
+    _seed_clip(ctl, "c")                                     # media nb_frames=20
+    ctl.split_clip("c", 8)
+    mains = ctl.project.main_clips()
+    assert len(mains) == 2
+    assert [ctl.project._clip_length(c) for c in mains] == [8, 12]
+    assert ctl.can_undo
+    ctl.undo()
+    assert len(ctl.project.main_clips()) == 1                # back to one clip
+
+
 def test_presets_save_and_apply(win):
     ctl = win.controller
     _seed_clip(ctl, "c1")
