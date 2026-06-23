@@ -417,11 +417,18 @@ def apply(self, frames, ctx, *, amount=0.5):
 
 ## Roadmap
 
-Remaining basic-editing polish:
+Planned, in order:
 
-- **Visual crossfade overlap** — crossfades render correctly, but the timeline
-  still lays clips out contiguously (with a corner marker) rather than drawing
-  the true overlap; a compositing track is the longer-term home for that.
+1. **Visual crossfade overlap** — crossfades render correctly, but the timeline
+   still lays clips out contiguously (with a corner marker) rather than drawing
+   the true overlap; a compositing track is the longer-term home for that.
+2. **Undo/redo** — snapshot-based edit history over the JSON project model.
+3. **Clip split at playhead** — split one clip into two, GOP-snapped so both
+   halves stay decodable.
+4. **Audio waveform in the timeline** — draw the assembled track under the
+   timeline (pairs with synced preview audio).
+5. **Beat-synced keyframes** — onset/beat detection that auto-places automation
+   keyframes (e.g. drive `iframe_pulse`/`surge` on the beat).
 
 On the glitch side, the signature systems have all landed: GPU optical-flow
 motion transfer (see **Optical-flow transfer**), per-clip optical-flow as a
