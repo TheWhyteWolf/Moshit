@@ -69,6 +69,19 @@ def test_intra_track_crossfade_dissolves(project, engine, make_clip, tmp_path, p
     assert px[1] > 40 and px[2] > 60                 # green AND blue both present
 
 
+def test_free_position_gap_renders_black(project, engine, make_clip, tmp_path, probe):
+    # a free-positioned gap on the main track shows black and lengthens the output
+    mr = project.import_media(engine, make_clip("red.mp4", color="red"),
+                              label="red", role="main")
+    c = project.add_clip(mr.id, "main")
+    c.start = 6                                       # 6-frame leading gap
+    out = tmp_path / "g.avi"
+    r = project.render(engine, out)
+    assert r["frames"] == 30                          # 6 gap + 24
+    assert sum(probe.pixel(out, 2, 80, 60)) < 40      # black in the gap
+    assert probe.pixel(out, 15, 80, 60)[0] > 150      # red after it
+
+
 def test_single_track_keeps_fast_path(project, engine, make_clip, tmp_path, probe):
     # one clean main-track clip -> flat/fast path, geometry + count unchanged
     src = make_clip("a.mp4")

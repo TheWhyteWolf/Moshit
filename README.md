@@ -86,8 +86,8 @@ effect, including ones you write yourself, gets a usable UI with no GUI code.
 through the preview (it also tracks playback). Two tools sit in a strip directly
 under the timeline:
 
-- **Pointer** — drag a clip's body to reorder it on the main track, or drag
-  either edge to trim its start or end.
+- **Pointer** — drag a clip's body to move it in time (free positioning; gaps
+  and overlaps allowed), or drag either edge to trim its start or end.
 - **Cut** — click a clip to split it at that frame into two clips.
 
 You can also **split at the playhead** (`S`, or Edit → Split at playhead) and
@@ -434,10 +434,11 @@ def apply(self, frames, ctx, *, amount=0.5):
 
 - The renderer composites stacked **video tracks** (opacity + blend mode + alpha)
   and supports **nested sequences** (precomps), both editable from the timeline.
-  Within a track, clips still pack contiguously (free positioning / gaps and
-  intra-track crossfade dissolves on upper tracks are future work). A crossfade
-  overlaps two clips at render time, and the timeline draws that overlap (a
-  hatched band). Audio is still taken from the root sequence's main track.
+  Clips are **freely positioned** (drag a clip's body to move it; gaps show black /
+  the track below), and clips that **overlap on the same track cross-dissolve**.
+  Editing ops are non-rippling (a delete or trim leaves a gap rather than closing
+  it). Audio is still taken from the root sequence's main track (placed at the
+  clips' positions with gap silence; multi-track mixing is future work).
 - Clip trims snap to the nearest preceding keyframe so every clip stays
   decodable (GOP-based editing; for frame-exact cuts, use a smaller GOP).
 - Audio is reassembled from the original sources and muxed on **export** (the
@@ -461,9 +462,10 @@ keyframes** (the ♪ button pulses an automatable parameter on the audio's beats
 **Compositing tracks and nested sequences** have landed end-to-end: multiple
 video tracks composited with opacity/blend/alpha and precomps rendered to cached,
 moshable media, all editable from the timeline (track management, per-clip
-opacity/blend, a sequence switcher, precompose, and double-click-to-enter).
-Remaining refinements: free clip positioning / gaps within a track, intra-track
-crossfade dissolves on upper tracks, and multi-track audio mixing.
+opacity/blend, free clip positioning with gaps, intra-track crossfade dissolves,
+a sequence switcher, precompose, and double-click-to-enter). The main remaining
+refinement is **multi-track audio mixing** (audio currently comes from the root
+sequence's main track only).
 
 On the glitch side, the signature systems have all landed: GPU optical-flow
 motion transfer (see **Optical-flow transfer**), per-clip optical-flow as a

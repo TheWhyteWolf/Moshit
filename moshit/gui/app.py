@@ -438,6 +438,7 @@ class MainWindow(QMainWindow):
 
         self.timeline.clipSelected.connect(self._on_clip_selected)
         self.timeline.reorderRequested.connect(self.controller.reorder_clip)
+        self.timeline.moveRequested.connect(self.controller.move_clip)
         self.timeline.trimRequested.connect(self._on_trim)
         self.timeline.removeRequested.connect(self._on_remove)
         self.timeline.seekRequested.connect(self._on_seek)

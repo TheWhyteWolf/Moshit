@@ -404,13 +404,15 @@ class TimelineWidget(QWidget):
 
     Video tracks stack top-to-bottom (the topmost lane composites over the ones
     below); a motion lane sits at the bottom. Click a clip to select it, drag its
-    body to reorder it within its track, drag either edge to trim, and press
-    Delete to remove it. Right-click an empty lane for track actions (add /
-    remove / move / enable). A frame ruler and playhead run across the top.
+    body to move it in time (free positioning; overlapping clips on a track
+    cross-dissolve), drag either edge to trim, and press Delete to remove it.
+    Right-click an empty lane for track actions (add / remove / move / enable).
+    A frame ruler and playhead run across the top.
     """
 
     clipSelected = Signal(str)
     reorderRequested = Signal(str, int)            # clip_id, new index
+    moveRequested = Signal(str, int)               # clip_id, new start frame
     trimRequested = Signal(str, int, int)          # clip_id, in|-1, out|-1
     removeRequested = Signal(str)
     seekRequested = Signal(float)                  # scrub position, 0..1
@@ -788,9 +790,11 @@ class TimelineWidget(QWidget):
             mode = "trim_r"
         else:
             mode = "move"
+        x0, _x1 = self._track_x()
+        disp_start = round((rect.left() - x0) / self._ppf())   # current timeline pos
         self._drag = {"id": clip_id, "track": track, "mode": mode,
                       "press_x": pos.x(), "in": clip.in_point, "out": orig_out,
-                      "ppf": self._ppf()}
+                      "ppf": self._ppf(), "start": disp_start}
         self._cursor_x = pos.x()
         self.update()
 
@@ -821,9 +825,8 @@ class TimelineWidget(QWidget):
         d, self._drag = self._drag, None
         dframes = round((self._cursor_x - d["press_x"]) / d["ppf"])
         if d["mode"] == "move":
-            if self._is_video(d["track"]) and dframes != 0:
-                self.reorderRequested.emit(
-                    d["id"], self._drop_index(self._cursor_x, d["id"], d["track"]))
+            if self._is_video(d["track"]) and dframes != 0:    # free positioning
+                self.moveRequested.emit(d["id"], max(0, d["start"] + dframes))
         elif d["mode"] == "trim_l" and dframes != 0:
             self.trimRequested.emit(d["id"], max(0, d["in"] + dframes), -1)
         elif d["mode"] == "trim_r" and dframes != 0:

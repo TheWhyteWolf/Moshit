@@ -260,6 +260,22 @@ def test_precompose_and_sequence_switch(ctl):
     assert ctl.project.clip("c2").track == MAIN_TRACK_ID
 
 
+def test_move_clip_free_positioning(ctl):
+    from moshit.project import MAIN_TRACK_ID
+    _seed_clip(ctl, "c")                                  # clip "c" on main (0..20)
+    second = ctl.add_clip_for_media("m", MAIN_TRACK_ID)   # butts up at 20
+    assert second.start == 20
+    ctl.move_clip(second.id, 30)                          # open a gap (free position)
+    assert ctl.project.clip(second.id).start == 30
+    ctl.undo()
+    assert ctl.project.clip(second.id).start == 20
+    # moving clears any legacy crossfade so the explicit position wins
+    ctl.project.clip(second.id).transition_in = 5
+    ctl.move_clip(second.id, 14)
+    assert ctl.project.clip(second.id).start == 14
+    assert ctl.project.clip(second.id).transition_in == 0
+
+
 def test_cannot_remove_only_video_track(ctl):
     _seed_clip(ctl, "c")
     from moshit.project import MAIN_TRACK_ID

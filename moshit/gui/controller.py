@@ -759,7 +759,6 @@ class AppController(QObject):
         c.speed, c.reverse = speed, reverse
         c.fade_in, c.fade_out, c.transition_in = fade_in, fade_out, trans
         c.opacity, c.blend_mode = opacity, blend
-        self._repack_if_video(c.track)        # speed changes length -> reposition the rest
         self.project_changed.emit()
         self.status.emit("Clip updated.")
         return c
@@ -830,7 +829,21 @@ class AppController(QObject):
             c.in_point = max(0, min(int(in_point), cur_out - 1))
         if out_point is not None:
             c.out_point = max(c.in_point + 1, min(int(out_point), media.nb_frames))
-        self._repack_if_video(c.track)
+        self.project_changed.emit()
+
+    def move_clip(self, clip_id: str, new_start: int) -> None:
+        """Move a clip in time (free positioning; gaps/overlaps allowed). Clears
+        the legacy crossfade so the explicit position wins."""
+        try:
+            c = self.project.clip(clip_id)
+        except KeyError:
+            return
+        new_start = max(0, int(new_start))
+        if c.start == new_start and not c.transition_in:
+            return
+        self._push_undo()
+        c.start = new_start
+        c.transition_in = 0                # overlap (if any) now comes from position
         self.project_changed.emit()
 
     def remove_clip(self, clip_id: str) -> None:
@@ -844,7 +857,6 @@ class AppController(QObject):
         self.project.clips = [x for x in self.project.clips if x.id != clip_id]
         self.project.mosh_ops = [o for o in self.project.mosh_ops
                                  if o.target_clip_id != clip_id]
-        self._repack_if_video(c.track)
         self.project_changed.emit()
 
     def split_clip(self, clip_id: str, offset: int) -> None:
@@ -853,7 +865,6 @@ class AppController(QObject):
         if new is None:
             return
         self._commit_undo(snap)
-        self._repack_if_video(new.track)
         self.project_changed.emit()
         self.status.emit("Split clip.")
 
@@ -866,7 +877,6 @@ class AppController(QObject):
             return None
         self._push_undo()
         new = self.project.duplicate_clip(clip_id)
-        self._repack_if_video(new.track)
         self.project_changed.emit()
         self.status.emit("Duplicated clip.")
         return new
