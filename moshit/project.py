@@ -86,6 +86,7 @@ class Clip:
     seq_id: str = ROOT_SEQ_ID      # which sequence this clip lives in
     opacity: float = 1.0           # 0..1 layer opacity (compositing)
     blend_mode: str = "normal"     # normal | screen | multiply | add | ...
+    gain: float = 1.0              # audio gain for this clip when tracks mix
     # -- clean-edit finishing (pixel-domain; applied in the render finish pass).
     # Defaults are inert, so a clip with all defaults takes the fast path.
     speed: float = 1.0             # 2.0 = twice as fast, 0.5 = half speed
@@ -582,8 +583,10 @@ class Project:
         per-clip finish + crossfade fold). Otherwise — multiple tracks, free
         positions/overlaps, or any opacity/blend — its video tracks are
         **composited** bottom-to-top (opacity + blend mode + alpha) in the pixel
-        domain. The returned ``audio_plan`` comes from the root sequence's main
-        video track; with a *profile* and *audio* it is muxed on export.
+        domain. ``audio_plans`` carries one plan per audible video track; with a
+        *profile* and *audio* they are summed (per-clip ``gain``) and the mix is
+        muxed on export. ``audio_plan`` keeps the first track's plan for
+        single-track callers.
         """
         seq_id = sequence_id or self.root_seq_id
         self._resolve_precomps(engine, seq_id)
@@ -680,19 +683,23 @@ class Project:
             "duration": mlen / fps, "silent": item.derived,
             "speed": clip.speed, "reverse": clip.reverse,
             "fade_in": clip.fade_in, "fade_out": clip.fade_out,
-            "transition_in": trans,
+            "transition_in": trans, "gain": float(clip.gain),
         }, trans)
 
-    def _export_result(self, engine: MoshEngine, out, audio_plan, frames,
+    def _export_result(self, engine: MoshEngine, out, audio_plans, frames,
                        n_clips, *, profile, export_path, audio) -> Dict:
-        result = {"moshed_avi": out, "frames": frames,
-                  "clips_rendered": n_clips, "audio_plan": audio_plan}
+        # audio_plans: one plan per (audible) track. The first is the canonical
+        # single-track plan kept under "audio_plan" for back-compat/preview; the
+        # full list under "audio_plans" drives multi-track mixing.
+        audio_plans = audio_plans or [[]]
+        result = {"moshed_avi": out, "frames": frames, "clips_rendered": n_clips,
+                  "audio_plan": audio_plans[0], "audio_plans": audio_plans}
         if profile:
             fps = self.config.fps or 30.0
             audio_path = None
             if audio:
-                audio_path = engine.build_audio(
-                    audio_plan, Path(out).with_suffix(".audio.wav"), fps=fps)
+                audio_path = engine.mix_audio(
+                    audio_plans, Path(out).with_suffix(".audio.wav"), fps=fps)
                 if audio_path:
                     result["audio"] = audio_path
             ep = Path(export_path) if export_path else Path(out).with_suffix(
@@ -822,7 +829,7 @@ class Project:
                 sequence.extend(frames)
             out = engine.write_moshed(sequence, template, out_avi)
 
-        return self._export_result(engine, out, audio_plan, total, len(clips),
+        return self._export_result(engine, out, [audio_plan], total, len(clips),
                                    profile=profile, export_path=export_path,
                                    audio=audio)
 
@@ -837,15 +844,17 @@ class Project:
             raise ValueError("empty composition")
 
         layers: List[Dict] = []
-        main_seq: List = []                        # (clip, start, length, trans)
+        track_seqs: List[List] = []                # per enabled track: [(clip,start,length,trans)]
         for t in vtracks:                          # bottom -> top by index
+            seq: List = []
             for clip, start, length, trans in layouts[t.id]:
                 seg, seglen = self._clip_segment(engine, clip)
                 layers.append({"input": seg, "start": int(start),
                                "length": seglen, "opacity": float(clip.opacity),
                                "blend": clip.blend_mode, "head_fade": int(trans)})
-                if t.id == MAIN_TRACK_ID:
-                    main_seq.append((clip, int(start), seglen, int(trans)))
+                seq.append((clip, int(start), seglen, int(trans)))
+            if seq:
+                track_seqs.append(seq)
         out = engine.composite(layers, out_avi, total_frames=total)
         for lay in layers:                         # consumed
             try:
@@ -853,18 +862,19 @@ class Project:
             except OSError:
                 pass
 
-        # Audio: the root main track only (no track mixing yet), placed at the
-        # clips' absolute positions with gap silence and crossfade head-trims.
-        audio_plan = self._composite_audio_plan(main_seq, fps)
-        return self._export_result(engine, out, audio_plan, total, len(layers),
+        # Audio: every enabled video track becomes a full-length plan (clips at
+        # their absolute positions, gap silence, crossfade head-trims); the
+        # tracks are summed in the mix. Single-track comps just pass one plan.
+        audio_plans = [self._composite_audio_plan(seq, fps) for seq in track_seqs]
+        return self._export_result(engine, out, audio_plans, total, len(layers),
                                    profile=profile, export_path=export_path,
                                    audio=audio)
 
-    def _composite_audio_plan(self, main_seq, fps) -> List[Dict]:
+    def _composite_audio_plan(self, track_seq, fps) -> List[Dict]:
         plan: List[Dict] = []
         prev_end = 0
         prev_len = 0
-        for idx, (clip, start, length, trans) in enumerate(main_seq):
+        for idx, (clip, start, length, trans) in enumerate(track_seq):
             gap = start - prev_end
             if gap > 0:                            # silence fills a free-position gap
                 plan.append({"source": None, "start": 0.0, "duration": gap / fps,

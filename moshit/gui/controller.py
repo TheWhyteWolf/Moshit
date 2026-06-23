@@ -259,7 +259,7 @@ class AppController(QObject):
         def work(emit_begin, emit_batch):
             r = self.project.render(self.engine, out, sequence_id=seq_id)
             self.decoder.decode_stream(out, emit_begin, emit_batch, max_width=720)
-            self._preview_audio = self._build_preview_audio(r.get("audio_plan"))
+            self._preview_audio = self._build_preview_audio(r.get("audio_plans"))
 
         worker = _StreamWorker(work)
         worker.signals.begin.connect(self._on_preview_begin)   # queued -> main
@@ -269,17 +269,18 @@ class AppController(QObject):
         self._active_worker = worker           # retain (see _run)
         self.pool.start(worker)
 
-    def _build_preview_audio(self, audio_plan):
+    def _build_preview_audio(self, audio_plans):
         """Assemble the preview's audio track (worker thread). Cached by plan, so
-        edits that don't change the audio reuse the previous build."""
-        if self._preview_muted or not audio_plan:
+        edits that don't change the audio reuse the previous build. *audio_plans*
+        is one plan per audible track; they are summed into the preview WAV."""
+        if self._preview_muted or not audio_plans:
             self._preview_waveform = None
             return None
-        if audio_plan == self._audio_plan_cache and self._audio_path_cache:
+        if audio_plans == self._audio_plan_cache and self._audio_path_cache:
             return self._audio_path_cache         # waveform cache stays valid too
-        path = self.engine.build_audio(audio_plan, self._dir / "preview.wav",
-                                       fps=self.config.fps)
-        self._audio_plan_cache = audio_plan
+        path = self.engine.mix_audio(audio_plans, self._dir / "preview.wav",
+                                     fps=self.config.fps)
+        self._audio_plan_cache = audio_plans
         self._audio_path_cache = str(path) if path else None
         self._preview_waveform = (waveform.peaks(self._audio_path_cache)
                                   if self._audio_path_cache else None)
@@ -750,14 +751,15 @@ class AppController(QObject):
         trans = max(0, int(props.get("transition_in", c.transition_in)))
         opacity = max(0.0, min(1.0, float(props.get("opacity", c.opacity))))
         blend = str(props.get("blend_mode", c.blend_mode))
-        if (speed, reverse, fade_in, fade_out, trans, opacity, blend) == (
+        gain = max(0.0, min(4.0, float(props.get("gain", c.gain))))
+        if (speed, reverse, fade_in, fade_out, trans, opacity, blend, gain) == (
                 c.speed, c.reverse, c.fade_in, c.fade_out, c.transition_in,
-                c.opacity, c.blend_mode):
+                c.opacity, c.blend_mode, c.gain):
             return c
         self._push_undo()
         c.speed, c.reverse = speed, reverse
         c.fade_in, c.fade_out, c.transition_in = fade_in, fade_out, trans
-        c.opacity, c.blend_mode = opacity, blend
+        c.opacity, c.blend_mode, c.gain = opacity, blend, gain
         self.project_changed.emit()
         self.status.emit("Clip updated.")
         return c

@@ -826,7 +826,7 @@ def cmd_selftest(args) -> int:
     lproj.add_clip("lmedia", "main")
     v2 = lproj.add_track()                          # a second video track on top
     vclip = lproj.add_clip("lmedia", v2.id)
-    vclip.opacity, vclip.blend_mode = 0.5, "screen"
+    vclip.opacity, vclip.blend_mode, vclip.gain = 0.5, "screen", 0.25
     _check([t.id for t in lproj.video_tracks(lproj.root_seq_id)]
            == [MAIN_TRACK_ID, v2.id],
            "added video track stacks above main by index", failures)
@@ -834,8 +834,9 @@ def cmd_selftest(args) -> int:
            "a clip is stamped with its track's sequence", failures)
     lrel = Project.load(lproj.save(tmp / "l.json"))
     rc = lrel.clip(vclip.id)
-    _check(abs(rc.opacity - 0.5) < 1e-9 and rc.blend_mode == "screen",
-           "clip opacity/blend survive JSON round-trip", failures)
+    _check(abs(rc.opacity - 0.5) < 1e-9 and rc.blend_mode == "screen"
+           and abs(rc.gain - 0.25) < 1e-9,
+           "clip opacity/blend/gain survive JSON round-trip", failures)
     _check([t.id for t in lrel.video_tracks(lrel.root_seq_id)]
            == [MAIN_TRACK_ID, v2.id],
            "tracks survive JSON round-trip in compositing order", failures)

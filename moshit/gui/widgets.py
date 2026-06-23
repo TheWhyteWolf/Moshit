@@ -1368,6 +1368,12 @@ class InspectorPanel(QWidget):
         self.blend_combo = QComboBox()
         self.blend_combo.addItems(["normal"] + sorted(BLEND_MODES))
         self.blend_combo.setToolTip("How this clip blends with the tracks below")
+        self.gain_spin = QDoubleSpinBox()
+        self.gain_spin.setRange(0.0, 4.0)
+        self.gain_spin.setSingleStep(0.1)
+        self.gain_spin.setValue(1.0)
+        self.gain_spin.setToolTip("Audio gain for this clip when tracks are "
+                                  "mixed (1 = unchanged, 0 = silent)")
 
         form.addRow("Speed ×", self.speed_spin)
         form.addRow("", self.reverse_chk)
@@ -1376,6 +1382,7 @@ class InspectorPanel(QWidget):
         form.addRow("Crossfade ⟵", self.xfade_spin)
         form.addRow("Opacity", self.opacity_spin)
         form.addRow("Blend", self.blend_combo)
+        form.addRow("Gain", self.gain_spin)
 
         self.speed_spin.valueChanged.connect(self._emit_clip_props)
         self.reverse_chk.toggled.connect(self._emit_clip_props)
@@ -1384,6 +1391,7 @@ class InspectorPanel(QWidget):
         self.xfade_spin.valueChanged.connect(self._emit_clip_props)
         self.opacity_spin.valueChanged.connect(self._emit_clip_props)
         self.blend_combo.currentTextChanged.connect(self._emit_clip_props)
+        self.gain_spin.valueChanged.connect(self._emit_clip_props)
         self._clip_group = group
         return group
 
@@ -1398,6 +1406,7 @@ class InspectorPanel(QWidget):
             "transition_in": self.xfade_spin.value(),
             "opacity": self.opacity_spin.value(),
             "blend_mode": self.blend_combo.currentText(),
+            "gain": self.gain_spin.value(),
         })
 
     def _populate_clip_props(self, clip) -> None:
@@ -1409,6 +1418,7 @@ class InspectorPanel(QWidget):
         self.xfade_spin.setValue(int(getattr(clip, "transition_in", 0)))
         self.opacity_spin.setValue(float(getattr(clip, "opacity", 1.0)))
         self.blend_combo.setCurrentText(getattr(clip, "blend_mode", "normal"))
+        self.gain_spin.setValue(float(getattr(clip, "gain", 1.0)))
         self._populating = False
 
     # -- pixel FX (clip finishing) ------------------------------------------ #

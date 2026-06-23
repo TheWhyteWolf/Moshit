@@ -159,6 +159,13 @@ class MoshEngine:
         """
         return self.ff.build_audio_track(plan, dst, fps=fps or self.config.fps)
 
+    def mix_audio(self, plans, dst, *, fps: Optional[float] = None):
+        """Assemble and sum one audio track per plan into a single WAV.
+
+        Returns the written path, or None if no plan carried real audio.
+        """
+        return self.ff.mix_audio_tracks(plans, dst, fps=fps or self.config.fps)
+
     def optical_flow_transfer(self, base_src, motion_src, out_avi, *,
                               hold: bool = True, accumulate: bool = True,
                               strength: float = 1.0, preset: str = "fast",

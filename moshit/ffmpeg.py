@@ -309,6 +309,9 @@ class FFmpeg:
                         af.append(f"afade=t=in:st=0:d={fi:.6f}")
                     if fo > 0:
                         af.append(f"afade=t=out:st={max(0.0, dur - fo):.6f}:d={fo:.6f}")
+                    gain = float(seg.get("gain", 1.0))
+                    if abs(gain - 1.0) > 1e-6:
+                        af.append(f"volume={gain:.6f}")
                     af.append("apad")              # pad short audio to exactly `dur`
                     self._run(
                         ["-y", "-ss", f"{start:.6f}", "-t", f"{src_dur:.6f}",
@@ -342,6 +345,50 @@ class FFmpeg:
                 listfile.unlink()
             except OSError:
                 pass
+
+    def mix_audio_tracks(self, plans: List[List[Dict]], dst, *,
+                         fps: float = 30.0) -> Optional[Path]:
+        """Build one WAV per track plan and sum them into *dst*.
+
+        Each plan is assembled via :meth:`build_audio_track` (so each track is
+        already laid out full-length with gap silence and per-clip finishing),
+        then the audible tracks are combined with ``amix`` (``normalize=0`` so
+        they sum rather than attenuate; per-clip ``gain`` controls levels).
+        Returns *dst*, or ``None`` if no track carried real audio. A single
+        audible track is returned as-is (no needless mix pass)."""
+        dst = Path(dst)
+        plans = [p for p in (plans or []) if p]
+        if not plans:
+            return None
+        if len(plans) == 1:
+            return self.build_audio_track(plans[0], dst, fps=fps)
+        tracks: List[Path] = []
+        try:
+            for i, plan in enumerate(plans):
+                tp = dst.with_name(f"{dst.stem}_track{i:02d}.wav")
+                res = self.build_audio_track(plan, tp, fps=fps)
+                if res is not None:
+                    tracks.append(res)
+            if not tracks:
+                return None
+            if len(tracks) == 1:
+                os.replace(tracks[0], dst)
+                tracks = []
+                return dst
+            inputs: List[str] = []
+            for t in tracks:
+                inputs += ["-i", str(t)]
+            self._run(["-y", *inputs, "-filter_complex",
+                       f"amix=inputs={len(tracks)}:normalize=0:duration=longest",
+                       "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(dst)],
+                      "audio mix")
+            return dst
+        finally:
+            for t in tracks:
+                try:
+                    t.unlink()
+                except OSError:
+                    pass
 
     def finish_video(self, segments: List, meta: List[Dict], dst, *,
                      fps: float, gop: int = 250, qscale: int = 3,

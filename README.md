@@ -295,8 +295,9 @@ GPU produces it.
 
 Export reassembles audio from the original source clips and muxes it in (the GUI
 export dialog has an **Include audio** toggle; `render-project` does it by
-default, disable with `--no-audio`). The audio track is built to the rendered
-video's exact length, so trims, cuts and clip moves stay in sync.
+default, disable with `--no-audio`). Each video track is reassembled to the
+rendered video's exact length and the tracks are summed (per-clip **gain**), so
+trims, cuts and clip moves stay in sync across the whole composition.
 
 ### Non-destructive projects
 
@@ -439,8 +440,9 @@ def apply(self, frames, ctx, *, amount=0.5):
   Clips are **freely positioned** (drag a clip's body to move it; gaps show black /
   the track below), and clips that **overlap on the same track cross-dissolve**.
   Editing ops are non-rippling (a delete or trim leaves a gap rather than closing
-  it). Audio is still taken from the root sequence's main track (placed at the
-  clips' positions with gap silence; multi-track mixing is future work).
+  it). Audio is **mixed across all video tracks**: each track is laid out at its
+  clips' positions with gap silence, then the tracks are summed (per-clip **gain**
+  in the inspector controls levels).
 - Clip trims snap to the nearest preceding keyframe so every clip stays
   decodable (GOP-based editing; for frame-exact cuts, use a smaller GOP).
 - Audio is reassembled from the original sources and muxed on **export** (the
@@ -465,9 +467,9 @@ keyframes** (the ♪ button pulses an automatable parameter on the audio's beats
 video tracks composited with opacity/blend/alpha and precomps rendered to cached,
 moshable media, all editable from the timeline (track management, per-clip
 opacity/blend, free clip positioning with gaps, intra-track crossfade dissolves,
-a sequence switcher, precompose, and double-click-to-enter). The main remaining
-refinement is **multi-track audio mixing** (audio currently comes from the root
-sequence's main track only).
+a sequence switcher, precompose, and double-click-to-enter). **Multi-track audio
+mixing** has now landed too: every video track contributes audio (laid out with
+gap silence) and the tracks are summed with per-clip **gain**.
 
 On the glitch side, the signature systems have all landed: GPU optical-flow
 motion transfer (see **Optical-flow transfer**), per-clip optical-flow as a
