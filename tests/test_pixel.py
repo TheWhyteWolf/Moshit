@@ -35,7 +35,8 @@ def _clip(eng, make_clip, tmp_path, **attrs):
 
 
 @pytest.mark.parametrize("name", ["rgb_shift", "hue_rotate", "pixelate",
-                                  "noise", "echo", "trails"])
+                                  "noise", "echo", "trails",
+                                  "zoom", "pan", "rotate", "shake"])
 def test_pixel_effect_renders_preserving_geometry(name, pixel_engine, make_clip,
                                                   tmp_path, probe):
     p, c = _clip(pixel_engine, make_clip, tmp_path,
@@ -44,6 +45,27 @@ def test_pixel_effect_renders_preserving_geometry(name, pixel_engine, make_clip,
     p.render(pixel_engine, out)
     assert probe.dims(out) == "162x120"          # geometry preserved
     assert probe.nframes(out) == 24              # 1s @ 24fps, count unchanged
+
+
+@pytest.mark.parametrize("name,params", [
+    ("zoom", {"start": 1.0, "end": 2.0}),
+    ("pan", {"dx": 60, "dy": 0}),
+    ("rotate", {"angle": 0.0, "spin": 90.0}),
+    ("shake", {"amount": 20}),
+])
+def test_motion_injection_moves_pixels(name, params, pixel_engine, make_clip,
+                                       tmp_path, probe):
+    # a synthetic camera move should change the picture vs. the untouched clip
+    p, c = _clip(pixel_engine, make_clip, tmp_path)
+    plain = tmp_path / "plain.avi"
+    p.render(pixel_engine, plain)
+    c.pixel_effects = [{"name": name, "params": params}]
+    moved = tmp_path / f"{name}.avi"
+    p.render(pixel_engine, moved)
+    assert probe.nframes(moved) == 24                       # length preserved
+    # a frame partway through (animation has progressed) should differ
+    assert (probe.pixel(plain, 18, 80, 60, w=162)
+            != probe.pixel(moved, 18, 80, 60, w=162))
 
 
 def test_rgb_shift_changes_pixels(pixel_engine, make_clip, tmp_path, probe):

@@ -95,13 +95,15 @@ class Clip:
     fade_out: int = 0              # frames to fade to black at the tail
     transition_in: int = 0         # crossfade frames from the previous main clip
     pixel_effects: List = field(default_factory=list)  # [{name, params}] FFmpeg FX
+    raw_effects: List = field(default_factory=list)     # [{name, params}] numpy FX
     flow_transfer: Optional[Dict] = None   # live optical-flow warp (see render)
 
     def has_finish(self) -> bool:
         """True if this clip needs the pixel-domain finish pass."""
         return (self.speed != 1.0 or self.reverse or self.fade_in > 0
                 or self.fade_out > 0 or self.transition_in > 0
-                or bool(self.pixel_effects) or self.flow_transfer is not None)
+                or bool(self.pixel_effects) or bool(self.raw_effects)
+                or self.flow_transfer is not None)
 
     def to_dict(self) -> Dict:
         return self.__dict__.copy()
@@ -281,18 +283,48 @@ class Project:
             return self.media[source]
         return next((m for m in self.media.values() if m.label == source), None)
 
-    def _pixel_filters(self, clip: Clip) -> List[str]:
-        """FFmpeg filter strings for a clip's pixel effects (skips unknown ones)."""
+    def _pixel_filters(self, clip: Clip, *, nframes: int = 0) -> List[str]:
+        """FFmpeg filter strings for a clip's pixel effects (skips unknown ones).
+
+        *nframes* is the clip's (post-mosh, pre-speed) frame count; motion modes
+        use it to animate across the exact clip length."""
         from .modes import get_pixel_mode
+        fps = self.config.fps or 30.0
+        w, h = int(self.config.width or 0), int(self.config.height or 0)
         out: List[str] = []
         for pe in (clip.pixel_effects or []):
             try:
                 mode = get_pixel_mode(pe["name"])
             except KeyError:
                 continue
-            f = mode.filter(**mode.resolve(pe.get("params") or {}))
+            params = mode.resolve(pe.get("params") or {})
+            f = (mode.filter_ctx(params, fps=fps, nframes=int(nframes),
+                                 width=w, height=h)
+                 if getattr(mode, "needs_ctx", False)
+                 else mode.filter(**params))
             if f:
                 out.append(f)
+        return out
+
+    def _raw_specs(self, clip: Clip) -> List[Dict]:
+        """A clip's known raw-frame effects, in order (skips unknown ones)."""
+        from .modes import is_raw_mode
+        return [{"name": re["name"], "params": re.get("params") or {}}
+                for re in (clip.raw_effects or []) if is_raw_mode(re.get("name"))]
+
+    def _apply_raw(self, engine: MoshEngine, clip: Clip, seg):
+        """Run a clip's raw effects on segment AVI *seg*, returning the (possibly
+        new) segment path; consumes *seg* when it produces a replacement."""
+        from .modes import raw as _raw
+        specs = self._raw_specs(clip)
+        if not specs or not _raw.available():
+            return seg
+        out = engine.apply_raw_effects(seg, specs, engine._tmp(".avi"))
+        if str(out) != str(seg):
+            try:
+                Path(seg).unlink()
+            except OSError:
+                pass
         return out
 
     @staticmethod
@@ -740,9 +772,11 @@ class Project:
             except OSError:
                 pass
             seg = warped
+        seg = self._apply_raw(engine, clip, seg)
         meta = [{"n": len(frames), "speed": clip.speed, "reverse": clip.reverse,
                  "fade_in": clip.fade_in, "fade_out": clip.fade_out,
-                 "transition_in": 0, "pixel": self._pixel_filters(clip)}]
+                 "transition_in": 0,
+                 "pixel": self._pixel_filters(clip, nframes=len(frames))}]
         finished = engine.finish_clips([seg], meta, engine._tmp(".avi"))
         try:
             Path(seg).unlink()
@@ -811,11 +845,12 @@ class Project:
                     except OSError:
                         pass
                     seg = warped
+                seg = self._apply_raw(engine, c, seg)
                 seg_avis.append(seg)
             meta = [{"n": len(frames), "speed": c.speed, "reverse": c.reverse,
                      "fade_in": c.fade_in, "fade_out": c.fade_out,
                      "transition_in": c.transition_in,
-                     "pixel": self._pixel_filters(c)}
+                     "pixel": self._pixel_filters(c, nframes=len(frames))}
                     for c, _, frames in segs]
             out = engine.finish_clips(seg_avis, meta, out_avi)
             for s in seg_avis:               # consumed; don't pile up across renders
@@ -972,7 +1007,8 @@ class Project:
                         speed=target.speed, reverse=target.reverse,
                         fade_in=target.fade_in, fade_out=target.fade_out,
                         transition_in=target.transition_in,
-                        pixel_effects=[dict(pe) for pe in target.pixel_effects])
+                        pixel_effects=[dict(pe) for pe in target.pixel_effects],
+                        raw_effects=[dict(re) for re in target.raw_effects])
         self.clips.append(new_clip)
 
         target.enabled = False
@@ -1021,7 +1057,8 @@ class Project:
                         speed=target.speed, reverse=target.reverse,
                         fade_in=target.fade_in, fade_out=target.fade_out,
                         transition_in=target.transition_in,
-                        pixel_effects=[dict(pe) for pe in target.pixel_effects])
+                        pixel_effects=[dict(pe) for pe in target.pixel_effects],
+                        raw_effects=[dict(re) for re in target.raw_effects])
         self.clips.append(new_clip)
 
         target.enabled = False

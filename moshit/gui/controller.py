@@ -618,6 +618,52 @@ class AppController(QObject):
         c.pixel_effects[index]["params"] = dict(params)
         self.project_changed.emit()
 
+    # -- raw FX (numpy frame processors) ------------------------------------ #
+
+    def clip_raw_fx(self, clip_id: str) -> List[dict]:
+        try:
+            return [dict(re) for re in self.project.clip(clip_id).raw_effects]
+        except KeyError:
+            return []
+
+    def add_raw_fx(self, clip_id: str, name: str):
+        from ..modes import get_raw_mode
+        try:
+            c = self.project.clip(clip_id)
+            mode = get_raw_mode(name)
+        except KeyError:
+            return None
+        self._push_undo()
+        c.raw_effects.append({"name": name, "params": mode.defaults()})
+        self.project_changed.emit()
+        self.status.emit(f"Added raw FX: {name}")
+        return c
+
+    def remove_raw_fx(self, clip_id: str, index: int) -> None:
+        try:
+            c = self.project.clip(clip_id)
+        except KeyError:
+            return
+        if not (0 <= index < len(c.raw_effects)):
+            return
+        self._push_undo()
+        c.raw_effects.pop(index)
+        self.project_changed.emit()
+        self.status.emit("Removed raw FX")
+
+    def update_raw_fx(self, clip_id: str, index: int, params: dict) -> None:
+        try:
+            c = self.project.clip(clip_id)
+        except KeyError:
+            return
+        if not (0 <= index < len(c.raw_effects)):
+            return
+        if c.raw_effects[index].get("params") == params:
+            return
+        self._push_undo()
+        c.raw_effects[index]["params"] = dict(params)
+        self.project_changed.emit()
+
     # -- effect stack ------------------------------------------------------- #
 
     @staticmethod

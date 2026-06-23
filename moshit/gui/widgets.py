@@ -1211,6 +1211,9 @@ class InspectorPanel(QWidget):
     pixelFxAddRequested = Signal(str)              # pixel mode name
     pixelFxRemoveRequested = Signal(int)           # index in the clip's pixel list
     pixelFxParamsChanged = Signal(int, dict)       # index, params
+    rawFxAddRequested = Signal(str)                # raw (numpy) mode name
+    rawFxRemoveRequested = Signal(int)             # index in the clip's raw list
+    rawFxParamsChanged = Signal(int, dict)         # index, params
     flowTransferRequested = Signal()               # optical-flow transfer (bake)
     flowChanged = Signal(object)                    # live flow_transfer dict / None
     bakeRequested = Signal()
@@ -1230,6 +1233,9 @@ class InspectorPanel(QWidget):
         self._pixel_fx: List[dict] = []
         self._pixel_getters: Dict[str, Callable] = {}
         self._pixel_sel = -1
+        self._raw_fx: List[dict] = []
+        self._raw_getters: Dict[str, Callable] = {}
+        self._raw_sel = -1
         self._beat_provider: Optional[Callable] = None    # clip_id -> [pos, ...]
 
         layout = QVBoxLayout(self)
@@ -1240,6 +1246,7 @@ class InspectorPanel(QWidget):
         layout.addWidget(self.clip_lbl)
         layout.addWidget(self._build_clip_group())
         layout.addWidget(self._build_pixel_group())
+        layout.addWidget(self._build_raw_group())
         layout.addWidget(self._build_flow_group())
 
         layout.addWidget(_heading("Effects (top → bottom)"))
@@ -1531,6 +1538,116 @@ class InspectorPanel(QWidget):
         params = {name: getter() for name, getter in self._pixel_getters.items()}
         self.pixelFxParamsChanged.emit(self._pixel_sel, params)
 
+    # -- raw FX (numpy frame processors: pixel sort, ...) ------------------- #
+
+    def _build_raw_group(self) -> QWidget:
+        from ..modes import available_raw_modes
+        group = QWidget()
+        v = QVBoxLayout(group)
+        v.setContentsMargins(0, 0, 0, 4)
+        v.setSpacing(3)
+        v.addWidget(_heading("Raw FX (numpy)"))
+
+        add_row = QHBoxLayout()
+        self.raw_add_combo = QComboBox()
+        self.raw_add_combo.addItems(available_raw_modes())
+        self.raw_add_btn = QPushButton("+ Add")
+        self.raw_add_btn.clicked.connect(self._emit_raw_add)
+        add_row.addWidget(self.raw_add_combo, 1)
+        add_row.addWidget(self.raw_add_btn)
+        v.addLayout(add_row)
+
+        self.raw_list = QListWidget()
+        self.raw_list.setMaximumHeight(54)
+        self.raw_list.setToolTip("Per-pixel effects applied to decoded frames "
+                                 "(needs numpy); run before the FFmpeg pixel FX.")
+        self.raw_list.currentRowChanged.connect(self._on_raw_row)
+        v.addWidget(self.raw_list)
+
+        self._raw_form_host = QWidget()
+        self._raw_form = QFormLayout(self._raw_form_host)
+        self._raw_form.setContentsMargins(0, 2, 0, 2)
+        v.addWidget(self._raw_form_host)
+
+        btns = QHBoxLayout()
+        self.raw_apply_btn = QPushButton("Apply raw FX")
+        self.raw_apply_btn.clicked.connect(self._emit_raw_params)
+        self.raw_remove_btn = QPushButton("− Remove")
+        self.raw_remove_btn.clicked.connect(self._emit_raw_remove)
+        btns.addWidget(self.raw_apply_btn)
+        btns.addWidget(self.raw_remove_btn)
+        v.addLayout(btns)
+        self._raw_group = group
+        return group
+
+    def set_clip_raw_fx(self, rfx: List[dict]) -> None:
+        self._raw_fx = [dict(p) for p in (rfx or [])]
+        prev = self._raw_sel
+        self._populating = True
+        self.raw_list.clear()
+        for re in self._raw_fx:
+            self.raw_list.addItem(re.get("name", ""))
+        self._populating = False
+        row = (prev if 0 <= prev < len(self._raw_fx)
+               else (len(self._raw_fx) - 1 if self._raw_fx else -1))
+        if row >= 0:
+            self.raw_list.setCurrentRow(row)
+        else:
+            self._raw_sel = -1
+            self._rebuild_raw_params(None)
+            self._update_raw_buttons()
+
+    def _on_raw_row(self, row: int) -> None:
+        if self._populating:
+            return
+        if 0 <= row < len(self._raw_fx):
+            self._raw_sel = row
+            re = self._raw_fx[row]
+            self._rebuild_raw_params(re.get("name"), re.get("params") or {})
+        else:
+            self._raw_sel = -1
+            self._rebuild_raw_params(None)
+        self._update_raw_buttons()
+
+    def _rebuild_raw_params(self, name, params=None) -> None:
+        while self._raw_form.rowCount():
+            self._raw_form.removeRow(0)
+        self._raw_getters = {}
+        if not name:
+            return
+        from ..modes import get_raw_mode
+        self._populating = True
+        for p in get_raw_mode(name).params:
+            widget, getter = build_param_widget(p)
+            if p.help:
+                widget.setToolTip(p.help)
+            self._raw_form.addRow(p.label or p.name, widget)
+            self._raw_getters[p.name] = getter
+            if params and p.name in params:
+                _set_param_value(getattr(getter, "__self__", None), params[p.name])
+        self._populating = False
+
+    def _update_raw_buttons(self) -> None:
+        has_sel = (self._clip_id is not None
+                   and 0 <= self._raw_sel < len(self._raw_fx))
+        self.raw_remove_btn.setEnabled(has_sel)
+        self.raw_apply_btn.setEnabled(has_sel)
+
+    def _emit_raw_add(self) -> None:
+        name = self.raw_add_combo.currentText()
+        if name and self._clip_id is not None:
+            self.rawFxAddRequested.emit(name)
+
+    def _emit_raw_remove(self) -> None:
+        if 0 <= self._raw_sel < len(self._raw_fx):
+            self.rawFxRemoveRequested.emit(self._raw_sel)
+
+    def _emit_raw_params(self) -> None:
+        if not (0 <= self._raw_sel < len(self._raw_fx)):
+            return
+        params = {name: getter() for name, getter in self._raw_getters.items()}
+        self.rawFxParamsChanged.emit(self._raw_sel, params)
+
     # -- flow FX (live optical-flow warp) ----------------------------------- #
 
     def _build_flow_group(self) -> QWidget:
@@ -1724,18 +1841,21 @@ class InspectorPanel(QWidget):
         self._region_host.setEnabled(on)
         self._clip_group.setEnabled(on)
         self._pixel_group.setEnabled(on)
+        self._raw_group.setEnabled(on)
         self._flow_group.setEnabled(on)
         self.effect_list.setEnabled(on)
         if on:
             self.clip_lbl.setText(f"Clip: <b>{label}</b>")
             self._populate_clip_props(clip if clip is not None else object())
             self.set_clip_pixel_fx(getattr(clip, "pixel_effects", []))
+            self.set_clip_raw_fx(getattr(clip, "raw_effects", []))
             self._populate_flow(getattr(clip, "flow_transfer", None))
             self.set_clip_effects(effects or [])
         else:
             self.clip_lbl.setText("Select a clip on the main track.")
             self._populate_clip_props(object())        # reset to defaults
             self.set_clip_pixel_fx([])
+            self.set_clip_raw_fx([])
             self._populate_flow(None)
             self.set_clip_effects([])
         self._update_stack_buttons()

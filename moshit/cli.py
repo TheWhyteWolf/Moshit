@@ -108,12 +108,21 @@ def cmd_modes(args) -> int:
             if p.help:
                 print(f"        {p.help}")
 
-    from .modes import available_pixel_modes, get_pixel_mode
+    from .modes import (available_pixel_modes, get_pixel_mode,
+                        available_raw_modes, get_raw_mode)
     pixel = available_pixel_modes()
     if pixel:
         print("\n=== pixel effects (clip finishing, FFmpeg filters) ===")
         for name in pixel:
             mode = get_pixel_mode(name)
+            print(f"\n{name}\n  {mode.description}")
+            for p in mode.params:
+                print(f"    - {p.describe()}")
+    raw = available_raw_modes()
+    if raw:
+        print("\n=== raw effects (clip finishing, numpy frame processors) ===")
+        for name in raw:
+            mode = get_raw_mode(name)
             print(f"\n{name}\n  {mode.description}")
             for p in mode.params:
                 print(f"    - {p.describe()}")
@@ -768,6 +777,14 @@ def cmd_selftest(args) -> int:
            "rgb_shift builds the expected FFmpeg filter string", failures)
     _check("scale=" in get_pixel_mode("pixelate").filter(block=8),
            "pixelate builds a scale-based filter", failures)
+    _check(all(m in available_pixel_modes()
+               for m in ("zoom", "pan", "rotate", "shake")),
+           "motion-injection effects are registered", failures)
+    zf = get_pixel_mode("zoom").filter_ctx({"start": 1.0, "end": 2.0},
+                                           fps=24.0, nframes=24, width=160,
+                                           height=120)
+    _check(zf.startswith("zoompan=") and "on/23" in zf and "s=160x120" in zf,
+           "zoom animates over the clip length at project geometry", failures)
 
     kproj = Project(name="k", assets_dir=str(tmp / "assets_k"))
     kp = tmp / "k.avi"
@@ -787,6 +804,11 @@ def cmd_selftest(args) -> int:
     _check(kc.has_finish(), "a clip with pixel FX needs the finish pass", failures)
     _check(kproj._pixel_filters(kc) == ["rgbashift=rh=5:bh=-5:rv=2:bv=-2"],
            "_pixel_filters builds known filters and skips unknown ones", failures)
+    kc.pixel_effects.insert(0, {"name": "zoom",
+                                "params": {"start": 1.0, "end": 3.0}})
+    _check("on/5" in kproj._pixel_filters(kc, nframes=6)[0],
+           "_pixel_filters animates motion modes across nframes", failures)
+    kc.pixel_effects.pop(0)                         # restore for the bake check
 
     # live optical-flow effect: a clip property (pure-Python checks only here)
     kc.flow_transfer = {"source": "kmedia", "strength": 1.5, "region_start": 2}
@@ -806,6 +828,43 @@ def cmd_selftest(args) -> int:
     krel = Project.load(kproj.save(tmp / "k.json"))
     _check(krel.clip(krec.baked_clip_id).pixel_effects[0]["name"] == "rgb_shift",
            "pixel FX survive JSON round-trip", failures)
+    _check([re["name"] for re in krel.clip(krec.baked_clip_id).raw_effects] == [],
+           "bake carries an (empty) raw FX list without error", failures)
+
+    print("\nK2. Raw FX (numpy frame processors)")
+    from .modes import available_raw_modes, is_raw_mode, raw as _rawmod
+    _check("pixel_sort" in available_raw_modes() and is_raw_mode("pixel_sort"),
+           "pixel_sort is registered as a raw mode", failures)
+    rclip = Clip(id="rc", media_id="m", track="main",
+                 raw_effects=[{"name": "pixel_sort",
+                               "params": {"axis": "vertical", "lo": 0.1}}])
+    _check(rclip.has_finish(),
+           "a clip with raw FX needs the finish pass", failures)
+    _check([s["name"] for s in kproj._raw_specs(rclip)] == ["pixel_sort"],
+           "_raw_specs returns known raw effects (skips unknown)", failures)
+    rclip2 = Clip(id="rc2", media_id="m", track="main",
+                  raw_effects=[{"name": "nope", "params": {}}])
+    _check(kproj._raw_specs(rclip2) == [],
+           "_raw_specs skips unknown raw effects", failures)
+    _check(Clip.from_dict(rclip.to_dict()).raw_effects[0]["name"] == "pixel_sort",
+           "raw FX survive a Clip JSON round-trip", failures)
+    if _rawmod.available():
+        import numpy as _np
+        from .modes.raw import _sort_frame
+        vals = [200, 50, 120, 255, 10, 90]
+        row = _np.array([[[v, v, v] for v in vals]], _np.uint8).tobytes()
+        asc = _sort_frame(row, 6, 1, vertical=False, by="brightness",
+                          lo=0.0, hi=1.0, descending=False)
+        got = list(_np.frombuffer(asc, _np.uint8).reshape(1, 6, 3)[0, :, 0])
+        _check(got == sorted(vals),
+               "pixel_sort orders a fully-banded line by brightness", failures)
+        band = _sort_frame(row, 6, 1, vertical=False, by="brightness",
+                           lo=40 / 255, hi=210 / 255, descending=False)
+        bg = list(_np.frombuffer(band, _np.uint8).reshape(1, 6, 3)[0, :, 0])
+        _check(bg[3] == 255 and bg[4] == 10,
+               "out-of-band pixels stay anchored (contiguous-span sort)", failures)
+    else:
+        print("  [skip] numpy not installed; pixel_sort math not exercised")
 
     print("\nL. Compositing tracks & nested sequences")
     from .project import MAIN_TRACK_ID, MOTION_TRACK_ID

@@ -180,6 +180,27 @@ aberration), `hue_rotate`, `pixelate`, `noise`, `echo` (frame ghosting), and
 crossfade it, *and* shift its channels — and bake/persist like the other clip
 finishing. `moshit modes` lists them under their own heading.
 
+**Motion injection.** Synthetic camera moves, also pixel-domain, that *animate
+across the exact clip length*: `zoom` (push in / pull out, start× → end×), `pan`
+(drift by a pixel offset with headroom so edges stay filled), `rotate` (static
+angle plus optional total spin), and `shake` (hand-held jitter). They're Pixel FX
+like any other (added from the same panel, composable, bake-able); because they
+know the clip's geometry and frame count, a `zoom` of 1→2 ramps evenly over the
+whole clip. For motion driven by *another* clip's movement rather than a fixed
+move, use optical-flow transfer (below).
+
+**Raw FX (pixel sorting).** A third effect class — *raw-frame* processors that
+work on decoded pixels in numpy, for looks FFmpeg filters can't express. The
+first is **`pixel_sort`**: it sorts the pixels of each row (or column) within a
+brightness threshold band, leaving out-of-band pixels anchored, so bright (or
+dark) regions smear into the classic sorted-glitch streaks. Controls: `axis`
+(horizontal/vertical), `by` (brightness/hue/saturation), `lo`/`hi` (the band),
+and `order` (ascending/descending). It lives in its own inspector **Raw FX**
+panel, runs *before* the FFmpeg pixel filters in the finish pass, and — like
+optical-flow transfer — needs numpy (the `flow` extra); without it the effect is
+skipped rather than failing. The sort is fully vectorised (a single `lexsort`
+per frame), so it's cheap despite working per-pixel.
+
 **Optical-flow transfer (appearance-free motion transfer).** Warp a clip's pixels
 by the *motion* of another clip — dense optical flow drives the warp, so only the
 base's pixels are resampled and **none of the driver's appearance bleeds in** (the
@@ -473,5 +494,8 @@ gap silence) and the tracks are summed with per-clip **gain**.
 
 On the glitch side, the signature systems have all landed: GPU optical-flow
 motion transfer (see **Optical-flow transfer**), per-clip optical-flow as a
-live region-scoped *effect*, and multi-keyframe automation curves with
-per-keyframe easing.
+live region-scoped *effect*, multi-keyframe automation curves with per-keyframe
+easing, **motion injection** (synthetic zoom/pan/rotate/shake camera moves), and
+**pixel sorting** (a threshold-banded numpy raw-frame effect, the first of a new
+*Raw FX* class). Next glitch family on the bench: **masking** — compositor
+layer-mattes *and* effect-mattes keyed by luminance / alpha / motion.

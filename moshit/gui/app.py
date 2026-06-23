@@ -465,6 +465,9 @@ class MainWindow(QMainWindow):
         self.inspector.pixelFxAddRequested.connect(self._on_pixel_add)
         self.inspector.pixelFxRemoveRequested.connect(self._on_pixel_remove)
         self.inspector.pixelFxParamsChanged.connect(self._on_pixel_params)
+        self.inspector.rawFxAddRequested.connect(self._on_raw_add)
+        self.inspector.rawFxRemoveRequested.connect(self._on_raw_remove)
+        self.inspector.rawFxParamsChanged.connect(self._on_raw_params)
         self.inspector.bakeRequested.connect(self._on_bake)
         self.inspector.revertRequested.connect(lambda: c.revert_last_bake())
         self.inspector.clipPropsChanged.connect(self._on_clip_props)
@@ -576,6 +579,21 @@ class MainWindow(QMainWindow):
     def _on_pixel_params(self, index: int, params: dict) -> None:
         if self._selected_clip:
             self.controller.update_pixel_fx(self._selected_clip, index, params)
+            self._schedule_auto_refresh(immediate=True)
+
+    def _on_raw_add(self, name: str) -> None:
+        if self._selected_clip:
+            self.controller.add_raw_fx(self._selected_clip, name)
+            self._schedule_auto_refresh(immediate=True)
+
+    def _on_raw_remove(self, index: int) -> None:
+        if self._selected_clip:
+            self.controller.remove_raw_fx(self._selected_clip, index)
+            self._schedule_auto_refresh(immediate=True)
+
+    def _on_raw_params(self, index: int, params: dict) -> None:
+        if self._selected_clip:
+            self.controller.update_raw_fx(self._selected_clip, index, params)
             self._schedule_auto_refresh(immediate=True)
 
     def _on_flow_transfer(self) -> None:

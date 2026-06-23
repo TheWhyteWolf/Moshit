@@ -166,6 +166,35 @@ def test_effect_stack_region_and_pixel_fx(win):
     assert ctl.project.clip("c").has_finish()
 
 
+def test_raw_fx_add_update_remove_and_undo(ctl):
+    _seed_clip(ctl, "c")
+    ctl.add_raw_fx("c", "pixel_sort")
+    assert ctl.clip_raw_fx("c")[0]["name"] == "pixel_sort"
+    assert ctl.project.clip("c").has_finish()           # raw FX force the finish pass
+    ctl.update_raw_fx("c", 0, {"axis": "vertical", "lo": 0.1, "hi": 0.7})
+    assert ctl.clip_raw_fx("c")[0]["params"]["axis"] == "vertical"
+    ctl.undo()                                          # roll back the params edit
+    assert ctl.clip_raw_fx("c")[0]["params"].get("axis", "horizontal") != "vertical"
+    ctl.remove_raw_fx("c", 0)
+    assert ctl.clip_raw_fx("c") == []
+
+
+def test_inspector_raw_panel_round_trips(qapp):
+    from moshit.gui.widgets import InspectorPanel
+    insp = InspectorPanel()
+    added, params = [], []
+    insp.rawFxAddRequested.connect(added.append)
+    insp.rawFxParamsChanged.connect(lambda i, p: params.append((i, p)))
+    insp._clip_id = "c"
+    insp.set_clip_raw_fx([{"name": "pixel_sort",
+                           "params": {"axis": "vertical", "lo": 0.2, "hi": 0.8,
+                                      "by": "brightness", "order": "ascending"}}])
+    assert insp.raw_list.count() == 1
+    insp._emit_raw_params()                             # reads the built controls
+    assert params and params[-1][0] == 0
+    assert params[-1][1]["axis"] == "vertical"
+
+
 def test_undo_redo_round_trips(win):
     ctl = win.controller
     _seed_clip(ctl, "c")

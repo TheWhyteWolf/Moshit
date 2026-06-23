@@ -192,6 +192,31 @@ class MoshEngine:
                                       fps=self.config.fps,
                                       qscale=self.config.qscale, gop=self.config.gop)
 
+    def apply_raw_effects(self, src_avi, specs, out_avi) -> Path:
+        """Run numpy raw-frame effects over *src_avi* into a fresh moshable AVI.
+
+        *specs* is an ordered list of ``{"name", "params"}``; each decoded RGB
+        frame stack is passed through the named :class:`RawMode` in turn, then
+        re-encoded. Geometry/length are preserved. Needs numpy (the ``flow``
+        extra); returns *src_avi* unchanged if it (or every spec) is unavailable.
+        """
+        from .modes import raw as _raw, get_raw_mode
+        if not _raw.available():
+            return Path(src_avi)
+        usable = [s for s in (specs or []) if _raw.is_raw_mode(s.get("name"))]
+        if not usable:
+            return Path(src_avi)
+        w, h = self.config.width, self.config.height
+        frames = list(self.ff.decode_rgb_raw(src_avi, w, h))
+        for spec in usable:
+            mode = get_raw_mode(spec["name"])
+            params = mode.resolve(spec.get("params") or {})
+            frames = mode.apply(frames, width=w, height=h,
+                                fps=self.config.fps, **params)
+        return self.ff.encode_rgb_raw(frames, out_avi, width=w, height=h,
+                                      fps=self.config.fps,
+                                      qscale=self.config.qscale, gop=self.config.gop)
+
     def finish_clips(self, segments, meta, dst):
         """Pixel-domain finish pass: apply per-clip speed/reverse/fade/pixel-FX
         and fold clips with crossfade/hard-cut. Returns the finished AVI path."""
