@@ -209,6 +209,7 @@ class Project:
         self.tracks: List[Track] = []
         self.root_seq_id = ROOT_SEQ_ID
         self._parsed: Dict[str, AviVideo] = {}     # media_id -> AviVideo (cache)
+        self._tmp_assets: Optional[Path] = None    # precomp cache when no assets_dir
         self._ensure_default_structure()
 
     def _ensure_default_structure(self) -> None:
@@ -304,9 +305,11 @@ class Project:
         return range(start, end)
 
     def _motion_frames(self) -> Dict[str, List[Frame]]:
-        # Any imported clip can drive motion; keyed by its (unique) label.
+        # Any imported clip can drive motion; keyed by its (unique) label. Skip
+        # media with no intermediate on disk yet (e.g. an unrendered precomp).
         return {m.label: self._parsed_media(m.id).frames
-                for m in self.media.values()}
+                for m in self.media.values()
+                if Path(m.intermediate_path).exists()}
 
     # -- building (all non-destructive) ------------------------------------- #
 
@@ -343,8 +346,13 @@ class Project:
             raise KeyError(f"no media '{media_id}'")
         if start is None:
             start = self._timeline_end(track)
+        try:
+            seq_id = self.track(track).seq_id      # keep the clip with its track
+        except KeyError:
+            seq_id = self.root_seq_id
         c = Clip(id=_new_id("clip"), media_id=media_id, track=track,
-                 start=start, in_point=in_point, out_point=out_point)
+                 start=start, in_point=in_point, out_point=out_point,
+                 seq_id=seq_id)
         self.clips.append(c)
         return c
 
@@ -357,6 +365,45 @@ class Project:
                   name=name or f"Video {idx + 1}", index=idx, role=role)
         self.tracks.append(t)
         return t
+
+    def add_sequence(self, name: str = "Precomp") -> Sequence:
+        """Create a new sequence (precomp) with one empty video track."""
+        s = Sequence(id=_new_id("seq"), name=name, width=self.config.width,
+                     height=self.config.height, fps=self.config.fps)
+        self.sequences.append(s)
+        self.add_track(s.id, role="video", name="Video 1")
+        return s
+
+    def _precomp_dir(self) -> Path:
+        if self.assets_dir:
+            return self.assets_dir
+        if self._tmp_assets is None:
+            import tempfile
+            self._tmp_assets = Path(tempfile.mkdtemp(prefix="moshit_precomp_"))
+        return self._tmp_assets
+
+    def sequence_media(self, seq_id: str) -> MediaItem:
+        """The MediaItem that backs a sequence used as a clip, creating it (with
+        a cache path for its rendered intermediate) the first time."""
+        self.sequence(seq_id)                      # validate
+        for m in self.media.values():
+            if m.sequence_id == seq_id:
+                return m
+        mid = _new_id("media")
+        item = MediaItem(
+            id=mid, source_path="", label=self.sequence(seq_id).name,
+            role="main", intermediate_path=str(self._precomp_dir() / f"{mid}.avi"),
+            width=self.config.width, height=self.config.height,
+            fps=self.config.fps, nb_frames=0, derived=True, sequence_id=seq_id)
+        self.media[mid] = item
+        return item
+
+    def add_sequence_clip(self, track_id: str, seq_id: str, *,
+                          start: Optional[int] = None) -> Clip:
+        """Place a sequence (precomp) as a clip on *track_id* (cycle-checked at
+        render time)."""
+        media = self.sequence_media(seq_id)
+        return self.add_clip(media.id, track_id, start=start)
 
     def add_mosh(self, mode: str, params: Dict, target_clip_id: str) -> MoshOp:
         self.clip(target_clip_id)                  # validate

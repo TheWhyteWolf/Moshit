@@ -1,5 +1,7 @@
 """Project data model: sequences/tracks, compositing props, and back-compat
 (pure model, no ffmpeg)."""
+import pytest
+
 from moshit.project import (Clip, MediaItem, Project, Sequence, Track,
                             MAIN_TRACK_ID, MOTION_TRACK_ID, ROOT_SEQ_ID)
 
@@ -51,3 +53,24 @@ def test_unknown_keys_are_ignored():
     c = Clip.from_dict({"id": "c", "media_id": "m", "track": "main",
                         "bogus_field": 7})              # tolerant deserialisation
     assert c.id == "c" and not hasattr(c, "bogus_field")
+
+
+def test_add_sequence_clip_links_to_backing_media():
+    p = Project()
+    seq = p.add_sequence("inner")
+    assert p.video_tracks(seq.id)                       # has a default video track
+    clip = p.add_sequence_clip("main", seq.id)
+    media = p.sequence_media(seq.id)
+    assert clip.media_id == media.id and media.sequence_id == seq.id
+    assert media.derived and clip.seq_id == ROOT_SEQ_ID  # clip lives on root's main
+
+
+def test_precomp_cycle_detected():
+    # a sequence that contains itself must fail cleanly (no engine needed: the
+    # cycle is caught before any rendering)
+    p = Project()
+    a = p.add_sequence("A")
+    vt = p.video_tracks(a.id)[0]
+    p.add_sequence_clip(vt.id, a.id)                    # A contains A
+    with pytest.raises(ValueError, match="cycle"):
+        p.render(None, "x.avi", sequence_id=a.id)
