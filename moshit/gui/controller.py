@@ -86,6 +86,7 @@ class AppController(QObject):
     preview_done = Signal()               # stream complete
     preview_audio = Signal(object)        # path to the preview's audio, or None
     preview_waveform = Signal(object)     # list[float] peak envelope, or None
+    sequence_changed = Signal()           # the shown sequence (current_seq_id) changed
 
     def __init__(self, config: Optional[EngineConfig] = None,
                  ffmpeg_bin: Optional[str] = None,
@@ -246,15 +247,17 @@ class AppController(QObject):
     def refresh_preview(self) -> None:
         if self._busy:
             return
-        if not self.project.main_clips():
-            self.error.emit("Add a clip to the main track first.")
+        seq_id = self.current_seq_id
+        if not any(self.project.clips_for_track(t.id)
+                   for t in self.project.video_tracks(seq_id)):
+            self.error.emit("Add a clip to a video track first.")
             return
         self._busy = True
         self.busy.emit(True, "Rendering preview…")
         out = self._dir / "preview.avi"
 
         def work(emit_begin, emit_batch):
-            r = self.project.render(self.engine, out)
+            r = self.project.render(self.engine, out, sequence_id=seq_id)
             self.decoder.decode_stream(out, emit_begin, emit_batch, max_width=720)
             self._preview_audio = self._build_preview_audio(r.get("audio_plan"))
 
@@ -526,6 +529,48 @@ class AppController(QObject):
         self._push_undo()
         t.enabled = bool(enabled)
         self.project_changed.emit()
+
+    # -- sequences (precomps) ----------------------------------------------- #
+
+    def set_current_sequence(self, seq_id: str) -> None:
+        """Switch which sequence the timeline edits (no project mutation)."""
+        if seq_id == self.current_seq_id:
+            return
+        if not any(s.id == seq_id for s in self.project.sequences):
+            return
+        self.current_seq_id = seq_id
+        self.sequence_changed.emit()
+
+    def precompose(self, clip_ids, name: str = "Precomp"):
+        """Move the given clips into a new sequence and drop a precomp clip where
+        they were (After-Effects 'precompose'). Returns the new Sequence."""
+        valid = []
+        for cid in clip_ids:
+            try:
+                c = self.project.clip(cid)
+            except KeyError:
+                continue
+            if c.enabled and not c.archived and self.project.track(c.track).role \
+                    == "video":
+                valid.append(c)
+        if not valid:
+            return None
+        host_track = valid[0].track
+        insert_start = min(c.start for c in valid)
+        self._push_undo()
+        seq = self.project.add_sequence(name)
+        vt = self.project.video_tracks(seq.id)[0]
+        cursor = 0
+        for c in sorted(valid, key=lambda c: c.start):    # rehome onto the precomp
+            c.seq_id, c.track, c.start = seq.id, vt.id, cursor
+            cursor += self.project._clip_length(c)
+        media = self.project.sequence_media(seq.id)
+        media.nb_frames = cursor                          # provisional until rendered
+        self.project.add_sequence_clip(host_track, seq.id, start=insert_start)
+        self._repack_if_video(host_track)
+        self.project_changed.emit()
+        self.status.emit(f"Precomposed {len(valid)} clip(s) into {name}.")
+        return seq
 
     # -- pixel FX (clip finishing) ------------------------------------------ #
 

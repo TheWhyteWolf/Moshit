@@ -224,6 +224,7 @@ class MainWindow(QMainWindow):
         bv = QVBoxLayout(bottom)
         bv.setContentsMargins(0, 0, 0, 0)
         bv.setSpacing(4)
+        bv.addWidget(self._build_sequence_bar())
         bv.addWidget(self.timeline, 1)
         bv.addWidget(self._build_tool_strip())
 
@@ -241,6 +242,7 @@ class MainWindow(QMainWindow):
         self._build_shortcuts()
         self.timeline.set_sequence(self.controller.current_seq_id)
         self.timeline.set_project(self.controller.project)
+        self._refresh_sequence_bar()
         self.inspector.set_presets(self.controller.preset_names())
         self.inspector.set_flow_sources(self.controller.media_choices())
         self.inspector.set_beat_provider(self.controller.beat_positions)
@@ -320,6 +322,59 @@ class MainWindow(QMainWindow):
         for act in (self.act_import, self.act_preview, self.act_auto, self.act_export):
             tb.addAction(act)
 
+    def _build_sequence_bar(self) -> QWidget:
+        """Sequence switcher + track/precompose actions, above the timeline."""
+        bar = QWidget()
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(8, 2, 8, 0)
+        h.addWidget(QLabel("Sequence:"))
+        self.seq_combo = QComboBox()
+        self.seq_combo.setMinimumWidth(150)
+        self.seq_combo.setToolTip("Switch which sequence the timeline edits "
+                                  "(double-click a precomp clip to enter it)")
+        self.seq_combo.currentIndexChanged.connect(self._on_seq_combo)
+        h.addWidget(self.seq_combo)
+        btn_track = QPushButton("+ Track")
+        btn_track.setMaximumWidth(80)
+        btn_track.setToolTip("Add a video track to this sequence")
+        btn_track.clicked.connect(lambda: self.controller.add_video_track())
+        h.addWidget(btn_track)
+        self.btn_precompose = QPushButton("Precompose")
+        self.btn_precompose.setMaximumWidth(100)
+        self.btn_precompose.setToolTip("Move the selected clip into a new "
+                                       "sequence (precomp)")
+        self.btn_precompose.clicked.connect(self._on_precompose)
+        h.addWidget(self.btn_precompose)
+        h.addStretch(1)
+        return bar
+
+    def _refresh_sequence_bar(self) -> None:
+        self.seq_combo.blockSignals(True)
+        self.seq_combo.clear()
+        for s in self.controller.project.sequences:
+            self.seq_combo.addItem(s.name, s.id)
+        idx = self.seq_combo.findData(self.controller.current_seq_id)
+        if idx >= 0:
+            self.seq_combo.setCurrentIndex(idx)
+        self.seq_combo.blockSignals(False)
+
+    def _on_seq_combo(self, _idx: int) -> None:
+        sid = self.seq_combo.currentData()
+        if sid:
+            self.controller.set_current_sequence(sid)
+
+    def _on_precompose(self) -> None:
+        if not self._selected_clip:
+            self.statusBar().showMessage("Select a clip to precompose.")
+            return
+        self.controller.precompose([self._selected_clip])
+
+    def _on_sequence_changed(self) -> None:
+        self.timeline.set_sequence(self.controller.current_seq_id)
+        self.timeline.set_project(self.controller.project)
+        self._refresh_sequence_bar()
+        self._schedule_auto_refresh()
+
     def _build_tool_strip(self) -> QWidget:
         """The clip-editing tools, placed directly under the timeline so it's
         clear they act on it."""
@@ -393,6 +448,9 @@ class MainWindow(QMainWindow):
         self.timeline.reorderTrackRequested.connect(self.controller.reorder_track)
         self.timeline.trackEnabledToggled.connect(self.controller.set_track_enabled)
         self.timeline.addClipToTrackRequested.connect(self._on_add_clip_to_track)
+        self.timeline.enterSequenceRequested.connect(
+            self.controller.set_current_sequence)
+        c.sequence_changed.connect(self._on_sequence_changed)
         self.preview.frameChanged.connect(self._on_preview_frame)
 
         self.inspector.effectAddRequested.connect(self._on_effect_add)
@@ -437,6 +495,7 @@ class MainWindow(QMainWindow):
         self._set_dirty(True)
         self.timeline.set_sequence(self.controller.current_seq_id)
         self.timeline.set_project(self.controller.project)
+        self._refresh_sequence_bar()
         self.inspector.set_motion_labels(self.controller.motion_labels())
         self.inspector.set_flow_sources(self.controller.media_choices())
         self.act_undo.setEnabled(self.controller.can_undo)

@@ -330,9 +330,16 @@ A whole sequence can be used as a clip inside another — an After-Effects-style
 **precomp**. A precomp renders to a cached intermediate (re-rendered only when its
 contents change, and guarded against reference cycles) and behaves like any other
 media, so you can **mosh, retime, and composite a precomp** just like a source
-clip. Today these are driven through the project model / `render-project`
-(`Project.add_track`, `add_sequence`, `add_sequence_clip`); timeline UI for them
-is in progress. Audio still comes from the root sequence's main track.
+clip. Audio still comes from the root sequence's main track.
+
+In the app, the **timeline shows the current sequence's video tracks** stacked
+top-to-bottom (the top lane composites over the ones below), with the motion pool
+at the bottom; clips show opacity/blend badges. Right-click an empty lane to add /
+remove / move / enable a track or drop the selected media onto it; set a clip's
+**Opacity** and **Blend** in the inspector. The **Sequence** bar above the
+timeline switches sequences and **Precompose**s the selected clip into a new one;
+**double-click a precomp clip** to step into it. The preview renders whichever
+sequence you're editing.
 
 ### Tests
 
@@ -425,11 +432,12 @@ def apply(self, frames, ctx, *, amount=0.5):
 
 ## Known limits (v1)
 
-- The renderer composites multiple stacked **video tracks** (opacity + blend
-  mode + alpha) and supports **nested sequences** (precomps), but these are so far
-  driven through the project model / `render-project` — the timeline UI still
-  shows the single main track plus the motion pool. A crossfade overlaps two
-  clips at render time, and the timeline draws that true overlap (a hatched band).
+- The renderer composites stacked **video tracks** (opacity + blend mode + alpha)
+  and supports **nested sequences** (precomps), both editable from the timeline.
+  Within a track, clips still pack contiguously (free positioning / gaps and
+  intra-track crossfade dissolves on upper tracks are future work). A crossfade
+  overlaps two clips at render time, and the timeline draws that overlap (a
+  hatched band). Audio is still taken from the root sequence's main track.
 - Clip trims snap to the nearest preceding keyframe so every clip stays
   decodable (GOP-based editing; for frame-exact cuts, use a smaller GOP).
 - Audio is reassembled from the original sources and muxed on **export** (the
@@ -450,11 +458,12 @@ Ctrl+Z / Ctrl+Shift+Z), **clip split at playhead** (GOP-snapped so both halves
 stay decodable), an **audio waveform strip** under the ruler, and **beat-synced
 keyframes** (the ♪ button pulses an automatable parameter on the audio's beats).
 
-**Compositing tracks and nested sequences** now exist at the engine level —
-multiple video tracks composited with opacity/blend/alpha, and precomps rendered
-to cached, moshable media. The remaining work is the **timeline UI** for them:
-add/remove/reorder tracks, per-clip opacity/blend controls, and sequence tabs
-with a "precompose selection" action.
+**Compositing tracks and nested sequences** have landed end-to-end: multiple
+video tracks composited with opacity/blend/alpha and precomps rendered to cached,
+moshable media, all editable from the timeline (track management, per-clip
+opacity/blend, a sequence switcher, precompose, and double-click-to-enter).
+Remaining refinements: free clip positioning / gaps within a track, intra-track
+crossfade dissolves on upper tracks, and multi-track audio mixing.
 
 On the glitch side, the signature systems have all landed: GPU optical-flow
 motion transfer (see **Optical-flow transfer**), per-clip optical-flow as a

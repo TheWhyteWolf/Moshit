@@ -421,6 +421,7 @@ class TimelineWidget(QWidget):
     reorderTrackRequested = Signal(str, int)       # track_id, delta (-1 up/+1 down)
     trackEnabledToggled = Signal(str, bool)        # track_id, enabled
     addClipToTrackRequested = Signal(str)          # track_id (uses library selection)
+    enterSequenceRequested = Signal(str)           # seq_id (double-clicked a precomp)
 
     RULER_H = 20
     WAVE_H = 22                                     # audio waveform strip
@@ -828,6 +829,17 @@ class TimelineWidget(QWidget):
         elif d["mode"] == "trim_r" and dframes != 0:
             self.trimRequested.emit(d["id"], -1, d["out"] + dframes)
         self.update()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or not self._project:
+            return
+        hit = self._hit(event.position().toPoint())
+        if not hit:
+            return
+        clip = self._project.clip(hit[1])
+        media = self._project.media.get(clip.media_id)
+        if media and getattr(media, "sequence_id", None):   # a precomp clip
+            self.enterSequenceRequested.emit(media.sequence_id)
 
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self._selected:

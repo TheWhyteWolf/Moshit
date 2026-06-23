@@ -235,6 +235,30 @@ def test_track_ops_and_undo(ctl):
     assert [x.id for x in ctl.project.video_tracks(root)] == [MAIN_TRACK_ID]
 
 
+def test_precompose_and_sequence_switch(ctl):
+    from moshit.project import Clip, MAIN_TRACK_ID
+    _seed_clip(ctl, "c")                                  # media "m", clip on main
+    ctl.project.clips.append(Clip(id="c2", media_id="m", track=MAIN_TRACK_ID,
+                                  start=20))
+    seq = ctl.precompose(["c2"], name="PC")
+    assert seq is not None
+    assert ctl.project.clip("c2").seq_id == seq.id and ctl.project.clip("c2").track \
+        != MAIN_TRACK_ID
+    # a precomp clip backed by the new sequence now sits on the root main track
+    pc = [c for c in ctl.project.clips_for_track(MAIN_TRACK_ID)
+          if ctl.project.media[c.media_id].sequence_id == seq.id]
+    assert len(pc) == 1
+
+    got = []
+    ctl.sequence_changed.connect(lambda: got.append(ctl.current_seq_id))
+    ctl.set_current_sequence(seq.id)
+    assert ctl.current_seq_id == seq.id and got == [seq.id]
+
+    ctl.set_current_sequence(ctl.project.root_seq_id)
+    ctl.undo()                                            # undo the precompose
+    assert ctl.project.clip("c2").track == MAIN_TRACK_ID
+
+
 def test_cannot_remove_only_video_track(ctl):
     _seed_clip(ctl, "c")
     from moshit.project import MAIN_TRACK_ID
