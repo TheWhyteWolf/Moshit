@@ -66,16 +66,21 @@ def test_preview_audio_builds_and_mutes(qapp, tmp_path, monkeypatch):
     run_op(lambda: c.import_media(str(src), "main"))
     c.add_clip_for_media(list(c.project.media)[0], "main")
     got = []
+    waves = []
     c.preview_audio.connect(got.append)
+    c.preview_waveform.connect(waves.append)
     run_op(lambda: c.refresh_preview())
     assert got and got[-1] and Path(got[-1]).exists()    # audio built from source
+    assert waves and waves[-1] and max(waves[-1]) > 0     # waveform envelope built
     first = got[-1]
     run_op(lambda: c.refresh_preview())
     assert got[-1] == first                              # cached on unchanged plan
     c._preview_muted = True
     got.clear()
+    waves.clear()
     run_op(lambda: c.refresh_preview())
     assert got and got[-1] is None                       # muted -> no audio
+    assert waves and waves[-1] is None                   # muted -> no waveform
     c.cleanup()
 
 

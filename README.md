@@ -99,7 +99,8 @@ remove, and effect changes. Baking is a commit point: it starts a fresh undo
 history, and is separately reversible with **Revert bake**. Edits re-render the
 preview automatically after a short pause; toggle **Auto-refresh** off in the
 toolbar to render only on demand with **Refresh preview** (useful on large
-projects).
+projects). A **waveform strip** under the ruler shows the assembled audio, so you
+can line edits up to the sound at a glance.
 
 **Preview.** Frames are decoded with FFmpeg, so the GUI needs nothing beyond
 PySide6 — no extra media libraries. The preview streams in as it decodes (you see
@@ -420,15 +421,14 @@ def apply(self, frames, ctx, *, amount=0.5):
 
 Planned, in order:
 
-1. **Audio waveform in the timeline** — draw the assembled track under the
-   timeline (pairs with synced preview audio).
-2. **Beat-synced keyframes** — onset/beat detection that auto-places automation
+1. **Beat-synced keyframes** — onset/beat detection that auto-places automation
    keyframes (e.g. drive `iframe_pulse`/`surge` on the beat).
 
 Done: **visual crossfade overlap** (timeline draws the true overlap as a hatched
 band, with a frame-accurate, overlap-aware ruler), **undo/redo** (snapshot-based
-history, Ctrl+Z / Ctrl+Shift+Z), and **clip split at playhead** (GOP-snapped so
-both halves stay decodable).
+history, Ctrl+Z / Ctrl+Shift+Z), **clip split at playhead** (GOP-snapped so both
+halves stay decodable), and an **audio waveform strip** under the ruler (a
+dependency-light peak envelope of the assembled preview track).
 
 On the glitch side, the signature systems have all landed: GPU optical-flow
 motion transfer (see **Optical-flow transfer**), per-clip optical-flow as a

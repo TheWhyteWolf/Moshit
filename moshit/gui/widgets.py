@@ -397,6 +397,7 @@ class TimelineWidget(QWidget):
     duplicateRequested = Signal(str)               # clip_id
 
     RULER_H = 20
+    WAVE_H = 22                                     # audio waveform strip
     LANE_H = 46
     PAD = 8
     LABEL_W = 56
@@ -404,7 +405,8 @@ class TimelineWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(self.RULER_H + 2 * self.LANE_H + 3 * self.PAD + 6)
+        self.setMinimumHeight(self.RULER_H + self.WAVE_H + 2 * self.LANE_H
+                              + 3 * self.PAD + 6)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
@@ -417,6 +419,7 @@ class TimelineWidget(QWidget):
         self._scrubbing = False
         self._tool = "pointer"                      # "pointer" | "cut"
         self._cursor_x = 0
+        self._waveform: Optional[List[float]] = None      # audio peak envelope
 
     def set_project(self, project) -> None:
         self._project = project
@@ -425,6 +428,10 @@ class TimelineWidget(QWidget):
 
     def set_play_fraction(self, frac: float) -> None:
         self._play_frac = max(0.0, min(1.0, float(frac)))
+        self.update()
+
+    def set_waveform(self, peaks) -> None:
+        self._waveform = list(peaks) if peaks else None
         self.update()
 
     def set_tool(self, tool: str) -> None:
@@ -479,7 +486,8 @@ class TimelineWidget(QWidget):
         return max(1, x1 - x0) / max(1, self._total)
 
     def _lane_y(self, lane: int) -> int:
-        return self.RULER_H + self.PAD + lane * (self.LANE_H + self.PAD)
+        return (self.RULER_H + self.WAVE_H + self.PAD
+                + lane * (self.LANE_H + self.PAD))
 
     # -- painting ----------------------------------------------------------- #
 
@@ -507,6 +515,9 @@ class TimelineWidget(QWidget):
             f += step
         p.setPen(QColor("#3a414c"))
         p.drawLine(x0, self.RULER_H - 2, x1, self.RULER_H - 2)
+
+        # audio waveform strip (spans the full rendered timeline)
+        self._draw_waveform(p, x0, track_w)
 
         # lane labels + backgrounds
         p.setPen(QColor("#8a92a6"))
@@ -585,6 +596,25 @@ class TimelineWidget(QWidget):
         p.drawText(rect.adjusted(5, 0, -3, 0),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    f"{label}  {length}f{suffix}")
+
+    def _draw_waveform(self, p, x0, track_w) -> None:
+        top = self.RULER_H + 2
+        h = self.WAVE_H - 3
+        p.fillRect(QRect(x0, top, track_w, h), QColor("#171a1f"))
+        peaks = self._waveform
+        if not peaks:
+            return
+        mid = top + h / 2.0
+        amp = h / 2.0 - 1
+        n = len(peaks)
+        p.setPen(QColor("#3aa6a0"))
+        for col in range(track_w):
+            v = peaks[min(n - 1, col * n // track_w)]
+            ph = v * amp
+            x = x0 + col
+            p.drawLine(x, int(mid - ph), x, int(mid + ph))
+        p.setPen(QColor("#2a3038"))                   # centre baseline
+        p.drawLine(x0, int(mid), x0 + track_w, int(mid))
 
     def _draw_xfade_band(self, p, rect) -> None:
         """Shade the crossfade overlap region with a hatched translucent band."""

@@ -373,6 +373,7 @@ class MainWindow(QMainWindow):
         c.preview_batch.connect(self.preview.append_frames)
         c.preview_done.connect(self.preview.end_stream)
         c.preview_audio.connect(self.preview.set_audio)
+        c.preview_waveform.connect(self.timeline.set_waveform)
         self.preview.muteToggled.connect(self.controller.set_preview_muted)
         c.busy.connect(self._on_busy)
         c.error.connect(self._on_error)

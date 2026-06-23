@@ -26,6 +26,7 @@ from ..engine import EngineConfig, MoshEngine
 from ..ffmpeg import FFmpeg
 from ..modes import load_modes
 from ..project import Project
+from .. import waveform
 from .preview import PreviewDecoder
 
 
@@ -84,6 +85,7 @@ class AppController(QObject):
     preview_batch = Signal(list)          # list[QImage] — a chunk of frames
     preview_done = Signal()               # stream complete
     preview_audio = Signal(object)        # path to the preview's audio, or None
+    preview_waveform = Signal(object)     # list[float] peak envelope, or None
 
     def __init__(self, config: Optional[EngineConfig] = None,
                  ffmpeg_bin: Optional[str] = None,
@@ -105,6 +107,7 @@ class AppController(QObject):
         self._audio_plan_cache = None          # rebuild audio only when it changes
         self._audio_path_cache = None
         self._preview_audio = None
+        self._preview_waveform = None          # peak envelope for the timeline
         self._cleaned = False
         self._undo: List = []                 # snapshots of (clips, mosh_ops)
         self._redo: List = []
@@ -266,13 +269,16 @@ class AppController(QObject):
         """Assemble the preview's audio track (worker thread). Cached by plan, so
         edits that don't change the audio reuse the previous build."""
         if self._preview_muted or not audio_plan:
+            self._preview_waveform = None
             return None
         if audio_plan == self._audio_plan_cache and self._audio_path_cache:
-            return self._audio_path_cache
+            return self._audio_path_cache         # waveform cache stays valid too
         path = self.engine.build_audio(audio_plan, self._dir / "preview.wav",
                                        fps=self.config.fps)
         self._audio_plan_cache = audio_plan
         self._audio_path_cache = str(path) if path else None
+        self._preview_waveform = (waveform.peaks(self._audio_path_cache)
+                                  if self._audio_path_cache else None)
         return self._audio_path_cache
 
     def set_preview_muted(self, muted: bool) -> None:
@@ -294,6 +300,7 @@ class AppController(QObject):
         self.busy.emit(False, "")
         self.preview_done.emit()
         self.preview_audio.emit(self._preview_audio)
+        self.preview_waveform.emit(self._preview_waveform)
         self.status.emit("Preview updated.")
 
     def export(self, profile: str, path, audio: bool = True) -> None:
