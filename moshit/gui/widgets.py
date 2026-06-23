@@ -1353,18 +1353,32 @@ class InspectorPanel(QWidget):
         self.xfade_spin.setSuffix(" f")
         self.xfade_spin.setToolTip("Crossfade in from the previous clip over this "
                                    "many frames (0 = hard cut)")
+        self.opacity_spin = QDoubleSpinBox()
+        self.opacity_spin.setRange(0.0, 1.0)
+        self.opacity_spin.setSingleStep(0.05)
+        self.opacity_spin.setValue(1.0)
+        self.opacity_spin.setToolTip("Layer opacity when compositing over the "
+                                     "tracks below (1 = opaque)")
+        from ..ffmpeg import BLEND_MODES
+        self.blend_combo = QComboBox()
+        self.blend_combo.addItems(["normal"] + sorted(BLEND_MODES))
+        self.blend_combo.setToolTip("How this clip blends with the tracks below")
 
         form.addRow("Speed ×", self.speed_spin)
         form.addRow("", self.reverse_chk)
         form.addRow("Fade in", self.fadein_spin)
         form.addRow("Fade out", self.fadeout_spin)
         form.addRow("Crossfade ⟵", self.xfade_spin)
+        form.addRow("Opacity", self.opacity_spin)
+        form.addRow("Blend", self.blend_combo)
 
         self.speed_spin.valueChanged.connect(self._emit_clip_props)
         self.reverse_chk.toggled.connect(self._emit_clip_props)
         self.fadein_spin.valueChanged.connect(self._emit_clip_props)
         self.fadeout_spin.valueChanged.connect(self._emit_clip_props)
         self.xfade_spin.valueChanged.connect(self._emit_clip_props)
+        self.opacity_spin.valueChanged.connect(self._emit_clip_props)
+        self.blend_combo.currentTextChanged.connect(self._emit_clip_props)
         self._clip_group = group
         return group
 
@@ -1377,6 +1391,8 @@ class InspectorPanel(QWidget):
             "fade_in": self.fadein_spin.value(),
             "fade_out": self.fadeout_spin.value(),
             "transition_in": self.xfade_spin.value(),
+            "opacity": self.opacity_spin.value(),
+            "blend_mode": self.blend_combo.currentText(),
         })
 
     def _populate_clip_props(self, clip) -> None:
@@ -1386,6 +1402,8 @@ class InspectorPanel(QWidget):
         self.fadein_spin.setValue(int(getattr(clip, "fade_in", 0)))
         self.fadeout_spin.setValue(int(getattr(clip, "fade_out", 0)))
         self.xfade_spin.setValue(int(getattr(clip, "transition_in", 0)))
+        self.opacity_spin.setValue(float(getattr(clip, "opacity", 1.0)))
+        self.blend_combo.setCurrentText(getattr(clip, "blend_mode", "normal"))
         self._populating = False
 
     # -- pixel FX (clip finishing) ------------------------------------------ #

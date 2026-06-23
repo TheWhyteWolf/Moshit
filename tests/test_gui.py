@@ -96,6 +96,20 @@ def test_preview_audio_builds_and_mutes(qapp, tmp_path, monkeypatch):
     c.cleanup()
 
 
+def test_inspector_opacity_blend(qapp):
+    from moshit.gui.widgets import InspectorPanel
+    from moshit.project import Clip
+    insp = InspectorPanel()
+    got = []
+    insp.clipPropsChanged.connect(got.append)
+    insp._populate_clip_props(Clip(id="c", media_id="m", track="main",
+                                   opacity=0.5, blend_mode="screen"))
+    assert insp.opacity_spin.value() == 0.5
+    assert insp.blend_combo.currentText() == "screen"
+    insp.opacity_spin.setValue(0.25)                 # a control edit emits the props
+    assert got and got[-1]["opacity"] == 0.25 and got[-1]["blend_mode"] == "screen"
+
+
 def test_timeline_multitrack_lanes(qapp):
     from moshit.gui.widgets import TimelineWidget
     from moshit.project import (Project, Clip, MediaItem,
