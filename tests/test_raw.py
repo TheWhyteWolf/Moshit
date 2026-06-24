@@ -90,6 +90,44 @@ def test_mask_frames_motion_and_alpha():
 
 
 @requires_numpy
+def test_chroma_mask_keys_the_color():
+    import numpy as np
+    from moshit.modes.raw import mask_frames, _parse_color
+    assert list(_parse_color("#00ff00")) == [0.0, 1.0, 0.0]
+    img = np.zeros((1, 2, 3), np.uint8)
+    img[0, 0] = (0, 255, 0)                          # key color -> matte ~0
+    img[0, 1] = (255, 0, 0)                          # far -> matte ~1
+    m = mask_frames([img.tobytes()], 2, 1,
+                    {"source": "chroma", "key": "#00ff00", "lo": 0.1, "hi": 0.5})[0]
+    assert m[0, 0] < 0.1 and m[0, 1] > 0.9
+
+
+@requires_numpy
+def test_gate_island_blacks_outside_matte():
+    import numpy as np
+    from moshit.modes.raw import gate_island
+    img = np.full((4, 4, 3), 200, np.uint8)
+    img[:, 2:, :] = 0                                # right half dark -> luma ~0
+    isl = gate_island([img.tobytes()], 4, 4, {"source": "luma", "lo": 0.3, "hi": 0.6})
+    a = np.frombuffer(isl[0], np.uint8).reshape(4, 4, 3)
+    assert a[0, 0].sum() > 300 and a[0, 3].sum() == 0  # bright kept, dark blacked
+
+
+@requires_numpy
+def test_overlay_spill_shows_spilled_content():
+    import numpy as np
+    from moshit.modes.raw import overlay_spill
+    orig = np.full((4, 4, 3), 50, np.uint8)
+    proc = np.zeros((4, 4, 3), np.uint8)
+    proc[0, 3] = (240, 240, 240)                     # spilled bright pixel, mask dark there
+    out = overlay_spill([orig.tobytes()], [proc.tobytes()], 4, 4,
+                        {"source": "luma", "lo": 0.9, "hi": 1.0})  # ~no in-matte
+    r = np.frombuffer(out[0], np.uint8).reshape(4, 4, 3)
+    assert r[0, 3].sum() > 600                        # spilled content shows
+    assert tuple(r[1, 1]) == (50, 50, 50)            # untouched stays original
+
+
+@requires_numpy
 def test_blend_masked_white_and_black():
     import numpy as np
     from moshit.modes.raw import blend_masked

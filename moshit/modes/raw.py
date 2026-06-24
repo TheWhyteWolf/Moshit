@@ -132,12 +132,35 @@ def _box_blur(m, radius: int):
     return m
 
 
+_NAMED_COLORS = {
+    "black": (0, 0, 0), "white": (255, 255, 255), "red": (255, 0, 0),
+    "green": (0, 128, 0), "lime": (0, 255, 0), "blue": (0, 0, 255),
+    "cyan": (0, 255, 255), "magenta": (255, 0, 255), "yellow": (255, 255, 0),
+}
+
+
+def _parse_color(value):
+    """A color (``#rrggbb`` / ``0xrrggbb`` / name) -> (r, g, b) floats in 0..1."""
+    import numpy as np
+    v = str(value or "#00ff00").strip().lower()
+    if v in _NAMED_COLORS:
+        rgb = _NAMED_COLORS[v]
+    else:
+        h = v[1:] if v.startswith("#") else (v[2:] if v.startswith("0x") else v)
+        try:
+            rgb = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+        except (ValueError, IndexError):
+            rgb = (0, 255, 0)
+    return np.array(rgb, np.float32) / 255.0
+
+
 def mask_frames(frames, width: int, height: int, spec: Dict):
     """Per-frame grayscale mattes (float32, 0..1) for *frames* per *spec*.
 
-    Mirrors :func:`moshit.ffmpeg.mask_chain`: ``source`` luma / alpha / motion,
-    a soft ``lo``/``hi`` ramp, ``invert`` and ``feather``. RGB frames carry no
-    alpha, so an ``alpha`` matte is fully opaque (1.0) here too."""
+    Mirrors :func:`moshit.ffmpeg.mask_chain`: ``source`` luma / alpha / motion /
+    chroma (distance from the ``key`` color), a soft ``lo``/``hi`` ramp,
+    ``invert`` and ``feather``. RGB frames carry no alpha, so an ``alpha`` matte
+    is fully opaque (1.0) here too."""
     import numpy as np
     H, W = int(height), int(width)
     source = str(spec.get("source", "luma"))
@@ -146,6 +169,7 @@ def mask_frames(frames, width: int, height: int, spec: Dict):
     invert = bool(spec.get("invert", False))
     feather = max(0, int(spec.get("feather", 0)))
     span = max(1e-6, hi - lo)
+    key = _parse_color(spec.get("key", "#00ff00")) if source == "chroma" else None
     arrs = [np.frombuffer(f, np.uint8).reshape(H, W, 3).astype(np.float32) / 255.0
             for f in frames]
     out = []
@@ -158,6 +182,9 @@ def mask_frames(frames, width: int, height: int, spec: Dict):
             else:
                 ref = arrs[i - 1] if i > 0 else arrs[1]
                 base = np.abs(arr - ref).mean(2)
+        elif source == "chroma":                  # distance from the key color
+            diff = arr - key
+            base = np.sqrt((diff * diff).sum(2) / 3.0)
         else:
             base = _luma(arr)
         m = np.clip((base - lo) / span, 0.0, 1.0)
@@ -169,9 +196,23 @@ def mask_frames(frames, width: int, height: int, spec: Dict):
     return out
 
 
+def gate_island(frames, width: int, height: int, spec: Dict):
+    """Black out everything outside the matte (the *source*-mode FX input)."""
+    import numpy as np
+    H, W = int(height), int(width)
+    masks = mask_frames(frames, width, height, spec)
+    out = []
+    for f, m in zip(frames, masks):
+        a = np.frombuffer(f, np.uint8).reshape(H, W, 3).astype(np.float32)
+        isl = a * m[..., None]
+        out.append(np.ascontiguousarray(
+            np.clip(isl, 0, 255).astype(np.uint8)).tobytes())
+    return out
+
+
 def blend_masked(original, processed, width: int, height: int, spec: Dict):
-    """Blend *processed* over *original* per :func:`mask_frames` -- the raw-FX
-    matte (effect shows where the matte is bright, original passes elsewhere)."""
+    """Blend *processed* over *original* per :func:`mask_frames` -- the *confine*
+    raw-FX matte (effect shows where the matte is bright, original elsewhere)."""
     import numpy as np
     H, W = int(height), int(width)
     masks = mask_frames(original, width, height, spec)
@@ -183,6 +224,24 @@ def blend_masked(original, processed, width: int, height: int, spec: Dict):
         blended = o * (1.0 - m3) + p * m3
         out.append(np.ascontiguousarray(
             np.clip(blended, 0, 255).astype(np.uint8)).tobytes())
+    return out
+
+
+def overlay_spill(original, processed, width: int, height: int, spec: Dict):
+    """*source*-mode raw-FX matte: *processed* (the effect run on the matte-cut
+    island) overlays *original* wherever the matte is bright or the effect spilled
+    non-black content beyond it -- so glitches are free to overspill the matte."""
+    import numpy as np
+    H, W = int(height), int(width)
+    masks = mask_frames(original, width, height, spec)
+    out = []
+    for ob, pb, m in zip(original, processed, masks):
+        o = np.frombuffer(ob, np.uint8).reshape(H, W, 3).astype(np.float32)
+        p = np.frombuffer(pb, np.uint8).reshape(H, W, 3).astype(np.float32)
+        show = (m > 0.5) | (p.max(2) > 6)         # in-matte, or spilled content
+        res = np.where(show[..., None], p, o)
+        out.append(np.ascontiguousarray(
+            np.clip(res, 0, 255).astype(np.uint8)).tobytes())
     return out
 
 

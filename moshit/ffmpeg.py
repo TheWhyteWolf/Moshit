@@ -35,32 +35,52 @@ BLEND_MODES = {
 }
 
 # Matte sources for layer/effect masks.
-MASK_SOURCES = ("luma", "alpha", "motion")
+MASK_SOURCES = ("luma", "alpha", "motion", "chroma")
+# How an FX matte relates the effect to the matte: confine the effect's output to
+# the matte (no overspill), or generate it from the matte (output free to spill).
+MASK_MODES = ("confine", "source")
+
+
+def ffmpeg_color(value) -> str:
+    """Normalise a color (``#rrggbb`` / ``0xRRGGBB`` / name) for FFmpeg."""
+    v = str(value or "#00ff00").strip()
+    if v.startswith("#"):
+        return "0x" + v[1:].upper()
+    return v
 
 
 def mask_chain(spec: Dict) -> str:
     """FFmpeg filter string turning a video into a grayscale matte per *spec*.
 
-    *spec* is ``{source, lo, hi, invert, feather}``: ``source`` is ``luma`` (the
-    picture's brightness), ``alpha`` (its transparency -- opaque where the source
-    carries no alpha) or ``motion`` (frame-to-frame difference). ``lo``/``hi``
-    (0..1) are a soft threshold ramp -- below ``lo`` the matte is black, above
-    ``hi`` white, linear between (so the band doubles as feathering). ``invert``
-    flips it; ``feather`` blurs the edges by that many pixels (sigma)."""
+    *spec* is ``{source, lo, hi, invert, feather, key}``: ``source`` is ``luma``
+    (brightness), ``alpha`` (transparency -- opaque where the source has none),
+    ``motion`` (frame-to-frame difference), or ``chroma`` (distance from the
+    ``key`` color -- a green-screen-style key). For luma/alpha/motion ``lo``/``hi``
+    (0..1) are a soft threshold ramp -- below ``lo`` black, above ``hi`` white,
+    linear between (the band doubles as feathering); for chroma they map to the
+    key's similarity/softness. ``invert`` flips it; ``feather`` blurs edges by
+    that many pixels (sigma)."""
     source = str(spec.get("source", "luma"))
     lo = max(0.0, min(1.0, float(spec.get("lo", 0.0))))
     hi = max(0.0, min(1.0, float(spec.get("hi", 1.0))))
     invert = bool(spec.get("invert", False))
     feather = max(0, int(spec.get("feather", 0)))
-    if source == "alpha":
-        chain = ["format=yuva420p", "alphaextract"]   # opaque -> white if no alpha
-    elif source == "motion":
-        chain = ["tblend=all_mode=difference", "format=gray"]
-    else:                                             # luma
-        chain = ["format=gray"]
-    lo255 = lo * 255.0
-    span = max(1.0, (hi - lo) * 255.0)
-    chain.append(f"lutyuv=y='clip((val-{lo255:.3f})/{span:.3f}*255,0,255)'")
+    if source == "chroma":
+        key = ffmpeg_color(spec.get("key", "#00ff00"))
+        sim = max(0.01, lo if lo > 0 else 0.3)
+        blend = max(0.0, hi - lo)
+        chain = [f"format=rgba", f"colorkey={key}:{sim:.4f}:{blend:.4f}",
+                 "alphaextract"]                       # bright where NOT the key
+    else:
+        if source == "alpha":
+            chain = ["format=yuva420p", "alphaextract"]   # opaque -> white
+        elif source == "motion":
+            chain = ["tblend=all_mode=difference", "format=gray"]
+        else:                                         # luma
+            chain = ["format=gray"]
+        lo255 = lo * 255.0
+        span = max(1.0, (hi - lo) * 255.0)
+        chain.append(f"lutyuv=y='clip((val-{lo255:.3f})/{span:.3f}*255,0,255)'")
     if invert:
         chain.append("lutyuv=y='255-val'")
     if feather > 0:
@@ -434,8 +454,9 @@ class FFmpeg:
         ``transition_in`` is set, else ``concat`` (a hard cut). ``meta[i]`` is
         ``{n, speed, reverse, fade_in, fade_out, transition_in, pixel}`` (frame
         counts plus a list of filter strings), and an optional ``fx_mask`` matte
-        spec that gates the pixel filters through ``maskedmerge`` (the FX show
-        only where the matte is bright). ``settb`` pins a common timebase so
+        spec that gates the pixel filters (alpha'd FX overlaid on the original;
+        ``mode`` confines the FX to the matte or sources them from it). ``settb``
+        pins a common timebase so
         ``xfade`` accepts the concat output; pixel filters are followed by a
         ``scale`` back to ``width x height`` so size-changing ones stay foldable.
         """
@@ -464,15 +485,24 @@ class FFmpeg:
                 fx.append(f"scale={int(width)}:{int(height)}:flags=bicubic")
             fx_mask = m.get("fx_mask")
             if pixel and fx_mask:                  # gate the FX through a matte
-                # alpha the FX branch by the matte and overlay it on the original,
-                # so only the matte's bright areas take the effect (overlay's
-                # single-channel alpha avoids maskedmerge's per-plane chroma bug)
+                # Both modes overlay an alpha'd FX branch onto the original; the
+                # matte enters *after* the FX ("confine" -> output limited to the
+                # matte, no overspill) or *before* it ("source" -> FX runs on the
+                # matte-cut island and its output is free to spill outward).
                 mc = mask_chain(fx_mask)
+                mode = str(fx_mask.get("mode", "confine"))
                 parts.append(f"[{i}:v]" + ",".join(head) + f"[hd{i}]")
                 parts.append(f"[hd{i}]split=3[fo{i}][ff{i}][fm{i}]")
-                parts.append(f"[ff{i}]" + ",".join(fx) + f",format=yuva420p[fxc{i}]")
                 parts.append(f"[fm{i}]{mc}[fmk{i}]")
-                parts.append(f"[fxc{i}][fmk{i}]alphamerge[fxm{i}]")
+                if mode == "source":
+                    parts.append(f"[ff{i}]format=yuva420p[ffa{i}]")
+                    parts.append(f"[ffa{i}][fmk{i}]alphamerge[isl{i}]")
+                    parts.append(f"[isl{i}]" + ",".join(fx)
+                                 + f",format=yuva420p[fxm{i}]")
+                else:                              # confine
+                    parts.append(f"[ff{i}]" + ",".join(fx)
+                                 + f",format=yuva420p[fxc{i}]")
+                    parts.append(f"[fxc{i}][fmk{i}]alphamerge[fxm{i}]")
                 parts.append(f"[fo{i}]format=yuv420p[forig{i}]")
                 parts.append(f"[forig{i}][fxm{i}]overlay=eof_action=pass,"
                              f"format=yuv420p,settb=1/{tb}[v{i}]")

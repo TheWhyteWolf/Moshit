@@ -210,14 +210,20 @@ class MoshEngine:
             return Path(src_avi)
         w, h = self.config.width, self.config.height
         original = list(self.ff.decode_rgb_raw(src_avi, w, h))
-        frames = original
+        matte_mode = str((mask or {}).get("mode", "confine"))
+        # "source" mode feeds the effects the matte-cut island so their output is
+        # free to spill; "confine" runs them on the full frame and limits output.
+        frames = (_raw.gate_island(original, w, h, mask)
+                  if mask and matte_mode == "source" else list(original))
         for spec in usable:
             mode = get_raw_mode(spec["name"])
             params = mode.resolve(spec.get("params") or {})
             frames = mode.apply(frames, width=w, height=h,
                                 fps=self.config.fps, **params)
         if mask:
-            frames = _raw.blend_masked(original, frames, w, h, mask)
+            frames = (_raw.overlay_spill(original, frames, w, h, mask)
+                      if matte_mode == "source"
+                      else _raw.blend_masked(original, frames, w, h, mask))
         return self.ff.encode_rgb_raw(frames, out_avi, width=w, height=h,
                                       fps=self.config.fps,
                                       qscale=self.config.qscale, gop=self.config.gop)

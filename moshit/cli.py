@@ -875,9 +875,10 @@ def cmd_selftest(args) -> int:
         print("  [skip] numpy not installed; pixel_sort math not exercised")
 
     print("\nK3. Masking (layer + FX mattes)")
-    from .ffmpeg import MASK_SOURCES, mask_chain
-    _check(MASK_SOURCES == ("luma", "alpha", "motion"),
-           "mask sources are luma / alpha / motion", failures)
+    from .ffmpeg import MASK_SOURCES, MASK_MODES, mask_chain
+    _check(MASK_SOURCES == ("luma", "alpha", "motion", "chroma")
+           and MASK_MODES == ("confine", "source"),
+           "mask sources (luma/alpha/motion/chroma) + modes registered", failures)
     _check(mask_chain({"source": "luma", "lo": 0.0, "hi": 1.0})
            .startswith("format=gray,lutyuv="),
            "luma matte builds a gray + lutyuv ramp", failures)
@@ -885,6 +886,8 @@ def cmd_selftest(args) -> int:
            "motion matte uses a frame-difference", failures)
     _check("alphaextract" in mask_chain({"source": "alpha"}),
            "alpha matte extracts the alpha plane", failures)
+    _check("colorkey=0x00FF00" in mask_chain({"source": "chroma", "key": "#00ff00"}),
+           "chroma matte keys the chosen color", failures)
     mc = mask_chain({"source": "luma", "invert": True, "feather": 4})
     _check("255-val" in mc and "gblur=sigma=4" in mc,
            "invert + feather extend the matte chain", failures)

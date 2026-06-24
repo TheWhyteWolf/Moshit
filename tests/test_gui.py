@@ -225,6 +225,26 @@ def test_inspector_mask_editor_round_trips(qapp):
     assert emitted and emitted[-1][0] == "fx" and emitted[-1][1] is not None
 
 
+def test_inspector_mask_chroma_and_mode(qapp):
+    from moshit.gui.widgets import InspectorPanel
+    insp = InspectorPanel()
+    emitted = []
+    insp.maskChanged.connect(lambda k, s: emitted.append((k, s)))
+    insp._clip_id = "c"
+    # only the FX matte carries a confine/source mode
+    assert insp._mask_editors["fx"]["mode"] is not None
+    assert insp._mask_editors["layer"]["mode"] is None
+    insp.set_clip_masks(None, {"source": "chroma", "key": "#112233",
+                               "lo": 0.3, "hi": 0.5, "mode": "source"})
+    ed = insp._mask_editors["fx"]
+    assert ed["source"].currentText() == "chroma" and not ed["key_row"].isHidden()
+    spec = insp._read_mask("fx")
+    assert spec["key"] == "#112233" and spec["mode"] == "source"
+    ed["source"].setCurrentText("luma")                 # non-chroma hides the key
+    assert ed["key_row"].isHidden()
+    assert emitted[-1][1]["source"] == "luma"
+
+
 def test_undo_redo_round_trips(win):
     ctl = win.controller
     _seed_clip(ctl, "c")

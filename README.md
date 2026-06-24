@@ -202,17 +202,21 @@ skipped rather than failing. The sort is fully vectorised (a single `lexsort`
 per frame), so it's cheap despite working per-pixel.
 
 **Masks (mattes).** Any clip can carry two mattes, both keyed by **luminance**,
-**alpha** or **motion** (frame-to-frame difference), with a soft `lo`/`hi`
-threshold band, `invert`, and `feather`. A **layer matte** modulates the clip's
-compositing alpha, so it shows through only where the matte is bright (a luma
-matte keys out darks; a motion matte reveals only moving areas — the track below
-fills the rest). An **FX matte** instead gates the clip's effects — both the
-FFmpeg pixel FX *and* the numpy raw FX (e.g. pixel sort) — applying them *only*
-in the matte's bright regions (glitch just the motion, or just the highlights)
-while the rest of the frame passes through clean. Both live in the
-inspector's **Masks** panel; a layer matte on a lone track composites it over
-black. (Alpha-keyed mattes are a no-op on the alpha-less MPEG-4 intermediates
-today, but the source is wired for when transparency-carrying layers land.)
+**alpha**, **motion** (frame-to-frame difference) or **chroma** (a green-screen
+key on a chosen `key` colour), with a soft `lo`/`hi` threshold band, `invert`,
+and `feather`. A **layer matte** modulates the clip's compositing alpha, so it
+shows through only where the matte is bright (a luma matte keys out darks; a
+motion matte reveals only moving areas; a chroma matte drops the key colour —
+the track below fills the rest). An **FX matte** instead gates the clip's
+effects — both the FFmpeg pixel FX *and* the numpy raw FX (e.g. pixel sort) —
+and has a **mode**: `confine` keeps the effect strictly inside the matte (no
+overspill), while `source` *generates* the effect from the matte-cut island and
+lets its output spill outward over the rest of the frame (glitches that
+originate in a region but bleed past it). Both mattes live in the inspector's
+**Masks** panel; a layer matte on a lone track composites it over black.
+(Alpha-keyed mattes are still a no-op on the alpha-less MPEG-4 intermediates —
+source-file alpha is the next step; chroma covers most keying needs in the
+meantime.)
 
 **Optical-flow transfer (appearance-free motion transfer).** Warp a clip's pixels
 by the *motion* of another clip — dense optical flow drives the warp, so only the
@@ -511,7 +515,11 @@ live region-scoped *effect*, multi-keyframe automation curves with per-keyframe
 easing, **motion injection** (synthetic zoom/pan/rotate/shake camera moves),
 **pixel sorting** (a threshold-banded numpy raw-frame effect, the first of a new
 *Raw FX* class), and **masking** — both compositor layer-mattes *and* finish-pass
-effect-mattes, keyed by luminance / alpha / motion with a soft threshold band,
-invert and feather. That clears the three glitch families that were on the
-bench; the engine now spans codec-domain mosh, pixel/raw finishing, motion
-transfer, compositing with mattes, and nested sequences.
+effect-mattes, keyed by luminance / motion / **chroma** with a soft threshold
+band, invert and feather, and a **confine/source** mode that controls whether
+glitches stay inside the matte or spill out of it. That clears the three glitch
+families that were on the bench; the engine now spans codec-domain mosh,
+pixel/raw finishing, motion transfer, compositing with mattes, and nested
+sequences. The one matte source still to land is **source-file alpha** (real
+transparency from alpha-carrying imports, needing an alpha companion + edit
+alignment); chroma keying covers most of that need today.

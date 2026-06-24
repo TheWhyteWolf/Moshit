@@ -1673,7 +1673,7 @@ class InspectorPanel(QWidget):
 
     def _build_mask_editor(self, parent: QVBoxLayout, kind: str, label: str,
                            tip: str) -> dict:
-        from ..ffmpeg import MASK_SOURCES
+        from ..ffmpeg import MASK_SOURCES, MASK_MODES
         enable = QCheckBox(label)
         enable.setToolTip(tip)
         parent.addWidget(enable)
@@ -1683,6 +1683,13 @@ class InspectorPanel(QWidget):
         form.setSpacing(2)
         source = QComboBox()
         source.addItems(MASK_SOURCES)
+        key = QLineEdit("#00ff00")
+        key.setToolTip("Key color to remove (chroma source); #rrggbb or a name")
+        key_row = QWidget()
+        _kr = QHBoxLayout(key_row)
+        _kr.setContentsMargins(0, 0, 0, 0)
+        _kr.addWidget(key)
+        key_row.setVisible(False)
         lo = QDoubleSpinBox()
         lo.setRange(0.0, 1.0)
         lo.setSingleStep(0.05)
@@ -1695,18 +1702,34 @@ class InspectorPanel(QWidget):
         feather.setRange(0, 50)
         feather.setSuffix(" px")
         form.addRow("Source", source)
+        form.addRow("Key", key_row)
         form.addRow("Threshold lo", lo)
         form.addRow("Threshold hi", hi)
         form.addRow("", invert)
         form.addRow("Feather", feather)
+        mode = None
+        if kind == "fx":                           # confine vs overspill (FX only)
+            mode = QComboBox()
+            mode.addItems(MASK_MODES)
+            mode.setToolTip("confine = effect stays inside the matte; "
+                            "source = effect generated from the matte, free to "
+                            "spill out")
+            form.addRow("Mode", mode)
         parent.addWidget(host)
         host.setVisible(False)
-        ed = {"enable": enable, "host": host, "source": source, "lo": lo,
-              "hi": hi, "invert": invert, "feather": feather}
+        ed = {"enable": enable, "host": host, "source": source, "key": key,
+              "key_row": key_row, "lo": lo, "hi": hi, "invert": invert,
+              "feather": feather, "mode": mode}
         enable.toggled.connect(host.setVisible)
+        source.currentTextChanged.connect(
+            lambda s=None, e=ed: e["key_row"].setVisible(
+                e["source"].currentText() == "chroma"))
         for w in (enable, invert):
             w.toggled.connect(lambda _=False, k=kind: self._emit_mask(k))
         source.currentTextChanged.connect(lambda _=None, k=kind: self._emit_mask(k))
+        key.textChanged.connect(lambda _=None, k=kind: self._emit_mask(k))
+        if mode is not None:
+            mode.currentTextChanged.connect(lambda _=None, k=kind: self._emit_mask(k))
         for sp in (lo, hi, feather):
             sp.valueChanged.connect(lambda _=None, k=kind: self._emit_mask(k))
         return ed
@@ -1720,9 +1743,15 @@ class InspectorPanel(QWidget):
         ed = self._mask_editors[kind]
         if not ed["enable"].isChecked():
             return None
-        return {"source": ed["source"].currentText(),
+        spec = {"source": ed["source"].currentText(),
                 "lo": round(ed["lo"].value(), 4), "hi": round(ed["hi"].value(), 4),
-                "invert": ed["invert"].isChecked(), "feather": ed["feather"].value()}
+                "invert": ed["invert"].isChecked(),
+                "feather": ed["feather"].value()}
+        if spec["source"] == "chroma":
+            spec["key"] = ed["key"].text().strip() or "#00ff00"
+        if ed["mode"] is not None:
+            spec["mode"] = ed["mode"].currentText()
+        return spec
 
     def set_clip_masks(self, layer_spec, fx_spec) -> None:
         self._populating = True
@@ -1732,11 +1761,16 @@ class InspectorPanel(QWidget):
             ed["enable"].setChecked(on)
             ed["host"].setVisible(on)
             spec = spec or {}
-            ed["source"].setCurrentText(str(spec.get("source", "luma")))
+            src = str(spec.get("source", "luma"))
+            ed["source"].setCurrentText(src)
+            ed["key_row"].setVisible(src == "chroma")
+            ed["key"].setText(str(spec.get("key", "#00ff00")))
             ed["lo"].setValue(float(spec.get("lo", 0.0)))
             ed["hi"].setValue(float(spec.get("hi", 1.0)))
             ed["invert"].setChecked(bool(spec.get("invert", False)))
             ed["feather"].setValue(int(spec.get("feather", 0)))
+            if ed["mode"] is not None:
+                ed["mode"].setCurrentText(str(spec.get("mode", "confine")))
         self._populating = False
 
     # -- flow FX (live optical-flow warp) ----------------------------------- #
