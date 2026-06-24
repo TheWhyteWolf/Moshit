@@ -125,3 +125,66 @@ def transfer_raw(base_frames: List[bytes], motion_frames: List[bytes],
         out.append(np.ascontiguousarray(warped, np.uint8))
 
     return [f.tobytes() for f in out]
+
+
+def magnify_raw(frames: List[bytes], width: int, height: int, *,
+                factor: float = 2.0, accumulate: bool = True,
+                preset: str = "fast", use_opencl: bool = True) -> List[bytes]:
+    """Amplify or reduce a clip's *own* motion by scaling its optical flow.
+
+    For each frame the dense flow (instantaneous, or accumulated from frame 0 with
+    ``accumulate``) is the displacement the picture's content has undergone. The
+    frame is then re-warped by ``(factor - 1)`` times that displacement, so the
+    motion reads as ``factor`` times larger:
+
+    * ``factor > 1`` exaggerates movement (the "motion microscope").
+    * ``factor == 1`` is identity (no warp).
+    * ``factor < 1`` damps motion; ``0`` warps content back to the anchor
+      positions (stabilises). Negative factors push motion the other way.
+
+    Frame count and geometry are preserved (frame 0 always passes through), so it
+    works as a length-preserving raw clip effect. RGB24 bytes in/out.
+    """
+    import cv2
+    import numpy as np
+
+    if len(frames) < 2:
+        return list(frames)
+    h, w = int(height), int(width)
+    arrs = [np.frombuffer(b, np.uint8).reshape(h, w, 3) for b in frames]
+
+    use_cl = bool(use_opencl) and cv2.ocl.haveOpenCL()
+    cv2.ocl.setUseOpenCL(use_cl)
+
+    def um(a):
+        return cv2.UMat(a) if use_cl else a
+
+    def get(a):
+        return a.get() if (use_cl and isinstance(a, cv2.UMat)) else a
+
+    dis = cv2.DISOpticalFlow_create(_preset(preset))
+    gy, gx = (m.astype(np.float32) for m in np.mgrid[0:h, 0:w])
+    acc = np.zeros((h, w, 2), np.float32)
+    prev_gray = cv2.cvtColor(arrs[0], cv2.COLOR_RGB2GRAY)
+    k = float(factor) - 1.0
+
+    out = [np.ascontiguousarray(arrs[0], np.uint8)]   # frame 0: no motion yet
+    for i in range(1, len(arrs)):
+        gray = cv2.cvtColor(arrs[i], cv2.COLOR_RGB2GRAY)
+        fl = get(dis.calc(um(prev_gray), um(gray), None))
+        if fl.shape[:2] != (h, w):
+            fl = cv2.resize(fl, (w, h))
+        prev_gray = gray
+        acc = acc + fl
+        disp = acc if accumulate else fl
+        if abs(k) < 1e-6 or not disp.any():
+            out.append(np.ascontiguousarray(arrs[i], np.uint8))   # passthrough
+            continue
+        ex = disp * k
+        # sample against the flow so content is pushed *further along* its motion
+        # (factor>1 exaggerates); +ex would pull it back toward the anchor.
+        warped = get(cv2.remap(um(arrs[i]), um(gx - ex[..., 0]), um(gy - ex[..., 1]),
+                               cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT))
+        out.append(np.ascontiguousarray(warped, np.uint8))
+
+    return [f.tobytes() for f in out]

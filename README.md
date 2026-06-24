@@ -208,7 +208,11 @@ so chromatic fringing compounds into deep, recursive colour trails.
 `pframe_duplicate`) give finer control over coded motion. **`motion_gain`** is a
 single continuous knob: above 1.0 it re-applies P-frame motion for exaggerated,
 blooming movement; below 1.0 it thins P-frames out toward a freeze at 0
-(fractional gains are error-diffused, so 1.5 doubles every other P-frame).
+(fractional gains are error-diffused, so 1.5 doubles every other P-frame). Its
+pixel-domain twin, the raw effect **`motion_magnify`**, instead measures real
+motion with optical flow and re-warps each frame by `factor` × its displacement
+— exaggerating movement (the "motion microscope") above 1, damping it below 1,
+and stabilising content toward the opening frame at 0 (needs the `flow` extra).
 **`pframe_stutter`** chops each P-frame run into blocks of a chosen `length` and
 replays every block `repeats` times — `forward` for a hard stutter, `reverse` so
 each echo replays the deltas backwards, or `pingpong` for out-and-back.

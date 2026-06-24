@@ -856,6 +856,8 @@ def cmd_selftest(args) -> int:
                         raw as _rawmod)
     _check("pixel_sort" in available_raw_modes() and is_raw_mode("pixel_sort"),
            "pixel_sort is registered as a raw mode", failures)
+    _check("motion_magnify" in available_raw_modes(),
+           "motion_magnify (flow-based) is registered as a raw mode", failures)
     rclip = Clip(id="rc", media_id="m", track="main",
                  raw_effects=[{"name": "pixel_sort",
                                "params": {"axis": "vertical", "lo": 0.1}}])

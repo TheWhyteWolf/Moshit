@@ -140,6 +140,43 @@ def test_async_optical_flow_via_controller(tmp_path, monkeypatch):
     c.cleanup()
 
 
+def test_magnify_scales_motion_monotonically():
+    """factor scales a moving box's travel: 0 stabilises -> 1 identity -> 2 exaggerates."""
+    W, H, N, v = 120, 80, 12, 4
+    frames = []
+    for i in range(N):
+        a = np.full((H, W, 3), 20, np.uint8)
+        x = 10 + v * i
+        a[30:50, x:x + 16] = 230
+        frames.append(a.tobytes())
+
+    def box_cx(buf):
+        a = np.frombuffer(buf, np.uint8).reshape(H, W, 3)[..., 0].astype(float)
+        xs = np.where((a > 120).any(0))[0]
+        return float(xs.mean())
+
+    ident = flow.magnify_raw(frames, W, H, factor=1.0)
+    assert len(ident) == N and ident == frames            # factor 1 = identity
+    anchor, orig = box_cx(frames[0]), box_cx(frames[-1])
+    stab = box_cx(flow.magnify_raw(frames, W, H, factor=0.0)[-1])
+    amp = box_cx(flow.magnify_raw(frames, W, H, factor=2.0)[-1])
+    assert abs(stab - anchor) < abs(orig - anchor)        # 0 pulls back toward anchor
+    assert amp > orig                                     # 2 pushes past the original
+
+
+@requires_ffmpeg
+def test_motion_magnify_raw_effect_preserves_length(engine, project, make_clip,
+                                                    tmp_path, probe):
+    m = project.import_media(engine, make_clip("s.mp4"), role="main")
+    c = project.add_clip(m.id, "main")
+    n = len(project._parsed_media(m.id).frames)
+    c.raw_effects = [{"name": "motion_magnify",
+                      "params": {"factor": 3.0, "accumulate": True}}]
+    out = tmp_path / "mag.avi"
+    r = project.render(engine, out)
+    assert r["frames"] == n and probe.dims(out) == "160x120"
+
+
 def test_flow_dialog_values():
     pytest.importorskip("PySide6")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
