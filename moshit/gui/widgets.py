@@ -24,7 +24,6 @@ try:
 except Exception:                      # QtMultimedia not built / no backend
     _HAVE_QT_AUDIO = False
 
-from ..modes import available_modes, get_mode
 from ..modes.base import Param, _build_evaluator
 
 
@@ -1357,6 +1356,12 @@ class PreviewWidget(QWidget):
         else:
             self._update_frame_label()
 
+    def cancel_stream(self) -> None:
+        """Finalize a render that was cancelled mid-stream, so the transport isn't
+        left disabled (keeps whatever frames had already arrived)."""
+        if self._streaming:
+            self.end_stream()
+
     def end_stream(self) -> None:
         self._streaming = False
         if not self._frames:
@@ -1424,6 +1429,61 @@ class PreviewWidget(QWidget):
 # Inspector (schema-driven)
 # --------------------------------------------------------------------------- #
 
+class _CollapsibleSection(QWidget):
+    """A titled inspector section whose body collapses when its header is clicked.
+
+    Lets the inspector show many groups without becoming a wall of controls --
+    the user expands only what they're working on.
+    """
+
+    def __init__(self, title: str, content: QWidget, *, expanded: bool = True):
+        super().__init__()
+        self._title = title
+        self._content = content
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        self._btn = QPushButton()
+        self._btn.setCheckable(True)
+        self._btn.setChecked(expanded)
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn.setStyleSheet(
+            "QPushButton { text-align:left; padding:4px 6px; border:0;"
+            " border-top:1px solid #3a414c; background:#1c1f24;"
+            " color:#cdd3df; font-weight:bold; }"
+            "QPushButton:hover { background:#222831; }")
+        self._btn.toggled.connect(self._on_toggled)
+        v.addWidget(self._btn)
+        v.addWidget(content)
+        content.setVisible(expanded)
+        self._render()
+
+    def _render(self) -> None:
+        self._btn.setText(f"{'▾' if self._btn.isChecked() else '▸'}  {self._title}")
+
+    def _on_toggled(self, on: bool) -> None:
+        self._content.setVisible(on)
+        self._render()
+
+
+class _HintListWidget(QListWidget):
+    """A list that shows centered placeholder text while it holds no items, so an
+    empty stack reads as "nothing here yet" rather than a blank box."""
+
+    def __init__(self, hint: str):
+        super().__init__()
+        self._hint = hint
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self.count() == 0:
+            painter = QPainter(self.viewport())
+            painter.setPen(QColor("#6a7280"))
+            painter.drawText(self.viewport().rect(),
+                             int(Qt.AlignmentFlag.AlignCenter), self._hint)
+            painter.end()
+
+
 class InspectorPanel(QWidget):
     effectAddRequested = Signal(str, dict, object)        # mode, params, region
     effectUpdateRequested = Signal(str, str, dict, object)  # op_id, mode, params, region
@@ -1433,10 +1493,10 @@ class InspectorPanel(QWidget):
     presetSaveRequested = Signal()                 # save the current stack
     presetApplyRequested = Signal(str)             # preset name
     presetDeleteRequested = Signal(str)            # preset name
-    pixelFxAddRequested = Signal(str)              # pixel mode name
+    pixelFxAddRequested = Signal(str, dict)        # pixel mode name, params
     pixelFxRemoveRequested = Signal(int)           # index in the clip's pixel list
     pixelFxParamsChanged = Signal(int, dict)       # index, params
-    rawFxAddRequested = Signal(str)                # raw (numpy) mode name
+    rawFxAddRequested = Signal(str, dict)          # raw (numpy) mode name, params
     rawFxRemoveRequested = Signal(int)             # index in the clip's raw list
     rawFxParamsChanged = Signal(int, dict)         # index, params
     maskChanged = Signal(str, object)              # kind ("layer"|"fx"), spec|None
@@ -1454,10 +1514,8 @@ class InspectorPanel(QWidget):
         self._effects: List[dict] = []
         self._selected_op: Optional[str] = None
         self._pixel_fx: List[dict] = []
-        self._pixel_getters: Dict[str, Callable] = {}
         self._pixel_sel = -1
         self._raw_fx: List[dict] = []
-        self._raw_getters: Dict[str, Callable] = {}
         self._raw_sel = -1
         self._mask_editors: Dict[str, dict] = {}
         self._beat_provider: Optional[Callable] = None    # clip_id -> [pos, ...]
@@ -1476,14 +1534,34 @@ class InspectorPanel(QWidget):
         outer.addStretch(1)
         layout = QVBoxLayout(self._body)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._build_clip_group())
-        layout.addWidget(self._build_pixel_group())
-        layout.addWidget(self._build_raw_group())
-        layout.addWidget(self._build_mask_group())
-        layout.addWidget(self._build_flow_group())
+        layout.setSpacing(0)
+        # Each group is collapsible so the inspector isn't a wall of controls;
+        # the primary stacks (Clip, Effects) start open, the rest folded away.
+        layout.addWidget(_CollapsibleSection(
+            "Clip", self._build_clip_group(), expanded=True))
+        layout.addWidget(_CollapsibleSection(
+            "Effects (top → bottom)", self._build_effects_group(), expanded=True))
+        layout.addWidget(_CollapsibleSection(
+            "Pixel FX", self._build_pixel_group(), expanded=False))
+        layout.addWidget(_CollapsibleSection(
+            "Raw FX (numpy)", self._build_raw_group(), expanded=False))
+        layout.addWidget(_CollapsibleSection(
+            "Masks", self._build_mask_group(), expanded=False))
+        layout.addWidget(_CollapsibleSection(
+            "Flow FX (motion warp)", self._build_flow_group(), expanded=False))
+        layout.addWidget(self._build_clip_actions())   # always-visible actions
+        layout.addStretch(1)
 
-        layout.addWidget(_heading("Effects (top → bottom)"))
-        self.effect_list = QListWidget()
+        self.set_enabled_for_clip(None, None)
+
+    def _build_effects_group(self) -> QWidget:
+        """The mosh effect stack (list + add/remove/reorder) and presets."""
+        group = QWidget()
+        v = QVBoxLayout(group)
+        v.setContentsMargins(0, 2, 0, 6)
+        v.setSpacing(3)
+
+        self.effect_list = _HintListWidget("No effects yet — use “+ Add ▾”")
         self.effect_list.setMaximumHeight(140)
         self.effect_list.setToolTip("This clip's effect stack, applied top to "
                                     "bottom. Double-click an effect to edit it; "
@@ -1491,7 +1569,7 @@ class InspectorPanel(QWidget):
         self.effect_list.currentRowChanged.connect(self._on_effect_row)
         self.effect_list.itemChanged.connect(self._on_effect_item_changed)
         self.effect_list.itemDoubleClicked.connect(self._edit_effect_item)
-        layout.addWidget(self.effect_list)
+        v.addWidget(self.effect_list)
 
         stack_btns = QHBoxLayout()
         self.add_btn = QPushButton("+ Add ▾")
@@ -1508,7 +1586,7 @@ class InspectorPanel(QWidget):
         self.down_btn.clicked.connect(lambda: self._emit_move(1))
         for b in (self.add_btn, self.remove_btn, self.up_btn, self.down_btn):
             stack_btns.addWidget(b)
-        layout.addLayout(stack_btns)
+        v.addLayout(stack_btns)
 
         preset_row = QHBoxLayout()
         self.preset_combo = QComboBox()
@@ -1528,14 +1606,20 @@ class InspectorPanel(QWidget):
         preset_row.addWidget(self.preset_save_btn)
         preset_row.addWidget(self.preset_apply_btn)
         preset_row.addWidget(self.preset_del_btn)
-        layout.addLayout(preset_row)
+        v.addLayout(preset_row)
+        return group
 
+    def _build_clip_actions(self) -> QWidget:
+        """Clip-level actions kept always visible below the collapsible groups."""
+        group = QWidget()
+        v = QVBoxLayout(group)
+        v.setContentsMargins(0, 6, 0, 0)
+        v.setSpacing(3)
         self.flow_btn = QPushButton("Optical-flow transfer…")
         self.flow_btn.setToolTip("Warp this clip's pixels by another clip's motion "
                                  "(appearance-free; GPU via OpenCV/OpenCL)")
         self.flow_btn.clicked.connect(lambda: self.flowTransferRequested.emit())
-        layout.addWidget(self.flow_btn)
-
+        v.addWidget(self.flow_btn)
         row = QHBoxLayout()
         self.bake_btn = QPushButton("Bake stack")
         self.bake_btn.clicked.connect(lambda: self.bakeRequested.emit())
@@ -1543,10 +1627,8 @@ class InspectorPanel(QWidget):
         self.revert_btn.clicked.connect(lambda: self.revertRequested.emit())
         row.addWidget(self.bake_btn)
         row.addWidget(self.revert_btn)
-        layout.addLayout(row)
-        layout.addStretch(1)
-
-        self.set_enabled_for_clip(None, None)
+        v.addLayout(row)
+        return group
 
     # -- clip finishing (speed / reverse / fades / crossfade) --------------- #
 
@@ -1638,40 +1720,28 @@ class InspectorPanel(QWidget):
     # -- pixel FX (clip finishing) ------------------------------------------ #
 
     def _build_pixel_group(self) -> QWidget:
-        from ..modes import available_pixel_modes
         group = QWidget()
         v = QVBoxLayout(group)
         v.setContentsMargins(0, 0, 0, 4)
         v.setSpacing(3)
-        v.addWidget(_heading("Pixel FX"))
 
-        add_row = QHBoxLayout()
-        self.pixel_add_combo = QComboBox()
-        self.pixel_add_combo.addItems(available_pixel_modes())
-        self.pixel_add_btn = QPushButton("+ Add")
-        self.pixel_add_btn.clicked.connect(self._emit_pixel_add)
-        add_row.addWidget(self.pixel_add_combo, 1)
-        add_row.addWidget(self.pixel_add_btn)
-        v.addLayout(add_row)
-
-        self.pixel_list = QListWidget()
+        self.pixel_list = _HintListWidget("No pixel FX")
         self.pixel_list.setMaximumHeight(72)
         self.pixel_list.setToolTip("Pixel filters, applied after the mosh stack "
-                                   "and the speed/fade finishing.")
+                                   "and the speed/fade finishing. Double-click to "
+                                   "edit one.")
         self.pixel_list.currentRowChanged.connect(self._on_pixel_row)
+        self.pixel_list.itemDoubleClicked.connect(self._edit_pixel_item)
         v.addWidget(self.pixel_list)
 
-        self._pixel_form_host = QWidget()
-        self._pixel_form = QFormLayout(self._pixel_form_host)
-        self._pixel_form.setContentsMargins(0, 2, 0, 2)
-        v.addWidget(self._pixel_form_host)
-
         btns = QHBoxLayout()
-        self.pixel_apply_btn = QPushButton("Apply pixel FX")
-        self.pixel_apply_btn.clicked.connect(self._emit_pixel_params)
+        self.pixel_add_btn = QPushButton("+ Add ▾")
+        self.pixel_add_btn.setToolTip("Add a pixel filter; its parameters open "
+                                      "in a pop-up.")
+        self.pixel_add_btn.clicked.connect(self._show_pixel_add_menu)
         self.pixel_remove_btn = QPushButton("− Remove")
         self.pixel_remove_btn.clicked.connect(self._emit_pixel_remove)
-        btns.addWidget(self.pixel_apply_btn)
+        btns.addWidget(self.pixel_add_btn)
         btns.addWidget(self.pixel_remove_btn)
         v.addLayout(btns)
         self._pixel_group = group
@@ -1688,123 +1758,87 @@ class InspectorPanel(QWidget):
         row = (prev if 0 <= prev < len(self._pixel_fx)
                else (len(self._pixel_fx) - 1 if self._pixel_fx else -1))
         if row >= 0:
-            self.pixel_list.setCurrentRow(row)    # -> _on_pixel_row builds the form
+            self.pixel_list.setCurrentRow(row)
         else:
             self._pixel_sel = -1
-            self._rebuild_pixel_params(None)
-            self._update_pixel_buttons()
+        self._update_pixel_buttons()
 
     def _on_pixel_row(self, row: int) -> None:
         if self._populating:
             return
-        if 0 <= row < len(self._pixel_fx):
-            self._pixel_sel = row
-            pe = self._pixel_fx[row]
-            self._rebuild_pixel_params(pe.get("name"), pe.get("params") or {})
-        else:
-            self._pixel_sel = -1
-            self._rebuild_pixel_params(None)
+        self._pixel_sel = row if 0 <= row < len(self._pixel_fx) else -1
         self._update_pixel_buttons()
-
-    def _rebuild_pixel_params(self, name, params=None) -> None:
-        while self._pixel_form.rowCount():
-            self._pixel_form.removeRow(0)
-        self._pixel_getters = {}
-        if not name:
-            return
-        from ..modes import get_pixel_mode
-        self._populating = True
-        for p in get_pixel_mode(name).params:
-            widget, getter = build_param_widget(p)
-            if p.help:
-                widget.setToolTip(p.help)
-            self._pixel_form.addRow(p.label or p.name, widget)
-            self._pixel_getters[p.name] = getter
-            if params and p.name in params:
-                _set_param_value(getattr(getter, "__self__", None), params[p.name])
-        self._populating = False
 
     def _update_pixel_buttons(self) -> None:
         has_sel = (self._clip_id is not None
                    and 0 <= self._pixel_sel < len(self._pixel_fx))
         self.pixel_remove_btn.setEnabled(has_sel)
-        self.pixel_apply_btn.setEnabled(has_sel)
 
-    def _emit_pixel_add(self) -> None:
-        name = self.pixel_add_combo.currentText()
-        if name and self._clip_id is not None:
-            self.pixelFxAddRequested.emit(name)
+    def _show_pixel_add_menu(self) -> None:
+        """Grouped '+ Add' menu of pixel filters; a pick opens its dialog."""
+        if self._clip_id is None:
+            return
+        menu = effect_add_menu(self, "pixel", self._add_pixel_fx)
+        menu.exec(self.pixel_add_btn.mapToGlobal(
+            self.pixel_add_btn.rect().bottomLeft()))
+
+    def _add_pixel_fx(self, name: str) -> None:
+        params = self._fx_dialog("pixel", name)
+        if params is not None:
+            self.pixelFxAddRequested.emit(name, params)
+
+    def _edit_pixel_item(self, item: QListWidgetItem) -> None:
+        row = self.pixel_list.row(item)
+        if 0 <= row < len(self._pixel_fx):
+            pe = self._pixel_fx[row]
+            params = self._fx_dialog("pixel", pe.get("name", ""),
+                                     pe.get("params") or {}, verb="Edit")
+            if params is not None:
+                self.pixelFxParamsChanged.emit(row, params)
 
     def _emit_pixel_remove(self) -> None:
         if 0 <= self._pixel_sel < len(self._pixel_fx):
             self.pixelFxRemoveRequested.emit(self._pixel_sel)
 
-    def _emit_pixel_params(self) -> None:
-        if not (0 <= self._pixel_sel < len(self._pixel_fx)):
-            return
-        params = {name: getter() for name, getter in self._pixel_getters.items()}
-        self.pixelFxParamsChanged.emit(self._pixel_sel, params)
+    def _fx_dialog(self, kind: str, name: str, params: Optional[dict] = None,
+                   *, verb: str = "Add") -> Optional[dict]:
+        """Open the shared param pop-up for a pixel/raw effect; return the chosen
+        params on accept, else None. Used by both Add and double-click Edit."""
+        dlg = EffectParamDialog(self, kind=kind, mode_name=name, params=params,
+                                verb=verb, beat_provider=self._beat_provider,
+                                clip_id=self._clip_id)
+        return dlg.result_params() if dlg.exec() else None
 
     # -- raw FX (numpy frame processors: pixel sort, ...) ------------------- #
 
     def _build_raw_group(self) -> QWidget:
-        from ..modes import available_raw_modes
         group = QWidget()
         v = QVBoxLayout(group)
         v.setContentsMargins(0, 0, 0, 4)
         v.setSpacing(3)
-        v.addWidget(_heading("Raw FX (numpy)"))
 
-        add_row = QHBoxLayout()
-        self.raw_add_combo = QComboBox()
-        self._populate_raw_combo()
-        self.raw_add_btn = QPushButton("+ Add")
-        self.raw_add_btn.clicked.connect(self._emit_raw_add)
-        add_row.addWidget(self.raw_add_combo, 1)
-        add_row.addWidget(self.raw_add_btn)
-        v.addLayout(add_row)
-
-        self.raw_list = QListWidget()
-        self.raw_list.setMaximumHeight(54)
+        self.raw_list = _HintListWidget("No raw FX")
+        self.raw_list.setMaximumHeight(72)
         self.raw_list.setToolTip("Per-pixel effects applied to decoded frames "
-                                 "(needs numpy); run before the FFmpeg pixel FX.")
+                                 "(needs numpy); run before the FFmpeg pixel FX. "
+                                 "Double-click to edit one.")
         self.raw_list.currentRowChanged.connect(self._on_raw_row)
+        self.raw_list.itemDoubleClicked.connect(self._edit_raw_item)
         v.addWidget(self.raw_list)
 
-        self._raw_form_host = QWidget()
-        self._raw_form = QFormLayout(self._raw_form_host)
-        self._raw_form.setContentsMargins(0, 2, 0, 2)
-        v.addWidget(self._raw_form_host)
-
         btns = QHBoxLayout()
-        self.raw_apply_btn = QPushButton("Apply raw FX")
-        self.raw_apply_btn.clicked.connect(self._emit_raw_params)
+        self.raw_add_btn = QPushButton("+ Add ▾")
+        self.raw_add_btn.setToolTip("Add a raw (numpy) effect, grouped by type "
+                                    "(incl. RAW DATA - AUDIO); parameters open in "
+                                    "a pop-up.")
+        self.raw_add_btn.clicked.connect(self._show_raw_add_menu)
         self.raw_remove_btn = QPushButton("− Remove")
         self.raw_remove_btn.clicked.connect(self._emit_raw_remove)
-        btns.addWidget(self.raw_apply_btn)
+        btns.addWidget(self.raw_add_btn)
         btns.addWidget(self.raw_remove_btn)
         v.addLayout(btns)
         self._raw_group = group
         return group
-
-    def _populate_raw_combo(self) -> None:
-        """Fill the raw-FX picker, grouped by category with non-selectable
-        headers (so e.g. the CDP 'RAW DATA - AUDIO' effects sit together)."""
-        from ..modes import available_raw_modes, get_raw_mode
-        by_cat: dict = {}
-        for name in available_raw_modes():
-            cat = getattr(get_raw_mode(name), "category", "Raw FX")
-            by_cat.setdefault(cat, []).append(name)
-        cats = sorted(by_cat, key=lambda c: (c != "Raw FX", c))
-        grouped = len(cats) > 1
-        for cat in cats:
-            if grouped:
-                self.raw_add_combo.addItem(f"— {cat} —")
-                item = self.raw_add_combo.model().item(self.raw_add_combo.count() - 1)
-                if item is not None:
-                    item.setEnabled(False)
-            for name in by_cat[cat]:
-                self.raw_add_combo.addItem(name)
 
     def set_clip_raw_fx(self, rfx: List[dict]) -> None:
         self._raw_fx = [dict(p) for p in (rfx or [])]
@@ -1820,60 +1854,44 @@ class InspectorPanel(QWidget):
             self.raw_list.setCurrentRow(row)
         else:
             self._raw_sel = -1
-            self._rebuild_raw_params(None)
-            self._update_raw_buttons()
+        self._update_raw_buttons()
 
     def _on_raw_row(self, row: int) -> None:
         if self._populating:
             return
-        if 0 <= row < len(self._raw_fx):
-            self._raw_sel = row
-            re = self._raw_fx[row]
-            self._rebuild_raw_params(re.get("name"), re.get("params") or {})
-        else:
-            self._raw_sel = -1
-            self._rebuild_raw_params(None)
+        self._raw_sel = row if 0 <= row < len(self._raw_fx) else -1
         self._update_raw_buttons()
-
-    def _rebuild_raw_params(self, name, params=None) -> None:
-        while self._raw_form.rowCount():
-            self._raw_form.removeRow(0)
-        self._raw_getters = {}
-        if not name:
-            return
-        from ..modes import get_raw_mode
-        self._populating = True
-        for p in get_raw_mode(name).params:
-            widget, getter = build_param_widget(p)
-            if p.help:
-                widget.setToolTip(p.help)
-            self._raw_form.addRow(p.label or p.name, widget)
-            self._raw_getters[p.name] = getter
-            if params and p.name in params:
-                _set_param_value(getattr(getter, "__self__", None), params[p.name])
-        self._populating = False
 
     def _update_raw_buttons(self) -> None:
         has_sel = (self._clip_id is not None
                    and 0 <= self._raw_sel < len(self._raw_fx))
         self.raw_remove_btn.setEnabled(has_sel)
-        self.raw_apply_btn.setEnabled(has_sel)
 
-    def _emit_raw_add(self) -> None:
-        from ..modes import available_raw_modes
-        name = self.raw_add_combo.currentText()
-        if name in available_raw_modes() and self._clip_id is not None:
-            self.rawFxAddRequested.emit(name)
+    def _show_raw_add_menu(self) -> None:
+        """Grouped '+ Add' menu of raw effects; a pick opens its dialog."""
+        if self._clip_id is None:
+            return
+        menu = effect_add_menu(self, "raw", self._add_raw_fx)
+        menu.exec(self.raw_add_btn.mapToGlobal(
+            self.raw_add_btn.rect().bottomLeft()))
+
+    def _add_raw_fx(self, name: str) -> None:
+        params = self._fx_dialog("raw", name)
+        if params is not None:
+            self.rawFxAddRequested.emit(name, params)
+
+    def _edit_raw_item(self, item: QListWidgetItem) -> None:
+        row = self.raw_list.row(item)
+        if 0 <= row < len(self._raw_fx):
+            re = self._raw_fx[row]
+            params = self._fx_dialog("raw", re.get("name", ""),
+                                     re.get("params") or {}, verb="Edit")
+            if params is not None:
+                self.rawFxParamsChanged.emit(row, params)
 
     def _emit_raw_remove(self) -> None:
         if 0 <= self._raw_sel < len(self._raw_fx):
             self.rawFxRemoveRequested.emit(self._raw_sel)
-
-    def _emit_raw_params(self) -> None:
-        if not (0 <= self._raw_sel < len(self._raw_fx)):
-            return
-        params = {name: getter() for name, getter in self._raw_getters.items()}
-        self.rawFxParamsChanged.emit(self._raw_sel, params)
 
     # -- masks (layer matte + FX matte, keyed by luma/alpha/motion) ---------- #
 
@@ -1882,7 +1900,6 @@ class InspectorPanel(QWidget):
         v = QVBoxLayout(group)
         v.setContentsMargins(0, 0, 0, 4)
         v.setSpacing(3)
-        v.addWidget(_heading("Masks"))
         self._mask_editors = {}
         for kind, label, tip in (
                 ("layer", "Layer matte",
@@ -2004,7 +2021,6 @@ class InspectorPanel(QWidget):
         v = QVBoxLayout(group)
         v.setContentsMargins(0, 0, 0, 4)
         v.setSpacing(3)
-        v.addWidget(_heading("Flow FX (motion warp)"))
 
         r1 = QHBoxLayout()
         self.flow_source = QComboBox()

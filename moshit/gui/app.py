@@ -16,8 +16,8 @@ from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
-    QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox,
-    QSplitter, QVBoxLayout, QWidget,
+    QLabel, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
 from ..engine import EngineConfig, _ext_for_profile
@@ -248,6 +248,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_toolbar()
+        self._build_status_widgets()
         self.statusBar().showMessage("Ready. Import a video to begin.")
         self._wire()
         self._build_shortcuts()
@@ -332,6 +333,21 @@ class MainWindow(QMainWindow):
 
         for act in (self.act_import, self.act_preview, self.act_auto, self.act_export):
             tb.addAction(act)
+
+    def _build_status_widgets(self) -> None:
+        """A busy progress bar + Cancel button, parked in the status bar."""
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)              # indeterminate busy animation
+        self.progress.setMaximumWidth(150)
+        self.progress.setTextVisible(False)
+        self.progress.setVisible(False)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setMaximumWidth(80)
+        self.cancel_btn.setToolTip("Stop the current render / export")
+        self.cancel_btn.clicked.connect(self._on_cancel)
+        self.cancel_btn.setVisible(False)
+        self.statusBar().addPermanentWidget(self.progress)
+        self.statusBar().addPermanentWidget(self.cancel_btn)
 
     def _build_sequence_bar(self) -> QWidget:
         """Sequence switcher + track/precompose actions, above the timeline."""
@@ -577,9 +593,9 @@ class MainWindow(QMainWindow):
         self.controller.delete_preset(name)
         self.inspector.set_presets(self.controller.preset_names())
 
-    def _on_pixel_add(self, name: str) -> None:
+    def _on_pixel_add(self, name: str, params: dict) -> None:
         if self._selected_clip:
-            self.controller.add_pixel_fx(self._selected_clip, name)
+            self.controller.add_pixel_fx(self._selected_clip, name, params)
             self._schedule_auto_refresh(immediate=True)
 
     def _on_pixel_remove(self, index: int) -> None:
@@ -592,9 +608,9 @@ class MainWindow(QMainWindow):
             self.controller.update_pixel_fx(self._selected_clip, index, params)
             self._schedule_auto_refresh(immediate=True)
 
-    def _on_raw_add(self, name: str) -> None:
+    def _on_raw_add(self, name: str, params: dict) -> None:
         if self._selected_clip:
-            self.controller.add_raw_fx(self._selected_clip, name)
+            self.controller.add_raw_fx(self._selected_clip, name, params)
             self._schedule_auto_refresh(immediate=True)
 
     def _on_raw_remove(self, index: int) -> None:
@@ -812,10 +828,16 @@ class MainWindow(QMainWindow):
         if path:
             self.controller.export(profile, path, audio)
 
+    def _on_cancel(self) -> None:
+        self.controller.cancel()
+        self.preview.cancel_stream()            # finalize any partial preview frames
+
     def _on_busy(self, busy: bool, message: str) -> None:
         for act in (self.act_import, self.act_preview, self.act_export):
             act.setEnabled(not busy)
         self.inspector.setEnabled(not busy)
+        self.progress.setVisible(busy)
+        self.cancel_btn.setVisible(busy)        # Cancel stays clickable while busy
         if busy and message:
             self.statusBar().showMessage(message)
         self.setCursor(Qt.CursorShape.BusyCursor if busy else Qt.CursorShape.ArrowCursor)

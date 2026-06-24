@@ -102,6 +102,8 @@ class AppController(QObject):
         self.decoder = PreviewDecoder(self.ff.ffmpeg)
         self.pool = QThreadPool.globalInstance()
         self._busy = False
+        self._job_gen = 0                      # bumped on cancel; stale results ignored
+        self._draining = False                 # a cancelled worker may still be running
         self._pending: Optional[Callable] = None
         self._active_worker = None             # keep the running QRunnable alive
         self._preview_muted = False            # build + play preview audio
@@ -122,7 +124,9 @@ class AppController(QObject):
 
     @property
     def is_busy(self) -> bool:
-        return self._busy
+        # Draining counts as busy: a cancelled worker may still mutate state, so
+        # callers (auto-refresh) must wait for it to finish before the next job.
+        return self._busy or self._draining
 
     def export_profiles(self) -> List[str]:
         return self.ff.capabilities().available_export_profiles()
@@ -182,31 +186,54 @@ class AppController(QObject):
     # -- off-thread dispatch ------------------------------------------------ #
 
     def _run(self, fn: Callable, on_done: Callable, message: str) -> None:
-        if self._busy:
-            self.error.emit("Still working on the previous task - please wait.")
+        if self.is_busy:
+            self.error.emit("Still working on the previous task - please wait."
+                            if self._busy else
+                            "Finishing the cancelled task - try again in a moment.")
             return
         self._busy = True
         self._pending = on_done
+        gen = self._job_gen
         self.busy.emit(True, message)
         worker = _Worker(fn)
-        worker.signals.finished.connect(self._on_finished)   # queued -> main thread
-        worker.signals.error.connect(self._on_error)
+        # gen is captured so a result that arrives after a cancel is dropped.
+        worker.signals.finished.connect(
+            lambda r, g=gen: self._on_finished(r, g))        # queued -> main thread
+        worker.signals.error.connect(lambda m, g=gen: self._on_error(m, g))
         # Retain a Python reference: QThreadPool owns the C++ runnable, but
         # without this the Python wrapper (and its signals) can be GC'd mid-run
         # -- corrupting long tasks like the flow transfer and losing the result.
         self._active_worker = worker
         self.pool.start(worker)
 
-    @Slot(object)
-    def _on_finished(self, result):
+    def cancel(self) -> None:
+        """Cancel the in-flight task: kill its ffmpeg subprocesses and drop its
+        result (callbacks tagged with the old generation are ignored)."""
+        if not self._busy:
+            return
+        self._job_gen += 1
+        self._busy = False
+        self._draining = True                  # block new jobs until the worker drains
+        self._pending = None
+        self.ff.terminate_active()
+        self.decoder.terminate()
+        self.busy.emit(False, "")
+        self.status.emit("Cancelled.")
+
+    def _on_finished(self, result, gen):
+        if gen != self._job_gen:               # superseded by a cancel
+            self._draining = False             # the cancelled worker has now drained
+            return
         self._busy = False
         self.busy.emit(False, "")
         cb, self._pending = self._pending, None
         if cb:
             cb(result)
 
-    @Slot(str)
-    def _on_error(self, message: str):
+    def _on_error(self, message: str, gen=None):
+        if gen is not None and gen != self._job_gen:    # cancelled job's failure
+            self._draining = False
+            return
         self._busy = False
         self._pending = None
         self.busy.emit(False, "")
@@ -245,7 +272,7 @@ class AppController(QObject):
         self._run(work, done, f"Generating {label} motion source…")
 
     def refresh_preview(self) -> None:
-        if self._busy:
+        if self.is_busy:                       # also waits out a draining cancel
             return
         seq_id = self.current_seq_id
         if not any(self.project.clips_for_track(t.id)
@@ -253,6 +280,7 @@ class AppController(QObject):
             self.error.emit("Add a clip to a video track first.")
             return
         self._busy = True
+        gen = self._job_gen
         self.busy.emit(True, "Rendering preview…")
         out = self._dir / "preview.avi"
 
@@ -262,10 +290,11 @@ class AppController(QObject):
             self._preview_audio = self._build_preview_audio(r.get("audio_plans"))
 
         worker = _StreamWorker(work)
-        worker.signals.begin.connect(self._on_preview_begin)   # queued -> main
-        worker.signals.batch.connect(self._on_preview_batch)
-        worker.signals.done.connect(self._on_preview_done)
-        worker.signals.error.connect(self._on_error)
+        worker.signals.begin.connect(                          # queued -> main
+            lambda t, f, g=gen: self._on_preview_begin(t, f, g))
+        worker.signals.batch.connect(lambda fr, g=gen: self._on_preview_batch(fr, g))
+        worker.signals.done.connect(lambda g=gen: self._on_preview_done(g))
+        worker.signals.error.connect(lambda m, g=gen: self._on_error(m, g))
         self._active_worker = worker           # retain (see _run)
         self.pool.start(worker)
 
@@ -310,16 +339,20 @@ class AppController(QObject):
         return [(t - start_s) / dur_s for t in beats.onsets(wav)
                 if start_s <= t < start_s + dur_s]
 
-    @Slot(int, float)
-    def _on_preview_begin(self, total: int, fps: float):
+    def _on_preview_begin(self, total: int, fps: float, gen):
+        if gen != self._job_gen:               # cancelled before it started
+            return
         self.preview_begin.emit(total, fps)
 
-    @Slot(list)
-    def _on_preview_batch(self, frames: list):
+    def _on_preview_batch(self, frames: list, gen):
+        if gen != self._job_gen:               # stale frames from a cancelled render
+            return
         self.preview_batch.emit(frames)
 
-    @Slot()
-    def _on_preview_done(self):
+    def _on_preview_done(self, gen):
+        if gen != self._job_gen:               # superseded by a cancel
+            self._draining = False             # the cancelled render has drained
+            return
         self._busy = False
         self.busy.emit(False, "")
         self.preview_done.emit()
@@ -580,7 +613,7 @@ class AppController(QObject):
         except KeyError:
             return []
 
-    def add_pixel_fx(self, clip_id: str, name: str):
+    def add_pixel_fx(self, clip_id: str, name: str, params: Optional[dict] = None):
         from ..modes import get_pixel_mode
         try:
             c = self.project.clip(clip_id)
@@ -588,7 +621,8 @@ class AppController(QObject):
         except KeyError:
             return None
         self._push_undo()
-        c.pixel_effects.append({"name": name, "params": mode.defaults()})
+        c.pixel_effects.append({"name": name,
+                                "params": dict(params) if params else mode.defaults()})
         self.project_changed.emit()
         self.status.emit(f"Added pixel FX: {name}")
         return c
@@ -626,7 +660,7 @@ class AppController(QObject):
         except KeyError:
             return []
 
-    def add_raw_fx(self, clip_id: str, name: str):
+    def add_raw_fx(self, clip_id: str, name: str, params: Optional[dict] = None):
         from ..modes import get_raw_mode
         try:
             c = self.project.clip(clip_id)
@@ -634,7 +668,8 @@ class AppController(QObject):
         except KeyError:
             return None
         self._push_undo()
-        c.raw_effects.append({"name": name, "params": mode.defaults()})
+        c.raw_effects.append({"name": name,
+                              "params": dict(params) if params else mode.defaults()})
         self.project_changed.emit()
         self.status.emit(f"Added raw FX: {name}")
         return c

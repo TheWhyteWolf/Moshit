@@ -20,6 +20,16 @@ from ..avi import parse_avi
 class PreviewDecoder:
     def __init__(self, ffmpeg_bin: str = "ffmpeg"):
         self.ffmpeg = ffmpeg_bin
+        self._proc: "subprocess.Popen | None" = None     # active decode, for cancel
+
+    def terminate(self) -> None:
+        """Kill the in-flight decode pipe (used to cancel a preview render)."""
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _dims(self, avi_path, max_width: int):
         info = parse_avi(avi_path)
@@ -71,6 +81,7 @@ class PreviewDecoder:
              "-i", str(avi_path), "-vf", f"scale={w}:{h}",
              "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self._proc = proc
         try:
             buf = b""
             pending: List[QImage] = []
@@ -94,3 +105,4 @@ class PreviewDecoder:
             if proc.stdout:
                 proc.stdout.close()
             proc.wait()
+            self._proc = None

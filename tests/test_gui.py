@@ -180,6 +180,14 @@ def test_effect_stack_region_and_pixel_fx(win):
     assert ctl.project.clip("c").has_finish()
 
 
+def test_add_pixel_fx_with_params(ctl):
+    _seed_clip(ctl, "c")
+    ctl.add_pixel_fx("c", "rgb_shift", {"shift": 7})    # params carried from the pop-up
+    assert ctl.clip_pixel_fx("c")[0]["params"]["shift"] == 7
+    ctl.add_raw_fx("c", "pixel_sort")                   # no params -> mode defaults
+    assert ctl.clip_raw_fx("c")[0]["params"]            # non-empty defaults
+
+
 def test_raw_fx_add_update_remove_and_undo(ctl):
     _seed_clip(ctl, "c")
     ctl.add_raw_fx("c", "pixel_sort")
@@ -193,18 +201,71 @@ def test_raw_fx_add_update_remove_and_undo(ctl):
     assert ctl.clip_raw_fx("c") == []
 
 
+def test_inspector_pixel_panel_round_trips(qapp):
+    from moshit.gui.widgets import InspectorPanel
+    insp = InspectorPanel()
+    added, params = [], []
+    insp.pixelFxAddRequested.connect(lambda n, p: added.append((n, p)))
+    insp.pixelFxParamsChanged.connect(lambda i, p: params.append((i, p)))
+    insp._clip_id = "c"
+    insp._fx_dialog = lambda *a, **k: {"shift": 7}      # stub the modal pop-up
+    insp._add_pixel_fx("rgb_shift")
+    assert added == [("rgb_shift", {"shift": 7})]
+    insp.set_clip_pixel_fx([{"name": "rgb_shift", "params": {"shift": 1}}])
+    assert insp.pixel_list.count() == 1
+    insp._edit_pixel_item(insp.pixel_list.item(0))      # double-click edit flow
+    assert params and params[-1] == (0, {"shift": 7})
+
+
+def test_cancel_drops_stale_result_and_is_idle_safe(ctl):
+    # a cancel supersedes the running job: its late finished callback is dropped
+    called = []
+    ctl._busy = True
+    ctl._pending = lambda r: called.append(r)
+    gen = ctl._job_gen
+    ctl.cancel()
+    assert not ctl._busy and ctl._job_gen != gen        # active flag cleared at once
+    ctl._on_finished("late", gen)                       # stale generation -> ignored
+    assert called == [] and not ctl.is_busy             # ...and the worker has drained
+    # a fresh job still delivers its result
+    ctl._busy = True
+    ctl._pending = lambda r: called.append(r)
+    ctl._on_finished("ok", ctl._job_gen)
+    assert called == ["ok"]
+    # cancelling while idle is a harmless no-op
+    ctl.cancel()
+    assert not ctl.is_busy
+
+
+def test_cancel_serializes_until_worker_drains(ctl):
+    # a cancelled (still-running) worker blocks a new job until it reports back,
+    # so its in-thread state mutation can't race a fresh job
+    ctl._busy = True
+    gen = ctl._job_gen
+    ctl.cancel()
+    assert ctl._draining and ctl.is_busy        # draining counts as busy
+    errs = []
+    ctl.error.connect(errs.append)
+    ctl._run(lambda: None, lambda r: None, "new job")
+    assert errs and "moment" in errs[-1].lower()    # refused while draining
+    ctl._on_finished("late", gen)                   # the zombie drains
+    assert not ctl._draining and not ctl.is_busy
+
+
 def test_inspector_raw_panel_round_trips(qapp):
     from moshit.gui.widgets import InspectorPanel
     insp = InspectorPanel()
     added, params = [], []
-    insp.rawFxAddRequested.connect(added.append)
+    insp.rawFxAddRequested.connect(lambda n, p: added.append((n, p)))
     insp.rawFxParamsChanged.connect(lambda i, p: params.append((i, p)))
     insp._clip_id = "c"
-    insp.set_clip_raw_fx([{"name": "pixel_sort",
-                           "params": {"axis": "vertical", "lo": 0.2, "hi": 0.8,
-                                      "by": "brightness", "order": "ascending"}}])
+    # stub the param pop-up so the test doesn't open a modal dialog
+    insp._fx_dialog = lambda *a, **k: {"axis": "vertical", "lo": 0.2, "hi": 0.8}
+    insp._add_raw_fx("pixel_sort")                      # the "+ Add" flow
+    assert added == [("pixel_sort", {"axis": "vertical", "lo": 0.2, "hi": 0.8})]
+    insp.set_clip_raw_fx([{"name": "pixel_sort", "params": {"axis": "horizontal"}}])
     assert insp.raw_list.count() == 1
-    insp._emit_raw_params()                             # reads the built controls
+    insp._edit_raw_item(insp.raw_list.item(0))          # double-click edit flow
     assert params and params[-1][0] == 0
     assert params[-1][1]["axis"] == "vertical"
 
@@ -299,15 +360,16 @@ def test_beat_positions_clip_to_span(win, monkeypatch):
 
 
 def test_inspector_beat_fill(win):
-    insp = win.inspector
-    from moshit.gui.widgets import AutoParamWidget
-    insp.set_beat_provider(lambda cid: [0.25, 0.5, 0.75])
-    insp._clip_id = "c"
-    insp.mode_combo.setCurrentText("pframe_duplicate")
-    w = insp._param_widgets["factor"]
+    # beats fill an automatable param inside the per-effect pop-up dialog
+    from moshit.gui.widgets import AutoParamWidget, EffectParamDialog
+    dlg = EffectParamDialog(win.inspector, kind="mosh",
+                            mode_name="pframe_duplicate",
+                            beat_provider=lambda cid: [0.25, 0.5, 0.75],
+                            clip_id="c")
+    w = dlg._param_widgets["factor"]
     assert isinstance(w, AutoParamWidget)
-    insp._fill_beats(w)
-    val = insp._getters["factor"]()
+    dlg._fill_beats(w)
+    val = dlg._getters["factor"]()
     assert isinstance(val, dict) and val["__auto__"] and val["interp"] == "hold"
     assert len([k for k in val["keys"] if len(k) >= 2]) >= 3   # a pulse per beat
 
@@ -394,24 +456,24 @@ def test_presets_save_and_apply(win):
 
 
 def test_inspector_automation_control(win):
-    from moshit.gui.widgets import AutoParamWidget, KeyframeDialog
-    insp = win.inspector
-    insp.mode_combo.setCurrentText("pframe_duplicate")
-    w = insp._param_widgets["factor"]
+    from moshit.gui.widgets import AutoParamWidget, KeyframeDialog, EffectParamDialog
+    dlg = EffectParamDialog(win.inspector, kind="mosh",
+                            mode_name="pframe_duplicate")
+    w = dlg._param_widgets["factor"]
     assert isinstance(w, AutoParamWidget)
     # enable automation -> a 2-point ramp from the current value
     w.value.setValue(2)
     w.auto_chk.setChecked(True)
-    value = insp._getters["factor"]()
+    value = dlg._getters["factor"]()
     assert isinstance(value, dict) and value["__auto__"] and len(value["keys"]) == 2
 
     # the keyframe dialog round-trips a multi-point curve with easing
     from moshit.modes.base import get_mode
     factor = next(p for p in get_mode("pframe_duplicate").params if p.name == "factor")
-    dlg = KeyframeDialog(None, factor,
-                         {"__auto__": True, "interp": "smooth",
-                          "keys": [[0.0, 1], [0.5, 4], [1.0, 2]]})
-    spec = dlg.values()
+    kdlg = KeyframeDialog(win.inspector, factor,
+                          {"__auto__": True, "interp": "smooth",
+                           "keys": [[0.0, 1], [0.5, 4], [1.0, 2]]})
+    spec = kdlg.values()
     assert spec["interp"] == "smooth" and len(spec["keys"]) == 3
     w.set_value(spec)
     out = w.get_value()

@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -181,16 +182,37 @@ class FFmpeg:
             )
         self._caps: Optional[Capabilities] = None
         self._audio_cache: Dict[str, bool] = {}
+        # Running ffmpeg subprocesses, so a long render/export can be cancelled.
+        self._active_procs: set = set()
+        self._proc_lock = threading.Lock()
 
     # -- process helpers ---------------------------------------------------- #
 
     def _run(self, args: List[str], desc: str) -> str:
-        proc = subprocess.run([self.ffmpeg, "-hide_banner", *args],
-                              capture_output=True, text=True)
+        proc = subprocess.Popen([self.ffmpeg, "-hide_banner", *args],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
+        with self._proc_lock:
+            self._active_procs.add(proc)
+        try:
+            _out, err = proc.communicate()
+        finally:
+            with self._proc_lock:
+                self._active_procs.discard(proc)
         if proc.returncode != 0:
-            tail = "\n".join(proc.stderr.strip().splitlines()[-12:])
+            tail = "\n".join((err or "").strip().splitlines()[-12:])
             raise FFmpegError(f"{desc} failed (exit {proc.returncode}):\n{tail}")
-        return proc.stderr
+        return err
+
+    def terminate_active(self) -> None:
+        """Kill any in-flight ffmpeg subprocess (used to cancel a render/export)."""
+        with self._proc_lock:
+            procs = list(self._active_procs)
+        for proc in procs:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     # detailed, time-static texture so the encoder sees only the transform's
     # motion (a flat source would yield no motion vectors to transfer)
