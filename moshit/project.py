@@ -98,7 +98,7 @@ class Clip:
     raw_effects: List = field(default_factory=list)     # [{name, params}] numpy FX
     flow_transfer: Optional[Dict] = None   # live optical-flow warp (see render)
     layer_mask: Optional[Dict] = None      # compositing matte (luma/alpha/motion)
-    fx_mask: Optional[Dict] = None         # matte gating this clip's pixel FX
+    fx_mask: Optional[Dict] = None         # matte gating this clip's pixel + raw FX
 
     def has_finish(self) -> bool:
         """True if this clip needs the pixel-domain finish pass."""
@@ -316,12 +316,14 @@ class Project:
 
     def _apply_raw(self, engine: MoshEngine, clip: Clip, seg):
         """Run a clip's raw effects on segment AVI *seg*, returning the (possibly
-        new) segment path; consumes *seg* when it produces a replacement."""
+        new) segment path; consumes *seg* when it produces a replacement. A clip's
+        ``fx_mask`` gates the raw effects too (same matte as its pixel FX)."""
         from .modes import raw as _raw
         specs = self._raw_specs(clip)
         if not specs or not _raw.available():
             return seg
-        out = engine.apply_raw_effects(seg, specs, engine._tmp(".avi"))
+        out = engine.apply_raw_effects(seg, specs, engine._tmp(".avi"),
+                                       mask=clip.fx_mask)
         if str(out) != str(seg):
             try:
                 Path(seg).unlink()

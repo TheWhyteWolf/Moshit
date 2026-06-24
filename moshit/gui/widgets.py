@@ -1665,7 +1665,8 @@ class InspectorPanel(QWidget):
                  "Show this clip through a matte when compositing "
                  "(reveals the track below where the matte is dark)."),
                 ("fx", "FX matte",
-                 "Apply this clip's pixel FX only where the matte is bright.")):
+                 "Apply this clip's pixel + raw FX only where the matte is "
+                 "bright.")):
             self._mask_editors[kind] = self._build_mask_editor(v, kind, label, tip)
         self._mask_group = group
         return group

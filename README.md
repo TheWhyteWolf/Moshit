@@ -206,9 +206,10 @@ per frame), so it's cheap despite working per-pixel.
 threshold band, `invert`, and `feather`. A **layer matte** modulates the clip's
 compositing alpha, so it shows through only where the matte is bright (a luma
 matte keys out darks; a motion matte reveals only moving areas — the track below
-fills the rest). An **FX matte** instead gates the clip's pixel FX, applying them
-*only* in the matte's bright regions (e.g. glitch just the motion, or just the
-highlights) while the rest of the frame passes through clean. Both live in the
+fills the rest). An **FX matte** instead gates the clip's effects — both the
+FFmpeg pixel FX *and* the numpy raw FX (e.g. pixel sort) — applying them *only*
+in the matte's bright regions (glitch just the motion, or just the highlights)
+while the rest of the frame passes through clean. Both live in the
 inspector's **Masks** panel; a layer matte on a lone track composites it over
 black. (Alpha-keyed mattes are a no-op on the alpha-less MPEG-4 intermediates
 today, but the source is wired for when transparency-carrying layers land.)

@@ -863,6 +863,14 @@ def cmd_selftest(args) -> int:
         bg = list(_np.frombuffer(band, _np.uint8).reshape(1, 6, 3)[0, :, 0])
         _check(bg[3] == 255 and bg[4] == 10,
                "out-of-band pixels stay anchored (contiguous-span sort)", failures)
+        from .modes.raw import blend_masked
+        orig = _np.full((4, 4, 3), 10, _np.uint8).tobytes()
+        proc = _np.full((4, 4, 3), 200, _np.uint8).tobytes()
+        wht = blend_masked([orig], [proc], 4, 4, {"source": "luma", "lo": 0.0, "hi": 0.0})
+        blk = blend_masked([orig], [proc], 4, 4, {"source": "luma", "lo": 1.0, "hi": 1.0})
+        _check(_np.frombuffer(wht[0], _np.uint8)[0] > 190
+               and _np.frombuffer(blk[0], _np.uint8)[0] < 20,
+               "an fx_mask gates raw effects (white=FX, black=original)", failures)
     else:
         print("  [skip] numpy not installed; pixel_sort math not exercised")
 

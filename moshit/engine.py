@@ -192,13 +192,15 @@ class MoshEngine:
                                       fps=self.config.fps,
                                       qscale=self.config.qscale, gop=self.config.gop)
 
-    def apply_raw_effects(self, src_avi, specs, out_avi) -> Path:
+    def apply_raw_effects(self, src_avi, specs, out_avi, *, mask=None) -> Path:
         """Run numpy raw-frame effects over *src_avi* into a fresh moshable AVI.
 
         *specs* is an ordered list of ``{"name", "params"}``; each decoded RGB
         frame stack is passed through the named :class:`RawMode` in turn, then
-        re-encoded. Geometry/length are preserved. Needs numpy (the ``flow``
-        extra); returns *src_avi* unchanged if it (or every spec) is unavailable.
+        re-encoded. Geometry/length are preserved. With a *mask* spec, the result
+        is blended back over the originals through that matte (the FX show only
+        where the matte is bright). Needs numpy (the ``flow`` extra); returns
+        *src_avi* unchanged if it (or every spec) is unavailable.
         """
         from .modes import raw as _raw, get_raw_mode
         if not _raw.available():
@@ -207,12 +209,15 @@ class MoshEngine:
         if not usable:
             return Path(src_avi)
         w, h = self.config.width, self.config.height
-        frames = list(self.ff.decode_rgb_raw(src_avi, w, h))
+        original = list(self.ff.decode_rgb_raw(src_avi, w, h))
+        frames = original
         for spec in usable:
             mode = get_raw_mode(spec["name"])
             params = mode.resolve(spec.get("params") or {})
             frames = mode.apply(frames, width=w, height=h,
                                 fps=self.config.fps, **params)
+        if mask:
+            frames = _raw.blend_masked(original, frames, w, h, mask)
         return self.ff.encode_rgb_raw(frames, out_avi, width=w, height=h,
                                       fps=self.config.fps,
                                       qscale=self.config.qscale, gop=self.config.gop)

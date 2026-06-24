@@ -108,6 +108,84 @@ def _hue(arr):
 _KEYS = {"brightness": _luma, "saturation": _saturation, "hue": _hue}
 
 
+# --------------------------------------------------------------------------- #
+# Matte (numpy mirror of ffmpeg.mask_chain, so an fx_mask gates raw effects too)
+# --------------------------------------------------------------------------- #
+
+def _box_blur(m, radius: int):
+    """Separable moving-average blur (edge-padded) -- a numpy stand-in for the
+    matte's ``gblur`` feather, no scipy needed."""
+    import numpy as np
+    r = int(radius)
+    if r <= 0:
+        return m
+    k = 2 * r + 1
+
+    def blur1d(a):
+        pad = np.pad(a, ((r, r), (0, 0)), mode="edge")
+        cs = np.cumsum(pad, axis=0)
+        cs = np.concatenate([np.zeros((1,) + a.shape[1:], cs.dtype), cs], axis=0)
+        return (cs[k:] - cs[:-k]) / k
+
+    m = blur1d(m)                              # rows
+    m = blur1d(m.T).T                          # cols
+    return m
+
+
+def mask_frames(frames, width: int, height: int, spec: Dict):
+    """Per-frame grayscale mattes (float32, 0..1) for *frames* per *spec*.
+
+    Mirrors :func:`moshit.ffmpeg.mask_chain`: ``source`` luma / alpha / motion,
+    a soft ``lo``/``hi`` ramp, ``invert`` and ``feather``. RGB frames carry no
+    alpha, so an ``alpha`` matte is fully opaque (1.0) here too."""
+    import numpy as np
+    H, W = int(height), int(width)
+    source = str(spec.get("source", "luma"))
+    lo = max(0.0, min(1.0, float(spec.get("lo", 0.0))))
+    hi = max(0.0, min(1.0, float(spec.get("hi", 1.0))))
+    invert = bool(spec.get("invert", False))
+    feather = max(0, int(spec.get("feather", 0)))
+    span = max(1e-6, hi - lo)
+    arrs = [np.frombuffer(f, np.uint8).reshape(H, W, 3).astype(np.float32) / 255.0
+            for f in frames]
+    out = []
+    for i, arr in enumerate(arrs):
+        if source == "alpha":
+            base = np.ones((H, W), np.float32)
+        elif source == "motion":
+            if len(arrs) < 2:
+                base = np.zeros((H, W), np.float32)
+            else:
+                ref = arrs[i - 1] if i > 0 else arrs[1]
+                base = np.abs(arr - ref).mean(2)
+        else:
+            base = _luma(arr)
+        m = np.clip((base - lo) / span, 0.0, 1.0)
+        if invert:
+            m = 1.0 - m
+        if feather > 0:
+            m = _box_blur(m, feather)
+        out.append(m.astype(np.float32))
+    return out
+
+
+def blend_masked(original, processed, width: int, height: int, spec: Dict):
+    """Blend *processed* over *original* per :func:`mask_frames` -- the raw-FX
+    matte (effect shows where the matte is bright, original passes elsewhere)."""
+    import numpy as np
+    H, W = int(height), int(width)
+    masks = mask_frames(original, width, height, spec)
+    out = []
+    for ob, pb, m in zip(original, processed, masks):
+        o = np.frombuffer(ob, np.uint8).reshape(H, W, 3).astype(np.float32)
+        p = np.frombuffer(pb, np.uint8).reshape(H, W, 3).astype(np.float32)
+        m3 = m[..., None]
+        blended = o * (1.0 - m3) + p * m3
+        out.append(np.ascontiguousarray(
+            np.clip(blended, 0, 255).astype(np.uint8)).tobytes())
+    return out
+
+
 def _sort_frame(buf: bytes, width: int, height: int, *, vertical: bool,
                 by: str, lo: float, hi: float, descending: bool) -> bytes:
     """Sort contiguous threshold-banded spans of each line (row, or column when

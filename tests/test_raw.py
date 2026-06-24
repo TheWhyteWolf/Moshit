@@ -64,6 +64,44 @@ def test_vertical_sorts_within_columns():
 
 
 @requires_numpy
+def test_mask_frames_luma_band():
+    import numpy as np
+    from moshit.modes.raw import mask_frames
+    # a left-dark / right-bright frame; a luma matte should pass only the bright half
+    img = np.zeros((4, 4, 3), np.uint8)
+    img[:, 2:, :] = 255
+    masks = mask_frames([img.tobytes()], 4, 4, {"source": "luma", "lo": 0.4, "hi": 0.6})
+    m = masks[0]
+    assert m[0, 0] < 0.1 and m[0, 3] > 0.9
+
+
+@requires_numpy
+def test_mask_frames_motion_and_alpha():
+    import numpy as np
+    from moshit.modes.raw import mask_frames
+    a = np.zeros((4, 4, 3), np.uint8)
+    b = np.full((4, 4, 3), 255, np.uint8)
+    motion = mask_frames([a.tobytes(), b.tobytes()], 4, 4,
+                         {"source": "motion", "lo": 0.05, "hi": 0.5})
+    assert motion[1].mean() > 0.9                    # frame differs strongly -> hot
+    # alpha on RGB frames is fully opaque (1.0 everywhere)
+    alpha = mask_frames([a.tobytes()], 4, 4, {"source": "alpha"})
+    assert float(alpha[0].min()) == 1.0
+
+
+@requires_numpy
+def test_blend_masked_white_and_black():
+    import numpy as np
+    from moshit.modes.raw import blend_masked
+    orig = np.full((4, 4, 3), 10, np.uint8).tobytes()
+    proc = np.full((4, 4, 3), 200, np.uint8).tobytes()
+    white = blend_masked([orig], [proc], 4, 4, {"source": "luma", "lo": 0.0, "hi": 0.0})
+    black = blend_masked([orig], [proc], 4, 4, {"source": "luma", "lo": 1.0, "hi": 1.0})
+    assert np.frombuffer(white[0], np.uint8)[0] > 190    # ~processed
+    assert np.frombuffer(black[0], np.uint8)[0] < 20      # ~original
+
+
+@requires_numpy
 def test_sort_preserves_geometry_and_is_a_permutation():
     import numpy as np
     from moshit.modes.raw import _sort_frame
@@ -111,6 +149,43 @@ def test_pixel_sort_changes_pixels(engine, project, make_clip, tmp_path, probe):
     sorted_out = tmp_path / "sorted.avi"
     project.render(engine, sorted_out)
     assert (probe.pixel(plain, 10, 80, 60) != probe.pixel(sorted_out, 10, 80, 60))
+
+
+@requires_ffmpeg
+@requires_numpy
+def test_pixel_sort_fx_matte_gates_the_sort(engine, project, make_clip, tmp_path,
+                                            probe):
+    # an fx_mask gates the raw sort too: black matte -> no sort, white -> full
+    import moshit.project as P
+
+    def render(mask, name, sort=True):
+        proj = P.Project(name=name, config=engine.config,
+                         assets_dir=str(tmp_path / ("a" + name)))
+        m = proj.import_media(engine, make_clip("s.mp4"), role="main")
+        c = proj.add_clip(m.id, "main")
+        if sort:
+            c.raw_effects = [{"name": "pixel_sort",
+                              "params": {"axis": "vertical", "lo": 0.0, "hi": 1.0}}]
+        c.fx_mask = mask
+        out = tmp_path / (name + ".avi")
+        proj.render(engine, out)
+        return out
+
+    def sample(p):
+        return [probe.pixel(p, 12, x, y) for x in (40, 120) for y in (30, 90)]
+
+    plain = render(None, "plain", sort=False)
+    full = render(None, "full")
+    black = render({"source": "luma", "lo": 1.0, "hi": 1.0}, "black")
+    white = render({"source": "luma", "lo": 0.0, "hi": 0.0}, "white")
+
+    def close(a, b):
+        return all(max(abs(p - q) for p, q in zip(pa, pb)) < 24
+                   for pa, pb in zip(sample(a), sample(b)))
+
+    assert close(black, plain)                       # masked out -> untouched
+    assert close(white, full)                        # masked in -> fully sorted
+    assert not close(full, plain)                    # the sort really changes pixels
 
 
 @requires_ffmpeg
