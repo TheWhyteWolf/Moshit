@@ -49,8 +49,19 @@ def ffmpeg_color(value) -> str:
     return v
 
 
-def mask_chain(spec: Dict) -> str:
+# Source pixel formats that carry an alpha channel (for source-file alpha mattes).
+ALPHA_PIX_FMTS = {
+    "rgba", "argb", "abgr", "bgra", "ya8", "ya16le", "ya16be", "pal8",
+    "yuva420p", "yuva422p", "yuva444p", "yuva420p10le", "yuva444p10le",
+    "gbrap", "gbrap10le", "gbrap12le", "rgba64le", "rgba64be",
+}
+
+
+def mask_chain(spec: Dict, *, gray_input: bool = False) -> str:
     """FFmpeg filter string turning a video into a grayscale matte per *spec*.
+
+    With *gray_input* the source is taken to be an already-extracted grayscale
+    matte (e.g. a source-file alpha map), so only the ramp/invert/feather apply.
 
     *spec* is ``{source, lo, hi, invert, feather, key}``: ``source`` is ``luma``
     (brightness), ``alpha`` (transparency -- opaque where the source has none),
@@ -65,7 +76,12 @@ def mask_chain(spec: Dict) -> str:
     hi = max(0.0, min(1.0, float(spec.get("hi", 1.0))))
     invert = bool(spec.get("invert", False))
     feather = max(0, int(spec.get("feather", 0)))
-    if source == "chroma":
+    if gray_input:                                    # already a gray matte
+        chain = ["format=gray"]
+        lo255 = lo * 255.0
+        span = max(1.0, (hi - lo) * 255.0)
+        chain.append(f"lutyuv=y='clip((val-{lo255:.3f})/{span:.3f}*255,0,255)'")
+    elif source == "chroma":
         key = ffmpeg_color(spec.get("key", "#00ff00"))
         sim = max(0.01, lo if lo > 0 else 0.3)
         blend = max(0.0, hi - lo)
@@ -313,6 +329,31 @@ class FFmpeg:
         self._audio_cache[key] = ok
         return ok
 
+    def has_alpha(self, path) -> bool:
+        """True if *path*'s video stream carries an alpha channel."""
+        if not (shutil.which(self.ffprobe) or Path(self.ffprobe).exists()):
+            return False
+        proc = subprocess.run(
+            [self.ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True)
+        return proc.returncode == 0 and proc.stdout.strip() in ALPHA_PIX_FMTS
+
+    def extract_alpha(self, src, dst, *, width: int, height: int, fps: float,
+                      gop: int, qscale: int = 3, keep_aspect: bool = True) -> Path:
+        """Render *src*'s alpha channel as a grayscale moshable AVI, frame-aligned
+        with :meth:`normalize` (same scale/pad/fps) so it can matte the clip."""
+        geom = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:-1:-1:color=black,setsar=1"
+                if keep_aspect else f"scale={width}:{height},setsar=1")
+        vf = f"alphaextract,{geom},fps={fps},format=gray"
+        self._run(
+            ["-y", "-i", str(src), "-an", "-sn", "-map", "0:v:0", "-vf", vf,
+             "-c:v", "mpeg4", "-q:v", str(qscale), "-bf", "0",
+             "-g", str(max(1, gop)), "-pix_fmt", "yuv420p", str(dst)],
+            f"extract alpha {Path(src).name}")
+        return Path(dst)
+
     # -- audio assembly (for clean-edit passthrough) ------------------------ #
 
     def build_audio_track(self, plan: List[Dict], dst, *, fps: float = 30.0
@@ -559,6 +600,15 @@ class FFmpeg:
         base = (f"color=c=black:s={w}x{h}:r={fps:g}:d={dur:.6f},"
                 f"format=yuv420p,settb=1/{tb}")
         parts: List[str] = [f"{base}[acc0]"]
+        # external alpha-map mattes become extra inputs after the layer inputs
+        mask_inputs: List[str] = []
+        mi_index: List[Optional[int]] = []
+        for lay in layers:
+            if lay.get("mask") and lay.get("mask_input"):
+                mi_index.append(len(layers) + len(mask_inputs))
+                mask_inputs.append(str(lay["mask_input"]))
+            else:
+                mi_index.append(None)
         for i, lay in enumerate(layers):
             op = max(0.0, min(1.0, float(lay.get("opacity", 1.0))))
             start = max(0, int(lay.get("start", 0)))
@@ -574,14 +624,22 @@ class FFmpeg:
             if startT > 0:
                 chain.append(f"setpts=PTS+{startT:.6f}/TB")
             parts.append(f"[{i}:v]" + ",".join(chain) + f"[c{i}]")
-            # optional layer matte: derive a grayscale mask from the clip itself
-            # and multiply it into the clip's alpha (preserving opacity/head_fade)
+            # optional layer matte: derive a grayscale mask -- from the clip itself,
+            # or from an aligned external alpha map (source-file alpha) -- and
+            # multiply it into the clip's alpha (preserving opacity/head_fade)
             clip_lbl = f"[c{i}]"
             mask = lay.get("mask")
             if mask:
-                mc = mask_chain(mask)
-                parts.append(f"[c{i}]split=3[cb{i}][cm{i}][ca{i}]")
-                parts.append(f"[cm{i}]{mc}[mk{i}]")
+                mi = mi_index[i]
+                if mi is not None:                     # external alpha-map matte
+                    parts.append(f"[c{i}]split[cb{i}][ca{i}]")
+                    delay = f",setpts=PTS+{startT:.6f}/TB" if startT > 0 else ""
+                    parts.append(f"[{mi}:v]fps={fps:g},scale={w}:{h},"
+                                 f"{mask_chain(mask, gray_input=True)},"
+                                 f"settb=1/{tb}{delay}[mk{i}]")
+                else:                                  # derive from the clip
+                    parts.append(f"[c{i}]split=3[cb{i}][cm{i}][ca{i}]")
+                    parts.append(f"[cm{i}]{mask_chain(mask)}[mk{i}]")
                 parts.append(f"[ca{i}]alphaextract[caa{i}]")
                 parts.append(f"[caa{i}][mk{i}]blend=all_mode=multiply[cmm{i}]")
                 parts.append(f"[cb{i}][cmm{i}]alphamerge[cmsk{i}]")
@@ -605,6 +663,8 @@ class FFmpeg:
         inputs: List[str] = []
         for lay in layers:
             inputs += ["-i", str(lay["input"])]
+        for mp in mask_inputs:                          # then the alpha-map mattes
+            inputs += ["-i", mp]
         self._run([*inputs, "-filter_complex", ";".join(parts), "-map", final,
                    "-c:v", "mpeg4", "-q:v", str(qscale), "-bf", "0",
                    "-g", str(max(1, gop)), "-pix_fmt", "yuv420p", "-y", str(dst)],

@@ -96,6 +96,18 @@ class MoshEngine:
             f.source = label            # human provenance label, used by modes
         return clip
 
+    def source_has_alpha(self, src) -> bool:
+        """True if *src* carries an alpha channel (for source-file alpha mattes)."""
+        return self.ff.has_alpha(src)
+
+    def extract_alpha_map(self, src, dst) -> Path:
+        """Render *src*'s alpha as a grayscale moshable AVI at project geometry,
+        frame-aligned with the normalised clip so it can matte it."""
+        return self.ff.extract_alpha(
+            src, dst, width=self.config.width, height=self.config.height,
+            fps=self.config.fps, gop=self.config.gop, qscale=self.config.qscale,
+            keep_aspect=self.config.keep_aspect)
+
     def render_transform(self, kind: str, dst, *, frames: int = 120,
                          speed: float = 1.0):
         """Render a geometric-transform motion source (zoom/pan/rotate) at the

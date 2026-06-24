@@ -891,6 +891,16 @@ def cmd_selftest(args) -> int:
     mc = mask_chain({"source": "luma", "invert": True, "feather": 4})
     _check("255-val" in mc and "gblur=sigma=4" in mc,
            "invert + feather extend the matte chain", failures)
+    gm = mask_chain({"source": "alpha", "lo": 0.0, "hi": 1.0}, gray_input=True)
+    _check(gm.startswith("format=gray,lutyuv=") and "alphaextract" not in gm,
+           "gray_input matte (source-file alpha map) skips extraction", failures)
+    from .ffmpeg import ALPHA_PIX_FMTS
+    _check("rgba" in ALPHA_PIX_FMTS and "yuva420p" in ALPHA_PIX_FMTS,
+           "alpha source pixel formats are recognised", failures)
+    amed = MediaItem(id="am", source_path="s", label="a", role="main",
+                     intermediate_path="i", alpha_path="a.alpha.avi")
+    _check(MediaItem.from_dict(amed.to_dict()).alpha_path == "a.alpha.avi",
+           "MediaItem.alpha_path survives a JSON round-trip", failures)
     mclip = Clip(id="mc", media_id="m", track="main",
                  layer_mask={"source": "motion", "lo": 0.1, "hi": 0.6},
                  fx_mask={"source": "luma", "invert": True})

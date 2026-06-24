@@ -214,9 +214,14 @@ overspill), while `source` *generates* the effect from the matte-cut island and
 lets its output spill outward over the rest of the frame (glitches that
 originate in a region but bleed past it). Both mattes live in the inspector's
 **Masks** panel; a layer matte on a lone track composites it over black.
-(Alpha-keyed mattes are still a no-op on the alpha-less MPEG-4 intermediates —
-source-file alpha is the next step; chroma covers most keying needs in the
-meantime.)
+
+The **alpha** source uses real **source-file transparency**: importing an
+alpha-carrying file (PNG / ProRes 4444 / WebM / MOV …) captures a grayscale
+alpha map alongside the moshable intermediate, so an alpha matte composites the
+overlay correctly — transparent areas reveal the track below. It aligns for
+clean placements (trim is fine); a clip that is **codec-moshed, sped or
+reversed** can't keep the alpha map 1:1 and falls back to opaque (use a chroma
+key there instead).
 
 **Optical-flow transfer (appearance-free motion transfer).** Warp a clip's pixels
 by the *motion* of another clip — dense optical flow drives the warp, so only the
@@ -516,10 +521,10 @@ easing, **motion injection** (synthetic zoom/pan/rotate/shake camera moves),
 **pixel sorting** (a threshold-banded numpy raw-frame effect, the first of a new
 *Raw FX* class), and **masking** — both compositor layer-mattes *and* finish-pass
 effect-mattes, keyed by luminance / motion / **chroma** with a soft threshold
-band, invert and feather, and a **confine/source** mode that controls whether
-glitches stay inside the matte or spill out of it. That clears the three glitch
-families that were on the bench; the engine now spans codec-domain mosh,
-pixel/raw finishing, motion transfer, compositing with mattes, and nested
-sequences. The one matte source still to land is **source-file alpha** (real
-transparency from alpha-carrying imports, needing an alpha companion + edit
-alignment); chroma keying covers most of that need today.
+band, invert and feather, a **confine/source** mode that controls whether
+glitches stay inside the matte or spill out of it, and **source-file alpha**
+(real transparency from alpha-carrying imports, via a captured alpha map that
+aligns to clean placements). That clears the three glitch families that were on
+the bench along with every matte source originally planned; the engine now spans
+codec-domain mosh, pixel/raw finishing, motion transfer, compositing with
+luma/alpha/motion/chroma mattes, and nested sequences.

@@ -64,6 +64,7 @@ class MediaItem:
     derived: bool = False          # True for baked media
     sequence_id: Optional[str] = None  # set when this media is a rendered precomp
     digest: str = ""               # content hash of the source sequence (cache key)
+    alpha_path: Optional[str] = None   # grayscale alpha map (source-file alpha matte)
 
     def to_dict(self) -> Dict:
         return self.__dict__.copy()
@@ -331,6 +332,34 @@ class Project:
                 pass
         return out
 
+    def _alpha_matte_segment(self, engine: MoshEngine, clip: Clip):
+        """An aligned grayscale alpha-map segment for *clip*, or None.
+
+        Only *clean placement* clips qualify -- no codec mosh, speed, reverse or
+        flow -- because those change the frame count/order and would break the
+        1:1 alignment between the alpha map and the clip's frames (such clips fall
+        back to an opaque matte). Returns a temp segment path the caller consumes.
+        """
+        item = self.media.get(clip.media_id)
+        if not item or not getattr(item, "alpha_path", None):
+            return None
+        if not Path(item.alpha_path).exists():
+            return None
+        if (self._ops_for_clip(clip.id) or clip.speed != 1.0 or clip.reverse
+                or clip.flow_transfer is not None):
+            return None
+        media = self._parsed_media(clip.media_id)
+        in_pt = self._snapped_in_point(media, clip.in_point)
+        out_pt = clip.out_point if clip.out_point is not None else len(media.frames)
+        w, h = self.config.width, self.config.height
+        frames = list(engine.ff.decode_rgb_raw(item.alpha_path, w, h))
+        seg = frames[in_pt:out_pt]
+        if not seg:
+            return None
+        return engine.ff.encode_rgb_raw(
+            seg, engine._tmp(".avi"), width=w, height=h, fps=self.config.fps,
+            qscale=self.config.qscale, gop=self.config.gop)
+
     @staticmethod
     def _op_region(op: MoshOp, n: int):
         """The frame ``range`` an op applies to within its *n*-frame input, or
@@ -372,6 +401,15 @@ class Project:
             id=media_id, source_path=str(source_path), label=label, role=role,
             intermediate_path=str(inter), width=clip.width, height=clip.height,
             fps=clip.fps, nb_frames=len(clip.frames))
+        # capture source-file transparency (for alpha mattes) as a grayscale map
+        if role != "motion" and engine.source_has_alpha(source_path):
+            amap = (self.assets_dir / f"{media_id}.alpha.avi") if self.assets_dir \
+                else Path(inter).with_suffix(".alpha.avi")
+            try:
+                engine.extract_alpha_map(source_path, amap)
+                item.alpha_path = str(amap)
+            except Exception:
+                item.alpha_path = None          # alpha matte falls back to opaque
         self.media[media_id] = item
         self._parsed[media_id] = avi.parse_avi(item.intermediate_path)
         return item
@@ -891,19 +929,26 @@ class Project:
             seq: List = []
             for clip, start, length, trans in layouts[t.id]:
                 seg, seglen = self._clip_segment(engine, clip)
+                lm = clip.layer_mask
+                # a source-file alpha matte pulls in the clip's aligned alpha map
+                mask_input = (self._alpha_matte_segment(engine, clip)
+                              if lm and lm.get("source") == "alpha" else None)
                 layers.append({"input": seg, "start": int(start),
                                "length": seglen, "opacity": float(clip.opacity),
                                "blend": clip.blend_mode, "head_fade": int(trans),
-                               "mask": clip.layer_mask})
+                               "mask": lm,
+                               "mask_input": str(mask_input) if mask_input else None})
                 seq.append((clip, int(start), seglen, int(trans)))
             if seq:
                 track_seqs.append(seq)
         out = engine.composite(layers, out_avi, total_frames=total)
         for lay in layers:                         # consumed
-            try:
-                Path(lay["input"]).unlink()
-            except OSError:
-                pass
+            for k in ("input", "mask_input"):
+                if lay.get(k):
+                    try:
+                        Path(lay[k]).unlink()
+                    except OSError:
+                        pass
 
         # Audio: every enabled video track becomes a full-length plan (clips at
         # their absolute positions, gap silence, crossfade head-trims); the

@@ -1,5 +1,6 @@
 """Masking: layer mattes (compositor) and FX mattes (finish), ffmpeg-gated."""
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -159,6 +160,54 @@ def test_raw_fx_source_mode_renders(engine, project, make_clip, tmp_path, probe)
     out = tmp_path / "rs.avi"
     r = project.render(engine, out)
     assert r["frames"] == 24 and probe.dims(out) == "160x120"
+
+
+def _alpha_clip(tmp_path, name="logo.mov"):
+    """A clip with real transparency: left half opaque green, right half clear."""
+    from moshit.ffmpeg import FFmpeg
+    path = tmp_path / name
+    FFmpeg()._run(
+        ["-f", "lavfi", "-i", "color=c=green:s=160x120:d=1:r=24",
+         "-vf", r"format=rgba,geq=r=0:g=200:b=0:a=if(lt(X\,80)\,255\,0)",
+         "-c:v", "qtrle", "-y", str(path)], "make alpha clip")
+    return path
+
+
+def test_import_detects_source_alpha(project, engine, make_clip, tmp_path):
+    plain = project.import_media(engine, make_clip("p.mp4"), label="p", role="main")
+    assert project.media[plain.id].alpha_path is None     # no alpha in a plain mp4
+    logo = project.import_media(engine, _alpha_clip(tmp_path), label="logo",
+                                role="main")
+    ap = project.media[logo.id].alpha_path
+    assert ap is not None and Path(ap).exists()           # alpha map captured
+
+
+def test_source_alpha_layer_matte_reveals_lower_track(project, engine, make_clip,
+                                                      tmp_path, probe):
+    red = project.import_media(engine, make_clip("red.mp4", color="red"),
+                               label="red", role="main")
+    logo = project.import_media(engine, _alpha_clip(tmp_path), label="logo",
+                                role="main")
+    project.add_clip(red.id, "main")
+    v2 = project.add_track()
+    cl = project.add_clip(logo.id, v2.id)
+    cl.layer_mask = {"source": "alpha", "lo": 0.0, "hi": 1.0}
+    out = tmp_path / "sa.avi"
+    project.render(engine, out)
+    left, right = probe.pixel(out, 12, 40, 60), probe.pixel(out, 12, 120, 60)
+    assert left[1] > 150 and left[0] < 90                 # opaque green shows
+    assert right[0] > 150 and right[1] < 90               # transparent -> red base
+
+
+def test_source_alpha_falls_back_to_opaque_when_moshed(project, engine, make_clip,
+                                                       tmp_path):
+    # a codec-moshed clip can't align its alpha map -> no aligned segment (opaque)
+    logo = project.import_media(engine, _alpha_clip(tmp_path), label="logo",
+                                role="main")
+    c = project.add_clip(logo.id, "main")
+    assert project._alpha_matte_segment(engine, c) is not None   # clean -> aligned
+    project.add_mosh("pframe_duplicate", {"factor": 2}, c.id)
+    assert project._alpha_matte_segment(engine, c) is None       # moshed -> fallback
 
 
 def test_motion_mask_renders(project, engine, make_clip, tmp_path, probe):
