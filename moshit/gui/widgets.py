@@ -295,7 +295,18 @@ class AutoParamWidget(QWidget):
 
 
 def build_param_widget(param: Param) -> Tuple[QWidget, Callable]:
-    """Return (control, getter) for a mode parameter. getter() -> current value."""
+    """Return (control, getter) for a mode parameter. getter() -> current value.
+
+    The parameter's ``help`` text becomes the control's tooltip, so the inspector
+    surfaces the same guidance ``moshit modes`` prints on the CLI.
+    """
+    w, getter = _build_param_control(param)
+    if getattr(param, "help", ""):
+        w.setToolTip(param.help)
+    return w, getter
+
+
+def _build_param_control(param: Param) -> Tuple[QWidget, Callable]:
     if param.kind in ("int", "float") and getattr(param, "automatable", False):
         w = AutoParamWidget(param)
         return w, w.get_value
