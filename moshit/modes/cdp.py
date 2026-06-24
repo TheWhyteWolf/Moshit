@@ -85,7 +85,8 @@ def _register(d: _Descriptor) -> type:
 
 
 # --------------------------------------------------------------------------- #
-# The CDP "distort" family -- waveset operations, ideal for pixel databending.
+# CDP waveset operations -- the "distort" family plus a few siblings
+# (distmore / distshift / distortt), all ideal for pixel databending.
 # --------------------------------------------------------------------------- #
 
 _DESCRIPTORS: List[_Descriptor] = [
@@ -142,9 +143,47 @@ _DESCRIPTORS: List[_Descriptor] = [
                     help="Wavesets silenced out of every B (must be < B).")),
          _Arg(Param("b", "int", 4, lo=2, hi=128, label="Out of (B)",
                     help="Group size; A of every B are silenced."))]),
+
+    # --- other waveset programs (not 'distort') ---------------------------- #
+    _Descriptor(
+        "cdp_distmore_double", "distmore", "double",
+        "CDP distmore/double: octave-up each waveset's frequency (bright ring).",
+        [_Arg(Param("mult", "int", 1, lo=1, hi=4, label="Octaves up",
+                    help="Octave steps up, doubling/quadrupling frequency (1-4)."))]),
+    _Descriptor(
+        "cdp_distshift_shift", "distshift", "distshift 1",
+        "CDP distshift/shift: slide alternate half-wavecycle groups forward "
+        "(smeared, phasey grind).",
+        [_Arg(Param("grpcnt", "int", 1, lo=1, hi=16, label="Group size",
+                    help="Half-waveset elements per group (1 = single halves).")),
+         _Arg(Param("shift", "int", 1, lo=1, hi=16, label="Shift",
+                    help="Move alternate groups forward by this many groups."))]),
+    _Descriptor(
+        "cdp_distshift_swap", "distshift", "distshift 2",
+        "CDP distshift/swap: swap alternate half-wavecycle groups (stutter buzz).",
+        [_Arg(Param("grpcnt", "int", 1, lo=1, hi=16, label="Group size",
+                    help="Half-waveset elements per group (1 = single halves)."))]),
+    _Descriptor(
+        "cdp_distortt_repeat", "distortt", "repeat",
+        "CDP distortt/repeat: repeat waveset groups along the sound (juddering "
+        "timestretch); Telescope keeps the output near the original length.",
+        [_Arg(Param("gpcnt", "int", 1, lo=1, hi=32, label="Group size",
+                    help="Wavesets per repeated group.")),
+         _Arg(Param("rpt", "int", 2, lo=1, hi=32, label="Repeats",
+                    help="Times each waveset group repeats.")),
+         _Arg(Param("offset", "int", 0, lo=0, hi=5000, label="Offset (mS)",
+                    help="Time skipped before the waveset process starts.")),
+         _Arg(Param("dur", "float", 60.0, lo=1.0, hi=600.0, label="Output dur (s)",
+                    help="Target output length; output is length-fit to the clip "
+                         "anyway, so this mainly bounds how far it processes.")),
+         _Arg(Param("telescope", "bool", True, label="Telescope",
+                    help="Skip wavesets so output stays near the input length."),
+              "flag", "-t")]),
 ]
 
 
-# Register only when CDP is actually installed (no dead controls otherwise).
+# Register only the modes whose CDP binary is actually present, so a machine
+# with some programs missing shows the ones it can run and no dead controls.
 if audio_bend.cdp_dir() is not None:
-    _REGISTERED = [_register(d) for d in _DESCRIPTORS]
+    _REGISTERED = [_register(d) for d in _DESCRIPTORS
+                   if audio_bend.has_program(d.program)]

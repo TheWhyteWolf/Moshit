@@ -111,6 +111,10 @@ def bend(frames: List[bytes], width: int, height: int, *, program: str,
          timeout: float = 180.0) -> List[bytes]:
     """Run a CDP ``program mode in out <positionals> <flags>`` over the clip.
 
+    ``mode`` may be several whitespace-separated tokens, for CDP programs whose
+    sub-command carries a mode number before the files (e.g. ``"distshift 1"`` ->
+    ``distshift distshift 1 in out ...``); single-word modes are unaffected.
+
     Returns the length-fitted, re-pixelated frames, or the originals unchanged if
     databending is unavailable or CDP fails (so a render never breaks).
     """
@@ -121,7 +125,7 @@ def bend(frames: List[bytes], width: int, height: int, *, program: str,
     try:
         in_wav, out_wav = work / "in.wav", work / "out.wav"
         _pixels_to_wav(frames, in_wav)
-        argv = ([mode, str(in_wav), str(out_wav)]
+        argv = (mode.split() + [str(in_wav), str(out_wav)]
                 + [str(p) for p in positionals] + [str(f) for f in flags])
         if not run_cdp(program, argv, timeout=timeout) or not out_wav.exists():
             return frames                     # CDP refused this input: passthrough
