@@ -32,6 +32,7 @@ class RawMode:
 
     name: str = ""
     description: str = ""
+    category: str = "Raw FX"        # GUI/CLI grouping (e.g. "RAW DATA - AUDIO")
     params: List[Param] = []
 
     def __init_subclass__(cls, **kwargs):

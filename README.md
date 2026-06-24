@@ -217,6 +217,25 @@ and stabilising content toward the opening frame at 0 (needs the `flow` extra).
 replays every block `repeats` times — `forward` for a hard stutter, `reverse` so
 each echo replays the deltas backwards, or `pingpong` for out-and-back.
 
+**RAW DATA - AUDIO (databending through CDP).** A family of raw effects that run
+a clip's pixels through **audio** software for vivid, unpredictable corruption.
+Every byte of every frame becomes one mono 16-bit sample (the whole clip
+concatenated into one stream, so the effect smears colour and frames into each
+other), the stream is processed by a [Composer Desktop
+Project](https://www.composersdesktop.com/) (CDP) sound-transformation program,
+and the result is mapped back to pixels and **length-fitted** to the clip's exact
+geometry — so a render's frame count and size never change, and a CDP failure is
+a clean no-op. The first set wraps CDP's **`distort`** waveset family, each with
+*all* its parameters exposed: `cdp_distort_multiply`/`divide` (waveset
+frequency), `cdp_distort_repeat`/`interpolate` (stutter / smear groups of
+wavesets), `cdp_distort_telescope` (collapse runs into one), `cdp_distort_reverse`
+(granular backwards), and `cdp_distort_omit` (rhythmic silence dropouts). They
+live in the **Raw FX** panel under a *RAW DATA - AUDIO* group, alongside the other
+raw effects. CDP binaries are discovered at runtime (`$MOSHIT_CDP_DIR`, else a
+bundled `CDP8/NewRelease`); without them the group simply doesn't appear. Adding
+a CDP program is one descriptor entry — its controls are generated from the
+parameter schema, no GUI changes.
+
 **Masks (mattes).** Any clip can carry two mattes, both keyed by **luminance**,
 **alpha**, **motion** (frame-to-frame difference) or **chroma** (a green-screen
 key on a chosen `key` colour), with a soft `lo`/`hi` threshold band, `invert`,

@@ -1553,7 +1553,7 @@ class InspectorPanel(QWidget):
 
         add_row = QHBoxLayout()
         self.raw_add_combo = QComboBox()
-        self.raw_add_combo.addItems(available_raw_modes())
+        self._populate_raw_combo()
         self.raw_add_btn = QPushButton("+ Add")
         self.raw_add_btn.clicked.connect(self._emit_raw_add)
         add_row.addWidget(self.raw_add_combo, 1)
@@ -1582,6 +1582,25 @@ class InspectorPanel(QWidget):
         v.addLayout(btns)
         self._raw_group = group
         return group
+
+    def _populate_raw_combo(self) -> None:
+        """Fill the raw-FX picker, grouped by category with non-selectable
+        headers (so e.g. the CDP 'RAW DATA - AUDIO' effects sit together)."""
+        from ..modes import available_raw_modes, get_raw_mode
+        by_cat: dict = {}
+        for name in available_raw_modes():
+            cat = getattr(get_raw_mode(name), "category", "Raw FX")
+            by_cat.setdefault(cat, []).append(name)
+        cats = sorted(by_cat, key=lambda c: (c != "Raw FX", c))
+        grouped = len(cats) > 1
+        for cat in cats:
+            if grouped:
+                self.raw_add_combo.addItem(f"— {cat} —")
+                item = self.raw_add_combo.model().item(self.raw_add_combo.count() - 1)
+                if item is not None:
+                    item.setEnabled(False)
+            for name in by_cat[cat]:
+                self.raw_add_combo.addItem(name)
 
     def set_clip_raw_fx(self, rfx: List[dict]) -> None:
         self._raw_fx = [dict(p) for p in (rfx or [])]
@@ -1637,8 +1656,9 @@ class InspectorPanel(QWidget):
         self.raw_apply_btn.setEnabled(has_sel)
 
     def _emit_raw_add(self) -> None:
+        from ..modes import available_raw_modes
         name = self.raw_add_combo.currentText()
-        if name and self._clip_id is not None:
+        if name in available_raw_modes() and self._clip_id is not None:
             self.rawFxAddRequested.emit(name)
 
     def _emit_raw_remove(self) -> None:

@@ -120,12 +120,17 @@ def cmd_modes(args) -> int:
                 print(f"    - {p.describe()}")
     raw = available_raw_modes()
     if raw:
-        print("\n=== raw effects (clip finishing, numpy frame processors) ===")
+        by_cat: dict = {}
         for name in raw:
             mode = get_raw_mode(name)
-            print(f"\n{name}\n  {mode.description}")
-            for p in mode.params:
-                print(f"    - {p.describe()}")
+            by_cat.setdefault(getattr(mode, "category", "Raw FX"), []).append(
+                (name, mode))
+        for cat in sorted(by_cat, key=lambda c: (c != "Raw FX", c)):
+            print(f"\n=== {cat} (clip finishing, numpy frame processors) ===")
+            for name, mode in by_cat[cat]:
+                print(f"\n{name}\n  {mode.description}")
+                for p in mode.params:
+                    print(f"    - {p.describe()}")
     return 0
 
 
@@ -903,6 +908,23 @@ def cmd_selftest(args) -> int:
         ident = rr.apply([rgbf], width=8, height=8, fps=24, decay=0.0)[0]
         _check(len(moved) == len(rgbf) and moved != rgbf and ident == rgbf,
                "rgb_recurse shifts/swaps recursively (decay=0 is identity)", failures)
+        from . import audio_bend as _ab
+        _abf = [(_np.arange(4 * 4 * 3) % 256).astype(_np.uint8).tobytes()
+                for _ in range(3)]
+        _ab._pixels_to_wav(_abf, tmp / "ab.wav")
+        _check(_ab._wav_to_frames(tmp / "ab.wav", 3, 4, 4) == _abf,
+               "RAW DATA - AUDIO pixel<->WAV bridge round-trips losslessly", failures)
+    else:
+        print("  [skip] numpy not installed; raw FX math not exercised")
+
+    from . import audio_bend as _ab2
+    if _ab2.available():
+        cdp = [m for m in available_raw_modes() if m.startswith("cdp_")]
+        _check("cdp_distort_multiply" in cdp
+               and all(get_raw_mode(m).category == "RAW DATA - AUDIO" for m in cdp),
+               "CDP databending modes registered under RAW DATA - AUDIO", failures)
+    else:
+        print("  [skip] CDP binaries not found; databending modes not exercised")
 
     print("\nK3. Masking (layer + FX mattes)")
     from .ffmpeg import MASK_SOURCES, MASK_MODES, mask_chain
