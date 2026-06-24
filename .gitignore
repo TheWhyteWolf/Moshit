@@ -16,3 +16,8 @@ venv/
 # Editor / OS cruft
 .DS_Store
 *.swp
+
+# CDP (Composer Desktop Project) -- large local toolkit for RAW DATA - AUDIO
+# databending; discovered at runtime ($MOSHIT_CDP_DIR or this bundled path),
+# kept out of git (172 MB + prebuilt binaries + nested .git).
+CDP8/
