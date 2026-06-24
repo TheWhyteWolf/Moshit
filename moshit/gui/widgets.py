@@ -1251,12 +1251,20 @@ class InspectorPanel(QWidget):
         self._mask_editors: Dict[str, dict] = {}
         self._beat_provider: Optional[Callable] = None    # clip_id -> [pos, ...]
 
-        layout = QVBoxLayout(self)
-        layout.addWidget(_heading("Inspector"))
+        outer = QVBoxLayout(self)
+        outer.addWidget(_heading("Inspector"))
 
         self.clip_lbl = QLabel("Select a clip on the main track.")
         self.clip_lbl.setWordWrap(True)
-        layout.addWidget(self.clip_lbl)
+        outer.addWidget(self.clip_lbl)
+
+        # Everything below the heading lives in a body container that stays
+        # hidden until a clip is selected, so the panel is blank otherwise.
+        self._body = QWidget()
+        outer.addWidget(self._body)
+        outer.addStretch(1)
+        layout = QVBoxLayout(self._body)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._build_clip_group())
         layout.addWidget(self._build_pixel_group())
         layout.addWidget(self._build_raw_group())
@@ -1987,6 +1995,7 @@ class InspectorPanel(QWidget):
                              clip=None, effects: Optional[List[dict]] = None) -> None:
         self._clip_id = clip_id
         on = clip_id is not None
+        self._body.setVisible(on)           # blank panel until a clip is selected
         self.mode_combo.setEnabled(on)
         self.bake_btn.setEnabled(on)
         self.flow_btn.setEnabled(on)

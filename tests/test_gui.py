@@ -113,6 +113,20 @@ def test_inspector_opacity_blend(qapp):
     assert got[-1]["gain"] == 2.0
 
 
+def test_inspector_body_blank_until_clip_selected(qapp):
+    # the inspector body stays hidden (panel blank) until a clip is selected
+    from moshit.gui.widgets import InspectorPanel
+    from moshit.project import Clip
+    insp = InspectorPanel()
+    assert insp._body.isHidden()                     # blank at init, no clip
+    insp.set_enabled_for_clip("c", "myclip",
+                              clip=Clip(id="c", media_id="m", track="main"),
+                              effects=[])
+    assert not insp._body.isHidden()                 # shown for the selected clip
+    insp.set_enabled_for_clip(None, None)
+    assert insp._body.isHidden()                     # blank again after deselect
+
+
 def test_timeline_multitrack_lanes(qapp):
     from moshit.gui.widgets import TimelineWidget
     from moshit.project import (Project, Clip, MediaItem,

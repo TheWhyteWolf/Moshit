@@ -15,9 +15,9 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
-    QMainWindow, QMessageBox, QPushButton, QSpinBox, QSplitter, QVBoxLayout,
-    QWidget,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
+    QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 from ..engine import EngineConfig, _ext_for_profile
@@ -213,10 +213,20 @@ class MainWindow(QMainWindow):
         self.inspector = InspectorPanel()
         self.timeline = TimelineWidget()
 
+        # The inspector scrolls inside its pane, so its (tall) content can never
+        # force the whole window to grow vertically when a clip is selected.
+        insp_scroll = QScrollArea()
+        insp_scroll.setWidget(self.inspector)
+        insp_scroll.setWidgetResizable(True)
+        insp_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        insp_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        insp_scroll.setMinimumWidth(260)
+
         top = QSplitter(Qt.Orientation.Horizontal)
         top.addWidget(self.library)
         top.addWidget(self.preview)
-        top.addWidget(self.inspector)
+        top.addWidget(insp_scroll)
         top.setStretchFactor(0, 2)
         top.setStretchFactor(1, 5)
         top.setStretchFactor(2, 3)
