@@ -199,15 +199,48 @@ def test_source_alpha_layer_matte_reveals_lower_track(project, engine, make_clip
     assert right[0] > 150 and right[1] < 90               # transparent -> red base
 
 
-def test_source_alpha_falls_back_to_opaque_when_moshed(project, engine, make_clip,
-                                                       tmp_path):
-    # a codec-moshed clip can't align its alpha map -> no aligned segment (opaque)
+def test_source_alpha_tracks_codec_mosh(project, engine, make_clip, tmp_path,
+                                        probe):
+    # a codec-moshed alpha clip keeps its matte: the alpha map runs through the
+    # same op chain, stays frame-aligned with the picture, and still reveals the
+    # lower track (no opaque fallback).
+    from moshit import avi
+    red = project.import_media(engine, make_clip("red.mp4", color="red"),
+                               label="red", role="main")
+    logo = project.import_media(engine, _alpha_clip(tmp_path), label="logo",
+                                role="main")
+    project.add_clip(red.id, "main")
+    v2 = project.add_track()
+    cl = project.add_clip(logo.id, v2.id)
+    cl.layer_mask = {"source": "alpha", "lo": 0.0, "hi": 1.0}
+    project.add_mosh("pframe_duplicate", {"factor": 3}, cl.id)
+
+    seg = project._alpha_matte_segment(engine, cl)
+    assert seg is not None                                # aligned, not opaque
+    vid_seg, _ = project._clip_segment(engine, cl)
+    a_len = len(avi.parse_avi(str(seg)).frames)
+    v_len = len(avi.parse_avi(str(vid_seg)).frames)
+    assert a_len == v_len and a_len > 24                  # aligned AND grew with the mosh
+
+    out = tmp_path / "sam.avi"
+    project.render(engine, out)
+    left, right = probe.pixel(out, 0, 40, 60), probe.pixel(out, 0, 120, 60)
+    assert left[1] > 150 and left[0] < 90                 # opaque green still shows
+    assert right[0] > 150 and right[1] < 90               # transparent -> red base
+
+
+def test_source_alpha_falls_back_to_opaque_when_retimed(project, engine, make_clip,
+                                                        tmp_path):
+    # speed/reverse re-time the picture in the finish pass, out from under the
+    # alpha map -> no aligned segment (opaque fallback)
     logo = project.import_media(engine, _alpha_clip(tmp_path), label="logo",
                                 role="main")
     c = project.add_clip(logo.id, "main")
     assert project._alpha_matte_segment(engine, c) is not None   # clean -> aligned
     project.add_mosh("pframe_duplicate", {"factor": 2}, c.id)
-    assert project._alpha_matte_segment(engine, c) is None       # moshed -> fallback
+    assert project._alpha_matte_segment(engine, c) is not None   # moshed -> aligned
+    c.speed = 2.0
+    assert project._alpha_matte_segment(engine, c) is None       # retimed -> fallback
 
 
 def test_motion_mask_renders(project, engine, make_clip, tmp_path, probe):

@@ -335,30 +335,47 @@ class Project:
     def _alpha_matte_segment(self, engine: MoshEngine, clip: Clip):
         """An aligned grayscale alpha-map segment for *clip*, or None.
 
-        Only *clean placement* clips qualify -- no codec mosh, speed, reverse or
-        flow -- because those change the frame count/order and would break the
-        1:1 alignment between the alpha map and the clip's frames (such clips fall
-        back to an opaque matte). Returns a temp segment path the caller consumes.
+        The clip's source-file alpha map is trimmed to the clip and put through
+        the *same codec-domain mosh ops* as the picture. Because the alpha map is
+        encoded with the same GOP structure (keyframes only on GOP boundaries,
+        see :meth:`FFmpeg.normalize`), the op chain transforms it frame-for-frame
+        identically -- so the transparency blooms and smears in sympathy with the
+        glitch and stays aligned. Only the finish-stage transforms that re-time
+        the picture out from under the map -- speed, reverse, optical-flow -- still
+        fall back to an opaque matte. Returns a temp segment the caller consumes.
         """
         item = self.media.get(clip.media_id)
         if not item or not getattr(item, "alpha_path", None):
             return None
         if not Path(item.alpha_path).exists():
             return None
-        if (self._ops_for_clip(clip.id) or clip.speed != 1.0 or clip.reverse
-                or clip.flow_transfer is not None):
+        if clip.speed != 1.0 or clip.reverse or clip.flow_transfer is not None:
             return None
         media = self._parsed_media(clip.media_id)
         in_pt = self._snapped_in_point(media, clip.in_point)
         out_pt = clip.out_point if clip.out_point is not None else len(media.frames)
         w, h = self.config.width, self.config.height
-        frames = list(engine.ff.decode_rgb_raw(item.alpha_path, w, h))
-        seg = frames[in_pt:out_pt]
-        if not seg:
+        ops = self._ops_for_clip(clip.id)
+        if not ops:                                # clean placement: decode + slice
+            frames = list(engine.ff.decode_rgb_raw(item.alpha_path, w, h))[in_pt:out_pt]
+            if not frames:
+                return None
+            return engine.ff.encode_rgb_raw(
+                frames, engine._tmp(".avi"), width=w, height=h, fps=self.config.fps,
+                qscale=self.config.qscale, gop=self.config.gop)
+        # moshed: run the alpha map's own coded frames through the identical op
+        # chain (same regions, same motion sources) so it tracks the picture.
+        alpha_av = avi.parse_avi(item.alpha_path)
+        aframes = list(alpha_av.frames[in_pt:out_pt])
+        if not aframes:
             return None
-        return engine.ff.encode_rgb_raw(
-            seg, engine._tmp(".avi"), width=w, height=h, fps=self.config.fps,
-            qscale=self.config.qscale, gop=self.config.gop)
+        motion = self._motion_frames()
+        for op in ops:
+            aframes = engine.mosh(
+                _as_avivideo(aframes, alpha_av), op.mode, op.params,
+                motion_clips=_wrap_motion(motion),
+                region=self._op_region(op, len(aframes)))
+        return engine.write_moshed(aframes, alpha_av, engine._tmp(".avi"))
 
     @staticmethod
     def _op_region(op: MoshOp, n: int):

@@ -218,10 +218,13 @@ originate in a region but bleed past it). Both mattes live in the inspector's
 The **alpha** source uses real **source-file transparency**: importing an
 alpha-carrying file (PNG / ProRes 4444 / WebM / MOV …) captures a grayscale
 alpha map alongside the moshable intermediate, so an alpha matte composites the
-overlay correctly — transparent areas reveal the track below. It aligns for
-clean placements (trim is fine); a clip that is **codec-moshed, sped or
-reversed** can't keep the alpha map 1:1 and falls back to opaque (use a chroma
-key there instead).
+overlay correctly — transparent areas reveal the track below. The map is encoded
+with the same GOP structure as the picture, so it can be **datamoshed right
+alongside it**: a codec-moshed clip runs its alpha map through the identical op
+chain, and the transparency blooms and smears *in sympathy with* the glitch
+while staying frame-aligned. Only the finish-stage re-timings — **speed,
+reverse, optical-flow** — re-time the picture out from under the map, so those
+fall back to opaque (use a chroma key there instead).
 
 **Optical-flow transfer (appearance-free motion transfer).** Warp a clip's pixels
 by the *motion* of another clip — dense optical flow drives the warp, so only the

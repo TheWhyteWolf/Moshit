@@ -349,7 +349,7 @@ class FFmpeg:
         vf = f"alphaextract,{geom},fps={fps},format=gray"
         self._run(
             ["-y", "-i", str(src), "-an", "-sn", "-map", "0:v:0", "-vf", vf,
-             "-c:v", "mpeg4", "-q:v", str(qscale), "-bf", "0",
+             "-c:v", "mpeg4", "-q:v", str(qscale), "-bf", "0", "-sc_threshold", "0",
              "-g", str(max(1, gop)), "-pix_fmt", "yuv420p", str(dst)],
             f"extract alpha {Path(src).name}")
         return Path(dst)
@@ -690,7 +690,10 @@ class FFmpeg:
 
         All clips that will mosh into one another must share width, height, fps
         and codec settings, so this is where they are normalised. B-frames are
-        disabled so every inter frame is a clean, self-contained P-frame.
+        disabled so every inter frame is a clean, self-contained P-frame, and
+        scene-change keyframes are disabled (``sc_threshold 0``) so I-frames land
+        only on GOP boundaries -- deterministic structure a clip's alpha map can
+        be made to share, which keeps an alpha matte aligned under codec mosh.
         """
         if keep_aspect:
             vf = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
@@ -701,7 +704,7 @@ class FFmpeg:
         self._run(
             ["-y", "-i", str(src), "-an", "-sn", "-map", "0:v:0",
              "-vf", vf, "-c:v", "mpeg4", "-q:v", str(qscale), "-bf", "0",
-             "-g", str(g), "-pix_fmt", "yuv420p", str(dst)],
+             "-sc_threshold", "0", "-g", str(g), "-pix_fmt", "yuv420p", str(dst)],
             f"normalise {Path(src).name}")
 
     def reencode_intermediate(self, src_avi, dst_avi, *, gop: int = 250,
