@@ -449,6 +449,26 @@ def cmd_selftest(args) -> int:
            sum(1 for f in base_frames if f.is_iframe),
            "pframe_duplicate leaves I-frames untouched", failures)
 
+    for _dir in ("forward", "reverse", "pingpong"):
+        stut = get_mode("pframe_stutter").apply(
+            list(base_frames), ctx, length=2, repeats=3, direction=_dir)
+        _check(sum(1 for f in stut if f.is_pframe) == base_p * 3
+               and sum(1 for f in stut if f.is_iframe) ==
+               sum(1 for f in base_frames if f.is_iframe),
+               f"pframe_stutter({_dir}, repeats=3) triples P, keeps anchors", failures)
+
+    amp = get_mode("motion_gain").apply(list(base_frames), ctx, gain=2.0)
+    red = get_mode("motion_gain").apply(list(base_frames), ctx, gain=0.5)
+    frz = get_mode("motion_gain").apply(list(base_frames), ctx, gain=0.0)
+    _check(sum(1 for f in amp if f.is_pframe) == base_p * 2,
+           "motion_gain(2.0) doubles P-frames (amplify)", failures)
+    _check(sum(1 for f in red if f.is_pframe) == base_p // 2,
+           "motion_gain(0.5) halves P-frames (reduce)", failures)
+    _check(sum(1 for f in frz if f.is_pframe) == 0
+           and sum(1 for f in frz if f.is_iframe) ==
+           sum(1 for f in base_frames if f.is_iframe),
+           "motion_gain(0.0) freezes on keyframes", failures)
+
     print("\nC. Project non-destructive bake / revert (no ffmpeg)")
     from .project import Clip, MediaItem, Project
 
@@ -832,7 +852,8 @@ def cmd_selftest(args) -> int:
            "bake carries an (empty) raw FX list without error", failures)
 
     print("\nK2. Raw FX (numpy frame processors)")
-    from .modes import available_raw_modes, is_raw_mode, raw as _rawmod
+    from .modes import (available_raw_modes, get_raw_mode, is_raw_mode,
+                        raw as _rawmod)
     _check("pixel_sort" in available_raw_modes() and is_raw_mode("pixel_sort"),
            "pixel_sort is registered as a raw mode", failures)
     rclip = Clip(id="rc", media_id="m", track="main",
@@ -871,8 +892,15 @@ def cmd_selftest(args) -> int:
         _check(_np.frombuffer(wht[0], _np.uint8)[0] > 190
                and _np.frombuffer(blk[0], _np.uint8)[0] < 20,
                "an fx_mask gates raw effects (white=FX, black=original)", failures)
-    else:
-        print("  [skip] numpy not installed; pixel_sort math not exercised")
+        _check("rgb_recurse" in available_raw_modes(),
+               "rgb_recurse is registered as a raw mode", failures)
+        rgbf = (_np.arange(8 * 8 * 3) % 256).astype(_np.uint8).tobytes()
+        rr = get_raw_mode("rgb_recurse")
+        moved = rr.apply([rgbf], width=8, height=8, fps=24, iterations=3,
+                         shift_x=2, swap="gbr", decay=0.7)[0]
+        ident = rr.apply([rgbf], width=8, height=8, fps=24, decay=0.0)[0]
+        _check(len(moved) == len(rgbf) and moved != rgbf and ident == rgbf,
+               "rgb_recurse shifts/swaps recursively (decay=0 is identity)", failures)
 
     print("\nK3. Masking (layer + FX mattes)")
     from .ffmpeg import MASK_SOURCES, MASK_MODES, mask_chain

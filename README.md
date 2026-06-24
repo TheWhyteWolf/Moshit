@@ -199,7 +199,19 @@ and `order` (ascending/descending). It lives in its own inspector **Raw FX**
 panel, runs *before* the FFmpeg pixel filters in the finish pass, and — like
 optical-flow transfer — needs numpy (the `flow` extra); without it the effect is
 skipped rather than failing. The sort is fully vectorised (a single `lexsort`
-per frame), so it's cheap despite working per-pixel.
+per frame), so it's cheap despite working per-pixel. A second raw effect,
+**`rgb_recurse`**, rolls the colour channels apart and permutes them and feeds
+the result back into itself over `iterations` passes (cross-faded by `decay`),
+so chromatic fringing compounds into deep, recursive colour trails.
+
+**Codec motion & stutter.** Two codec-domain mosh modes (the same class as
+`pframe_duplicate`) give finer control over coded motion. **`motion_gain`** is a
+single continuous knob: above 1.0 it re-applies P-frame motion for exaggerated,
+blooming movement; below 1.0 it thins P-frames out toward a freeze at 0
+(fractional gains are error-diffused, so 1.5 doubles every other P-frame).
+**`pframe_stutter`** chops each P-frame run into blocks of a chosen `length` and
+replays every block `repeats` times — `forward` for a hard stutter, `reverse` so
+each echo replays the deltas backwards, or `pingpong` for out-and-back.
 
 **Masks (mattes).** Any clip can carry two mattes, both keyed by **luminance**,
 **alpha**, **motion** (frame-to-frame difference) or **chroma** (a green-screen
