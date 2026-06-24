@@ -31,13 +31,28 @@ from ..modes.base import Param, _build_evaluator
 # Schema -> widget
 # --------------------------------------------------------------------------- #
 
+class _SpinBox(QSpinBox):
+    """A spin box that selects its text on focus, so clicking in and typing
+    *replaces* the value instead of appending to it (which clamped/garbled
+    multi-digit entry, e.g. you couldn't cleanly type a new larger number)."""
+    def focusInEvent(self, e):                  # noqa: N802 (Qt signature)
+        super().focusInEvent(e)
+        QTimer.singleShot(0, self.selectAll)
+
+
+class _DoubleSpinBox(QDoubleSpinBox):
+    def focusInEvent(self, e):                  # noqa: N802 (Qt signature)
+        super().focusInEvent(e)
+        QTimer.singleShot(0, self.selectAll)
+
+
 def _make_spin(param: Param):
     if param.kind == "int":
-        s = QSpinBox()
+        s = _SpinBox()
         s.setRange(int(param.lo) if param.lo is not None else -1_000_000,
                    int(param.hi) if param.hi is not None else 1_000_000)
     else:
-        s = QDoubleSpinBox()
+        s = _DoubleSpinBox()
         s.setDecimals(2)
         s.setSingleStep(0.1)
         s.setRange(float(param.lo) if param.lo is not None else -1e6,
@@ -314,19 +329,10 @@ def _build_param_control(param: Param) -> Tuple[QWidget, Callable]:
         w = QCheckBox()
         w.setChecked(bool(param.default))
         return w, w.isChecked
-    if param.kind == "int":
-        w = QSpinBox()
-        w.setRange(int(param.lo) if param.lo is not None else -1_000_000,
-                   int(param.hi) if param.hi is not None else 1_000_000)
-        w.setValue(int(param.default or 0))
-        return w, w.value
-    if param.kind == "float":
-        w = QDoubleSpinBox()
-        w.setDecimals(2)
-        w.setSingleStep(0.1)
-        w.setRange(float(param.lo) if param.lo is not None else -1e6,
-                   float(param.hi) if param.hi is not None else 1e6)
-        w.setValue(float(param.default or 0.0))
+    if param.kind in ("int", "float"):
+        w = _make_spin(param)                   # select-all-on-focus spin box
+        w.setValue(int(param.default or 0) if param.kind == "int"
+                   else float(param.default or 0.0))
         return w, w.value
     if param.kind == "choice":
         w = QComboBox()

@@ -20,7 +20,7 @@ class PFrameEcho(MoshMode):
               help="Echo every Nth P-frame."),
         Param("delay", "int", 2, lo=1, hi=240, label="Delay",
               help="How many frames later each echo lands."),
-        Param("copies", "int", 1, lo=1, hi=8, label="Echoes",
+        Param("copies", "int", 1, lo=1, hi=64, label="Echoes",
               help="Number of trailing echoes per affected P-frame."),
     ]
 
