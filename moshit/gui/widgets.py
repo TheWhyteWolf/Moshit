@@ -13,7 +13,8 @@ from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QPushButton, QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPushButton, QSizePolicy, QSlider, QSpinBox, QVBoxLayout,
+    QWidget,
 )
 
 try:
@@ -361,6 +362,213 @@ def _set_param_value(w, value) -> None:
         w.setCurrentText(str(value))
     elif isinstance(w, QLineEdit):
         w.setText(str(value))
+
+
+# --------------------------------------------------------------------------- #
+# Effect add menu (grouped by corruption type) + per-effect parameter dialog
+# --------------------------------------------------------------------------- #
+
+# Presentation-only grouping for the codec mosh modes' "+ Add" menu; unknown
+# modes fall into "Other". Pixel/raw modes group by their own metadata.
+_MOSH_CATEGORY = {
+    "pframe_duplicate": "P-frame", "pframe_drop": "P-frame", "pframe_echo": "P-frame",
+    "pframe_reverse": "P-frame", "pframe_shuffle": "P-frame",
+    "pframe_stutter": "P-frame", "pingpong": "P-frame",
+    "iframe_removal": "I-frame / GOP", "iframe_pulse": "I-frame / GOP",
+    "gop_scramble": "I-frame / GOP",
+    "motion_splice": "Motion", "motion_weave": "Motion", "motion_gain": "Motion",
+    "momentum": "Motion", "surge": "Motion",
+    "bitrot": "Corruption",
+}
+_MOSH_CAT_ORDER = ["P-frame", "I-frame / GOP", "Motion", "Corruption", "Other"]
+
+
+def _mode_for(kind: str, name: str):
+    from ..modes import get_mode, get_pixel_mode, get_raw_mode
+    if kind == "pixel":
+        return get_pixel_mode(name)
+    if kind == "raw":
+        return get_raw_mode(name)
+    return get_mode(name)
+
+
+def grouped_modes(kind: str) -> List[Tuple[str, List[str]]]:
+    """``[(category, [mode_name, ...]), ...]`` for an add menu, in display order."""
+    from ..modes import (available_modes, available_pixel_modes,
+                         available_raw_modes, get_raw_mode)
+    groups: Dict[str, List[str]] = {}
+    if kind == "mosh":
+        for n in available_modes():
+            groups.setdefault(_MOSH_CATEGORY.get(n, "Other"), []).append(n)
+        order = _MOSH_CAT_ORDER
+    elif kind == "pixel":
+        motion = {"zoom", "pan", "rotate", "shake"}
+        for n in available_pixel_modes():
+            groups.setdefault("Motion injection" if n in motion else "Pixel FX",
+                              []).append(n)
+        order = ["Pixel FX", "Motion injection"]
+    else:                                          # raw
+        for n in available_raw_modes():
+            groups.setdefault(getattr(get_raw_mode(n), "category", "Raw FX"),
+                              []).append(n)
+        order = ["Raw FX", "RAW DATA - AUDIO"]
+    out = [(c, sorted(groups[c])) for c in order if c in groups]
+    out += [(c, sorted(v)) for c, v in groups.items() if c not in order]
+    return out
+
+
+def effect_add_menu(parent, kind: str, on_pick: Callable[[str], None]) -> QMenu:
+    """A QMenu of a kind's effects, grouped into submenus by category."""
+    menu = QMenu(parent)
+    for category, names in grouped_modes(kind):
+        sub = menu.addMenu(category)
+        for name in names:
+            act = sub.addAction(name)
+            act.triggered.connect(lambda _checked=False, n=name: on_pick(n))
+    return menu
+
+
+class EffectParamDialog(QDialog):
+    """Modal editor exposing all of one effect's parameters.
+
+    Opened both when adding an effect (its defaults) and when double-clicking one
+    in a stack (its current values). Works for any effect *kind* -- ``"mosh"``,
+    ``"pixel"`` or ``"raw"`` -- building controls from the mode's ``Param``
+    schema; mosh effects also get a frame-range (region) row, and automatable
+    params carry the full automation / curve / beats controls.
+    """
+
+    def __init__(self, parent, *, kind: str, mode_name: str,
+                 params: Optional[dict] = None, region=None,
+                 motion_labels: Optional[List[str]] = None,
+                 beat_provider: Optional[Callable] = None,
+                 clip_id: Optional[str] = None, verb: str = "Edit"):
+        super().__init__(parent)
+        self._kind = kind
+        self.mode_name = mode_name
+        self._beat_provider = beat_provider
+        self._clip_id = clip_id
+        self._getters: Dict[str, Callable] = {}
+        self._param_widgets: Dict[str, QWidget] = {}
+        self._clip_ref_names: List[str] = []
+        mode = _mode_for(kind, mode_name)
+        self.setWindowTitle(f"{verb}: {mode_name}")
+        self.setModal(True)
+
+        v = QVBoxLayout(self)
+        if getattr(mode, "description", ""):
+            d = QLabel(mode.description)
+            d.setWordWrap(True)
+            d.setStyleSheet("color:#8a92a6;")
+            v.addWidget(d)
+
+        form_host = QWidget()
+        form = QFormLayout(form_host)
+        form.setContentsMargins(0, 4, 0, 4)
+        for param in mode.params:
+            widget, getter = build_param_widget(param)
+            if param.kind == "clip_ref":
+                widget.addItems(list(motion_labels or []))
+                self._clip_ref_names.append(param.name)
+            if isinstance(widget, AutoParamWidget) and beat_provider is not None:
+                widget.beatsRequested.connect(lambda w=widget: self._fill_beats(w))
+            form.addRow(param.label or param.name, widget)
+            self._getters[param.name] = getter
+            self._param_widgets[param.name] = widget
+        v.addWidget(form_host)
+        if params:
+            for name, widget in self._param_widgets.items():
+                if name in params:
+                    _set_param_value(widget, params[name])
+
+        self._region_chk = None
+        if kind == "mosh":
+            self._region_chk = QCheckBox("Limit to a frame range")
+            self._region_start = _make_spin(Param("s", "int", 0, lo=0, hi=1_000_000))
+            self._region_end = _make_spin(Param("e", "int", 0, lo=0, hi=1_000_000))
+            self._region_end.setSpecialValueText("end")   # 0 shows as "end" (= None)
+            rrow = QHBoxLayout()
+            rrow.addWidget(self._region_chk)
+            rrow.addWidget(self._region_start)
+            rrow.addWidget(QLabel("–"))
+            rrow.addWidget(self._region_end)
+            rrow.addStretch(1)
+            v.addLayout(rrow)
+            self._region_chk.toggled.connect(self._sync_region)
+            if region:
+                self._region_chk.setChecked(True)
+                self._region_start.setValue(int(region[0]))
+                self._region_end.setValue(0 if region[1] is None else int(region[1]))
+            self._sync_region(bool(region))
+
+        bar = QHBoxLayout()
+        rnd = QPushButton("🎲 Randomise")
+        rnd.setToolTip("Roll random values into the parameters")
+        rnd.clicked.connect(self._randomise)
+        bar.addWidget(rnd)
+        bar.addStretch(1)
+        v.addLayout(bar)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self._on_accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def result_params(self) -> dict:
+        return {name: g() for name, g in self._getters.items()}
+
+    def result_region(self):
+        if not self._region_chk or not self._region_chk.isChecked():
+            return None
+        end = self._region_end.value()
+        return [self._region_start.value(), (None if end == 0 else end)]
+
+    def _sync_region(self, on) -> None:
+        self._region_start.setEnabled(bool(on))
+        self._region_end.setEnabled(bool(on))
+
+    def _on_accept(self) -> None:
+        vals = self.result_params()
+        if any(not vals.get(n) for n in self._clip_ref_names):
+            QMessageBox.warning(self, "Motion source needed",
+                                "Pick a motion source first (import a clip and add "
+                                "it to the motion track).")
+            return
+        self.accept()
+
+    def _randomise(self) -> None:
+        import random
+        for p in _mode_for(self._kind, self.mode_name).params:
+            w = self._param_widgets.get(p.name)
+            has_range = p.lo is not None and p.hi is not None
+            num = (random.randint(int(p.lo), int(p.hi)) if p.kind == "int"
+                   else round(random.uniform(float(p.lo), float(p.hi)), 2)
+                   ) if has_range else None
+            if isinstance(w, AutoParamWidget):
+                if has_range:
+                    w.set_value(num)
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                if has_range:
+                    w.setValue(num)
+            elif isinstance(w, QCheckBox):
+                w.setChecked(random.random() < 0.5)
+            elif isinstance(w, QComboBox) and p.kind == "choice" and p.choices:
+                w.setCurrentText(str(random.choice(p.choices)))
+
+    def _fill_beats(self, widget) -> None:
+        from .. import beats
+        if not self._beat_provider or not self._clip_id:
+            QMessageBox.information(self, "No beats yet",
+                                    "Render a preview with audio (unmute) first so "
+                                    "the beats can be detected.")
+            return
+        positions = self._beat_provider(self._clip_id)
+        if not positions:
+            QMessageBox.information(self, "No beats", "No beats found in this clip.")
+            return
+        low, high, is_int = widget.beat_range()
+        widget.apply_curve(beats.pulse_curve(positions, low, high, is_int=is_int))
 
 
 # --------------------------------------------------------------------------- #
@@ -1240,9 +1448,6 @@ class InspectorPanel(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._getters: Dict[str, Callable] = {}
-        self._param_widgets: Dict[str, QWidget] = {}
-        self._clip_ref_combos: List[QComboBox] = []
         self._motion_labels: List[str] = []
         self._clip_id: Optional[str] = None
         self._populating = False
@@ -1279,17 +1484,20 @@ class InspectorPanel(QWidget):
 
         layout.addWidget(_heading("Effects (top → bottom)"))
         self.effect_list = QListWidget()
-        self.effect_list.setMaximumHeight(108)
+        self.effect_list.setMaximumHeight(140)
         self.effect_list.setToolTip("This clip's effect stack, applied top to "
-                                    "bottom. Toggle the checkbox to enable/disable.")
+                                    "bottom. Double-click an effect to edit it; "
+                                    "toggle the checkbox to enable/disable.")
         self.effect_list.currentRowChanged.connect(self._on_effect_row)
         self.effect_list.itemChanged.connect(self._on_effect_item_changed)
+        self.effect_list.itemDoubleClicked.connect(self._edit_effect_item)
         layout.addWidget(self.effect_list)
 
         stack_btns = QHBoxLayout()
-        self.add_btn = QPushButton("+ Add")
-        self.add_btn.setToolTip("Add the effect configured below to the stack")
-        self.add_btn.clicked.connect(self._emit_add)
+        self.add_btn = QPushButton("+ Add ▾")
+        self.add_btn.setToolTip("Add a corruption effect (grouped by type); its "
+                                "parameters open in a pop-up.")
+        self.add_btn.clicked.connect(self._show_add_menu)
         self.remove_btn = QPushButton("− Remove")
         self.remove_btn.clicked.connect(self._emit_remove)
         self.up_btn = QPushButton("↑")
@@ -1301,34 +1509,6 @@ class InspectorPanel(QWidget):
         for b in (self.add_btn, self.remove_btn, self.up_btn, self.down_btn):
             stack_btns.addWidget(b)
         layout.addLayout(stack_btns)
-
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(available_modes())
-        self.mode_combo.currentTextChanged.connect(self._rebuild_params)
-        layout.addWidget(self.mode_combo)
-
-        self.desc_lbl = QLabel("")
-        self.desc_lbl.setWordWrap(True)
-        self.desc_lbl.setStyleSheet("color:#8a92a6;")
-        layout.addWidget(self.desc_lbl)
-
-        self._form_host = QWidget()
-        self._form = QFormLayout(self._form_host)
-        self._form.setContentsMargins(0, 4, 0, 4)
-        layout.addWidget(self._form_host)
-
-        layout.addWidget(self._build_region_row())
-
-        editor_row = QHBoxLayout()
-        self.apply_btn = QPushButton("Apply to selected effect")
-        self.apply_btn.clicked.connect(self._emit_update)
-        self.random_btn = QPushButton("🎲")
-        self.random_btn.setMaximumWidth(36)
-        self.random_btn.setToolTip("Randomise the parameters below")
-        self.random_btn.clicked.connect(self._randomize_editor)
-        editor_row.addWidget(self.apply_btn)
-        editor_row.addWidget(self.random_btn)
-        layout.addLayout(editor_row)
 
         preset_row = QHBoxLayout()
         self.preset_combo = QComboBox()
@@ -1367,7 +1547,6 @@ class InspectorPanel(QWidget):
         layout.addStretch(1)
 
         self.set_enabled_for_clip(None, None)
-        self._rebuild_params(self.mode_combo.currentText())
 
     # -- clip finishing (speed / reverse / fades / crossfade) --------------- #
 
@@ -1942,74 +2121,21 @@ class InspectorPanel(QWidget):
 
     # -- effect region (apply to a frame range) ----------------------------- #
 
-    def _build_region_row(self) -> QWidget:
-        host = QWidget()
-        row = QHBoxLayout(host)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
-        self.region_chk = QCheckBox("Limit to frames")
-        self.region_chk.setToolTip("Apply this effect to only a frame range of "
-                                   "its input (the clip, for the first effect).")
-        self.region_start = QSpinBox()
-        self.region_start.setRange(0, 1_000_000)
-        self.region_end = QSpinBox()
-        self.region_end.setRange(0, 1_000_000)
-        self.region_end.setSpecialValueText("end")     # 0 shows as "end" (= None)
-        self.region_chk.toggled.connect(self._sync_region)
-        row.addWidget(self.region_chk)
-        row.addWidget(self.region_start)
-        row.addWidget(QLabel("–"))
-        row.addWidget(self.region_end)
-        row.addStretch(1)
-        self._region_host = host
-        return host
-
-    def _sync_region(self, *_a) -> None:
-        on = self.region_chk.isChecked()
-        self.region_start.setEnabled(on)
-        self.region_end.setEnabled(on)
-
-    def _editor_region(self):
-        if not self.region_chk.isChecked():
-            return None
-        end = self.region_end.value()
-        return [self.region_start.value(), (None if end == 0 else end)]
-
-    def _populate_region(self, region) -> None:
-        if region:
-            self.region_chk.setChecked(True)
-            self.region_start.setValue(int(region[0]))
-            self.region_end.setValue(0 if region[1] is None else int(region[1]))
-        else:
-            self.region_chk.setChecked(False)
-            self.region_start.setValue(0)
-            self.region_end.setValue(0)
-        self._sync_region()
-
     # -- external state ----------------------------------------------------- #
 
     def set_motion_labels(self, labels: List[str]) -> None:
+        # stored for the effect dialog's clip_ref (motion-source) pickers
         self._motion_labels = list(labels)
-        for combo in self._clip_ref_combos:
-            current = combo.currentText()
-            combo.clear()
-            combo.addItems(self._motion_labels)
-            if current in self._motion_labels:
-                combo.setCurrentText(current)
 
     def set_enabled_for_clip(self, clip_id: Optional[str], label: Optional[str],
                              clip=None, effects: Optional[List[dict]] = None) -> None:
         self._clip_id = clip_id
         on = clip_id is not None
         self._body.setVisible(on)           # blank panel until a clip is selected
-        self.mode_combo.setEnabled(on)
         self.bake_btn.setEnabled(on)
         self.flow_btn.setEnabled(on)
-        self.random_btn.setEnabled(on)
         self.preset_save_btn.setEnabled(on)
         self.preset_apply_btn.setEnabled(on)
-        self._form_host.setEnabled(on)
-        self._region_host.setEnabled(on)
         self._clip_group.setEnabled(on)
         self._pixel_group.setEnabled(on)
         self._raw_group.setEnabled(on)
@@ -2058,34 +2184,46 @@ class InspectorPanel(QWidget):
             row = len(self._effects) - 1          # default to the newest
         self._populating = False
         if row >= 0:
-            self.effect_list.setCurrentRow(row)   # -> _on_effect_row populates editor
+            self.effect_list.setCurrentRow(row)   # -> _on_effect_row selects it
         else:
             self._selected_op = None
-            self._populate_region(None)
             self._update_stack_buttons()
 
     def _on_effect_row(self, row: int) -> None:
         if self._populating:
             return
-        if 0 <= row < len(self._effects):
-            e = self._effects[row]
-            self._selected_op = e["id"]
-            self._load_effect(e["mode"], e["params"])
-            self._populate_region(e.get("region"))
-        else:
-            self._selected_op = None
-            self._populate_region(None)
+        self._selected_op = (self._effects[row]["id"]
+                             if 0 <= row < len(self._effects) else None)
         self._update_stack_buttons()
 
-    def _load_effect(self, mode: str, params: dict) -> None:
-        self._populating = True
-        if mode and mode != self.mode_combo.currentText():
-            self.mode_combo.setCurrentText(mode)   # triggers _rebuild_params
-        else:
-            self._rebuild_params(self.mode_combo.currentText())
-        if params:
-            self._apply_values(params)
-        self._populating = False
+    def _show_add_menu(self) -> None:
+        """Grouped '+ Add' menu of mosh corruption types; a pick opens its dialog."""
+        if self._clip_id is None:
+            return
+        menu = effect_add_menu(self, "mosh", self._add_effect)
+        menu.exec(self.add_btn.mapToGlobal(self.add_btn.rect().bottomLeft()))
+
+    def _add_effect(self, mode_name: str) -> None:
+        dlg = EffectParamDialog(
+            self, kind="mosh", mode_name=mode_name, verb="Add",
+            motion_labels=self._motion_labels, beat_provider=self._beat_provider,
+            clip_id=self._clip_id)
+        if dlg.exec():
+            self.effectAddRequested.emit(mode_name, dlg.result_params(),
+                                         dlg.result_region())
+
+    def _edit_effect_item(self, item: QListWidgetItem) -> None:
+        op_id = item.data(Qt.ItemDataRole.UserRole)
+        e = next((x for x in self._effects if x["id"] == op_id), None)
+        if e is None:
+            return
+        dlg = EffectParamDialog(
+            self, kind="mosh", mode_name=e["mode"], params=e.get("params") or {},
+            region=e.get("region"), motion_labels=self._motion_labels,
+            beat_provider=self._beat_provider, clip_id=self._clip_id, verb="Edit")
+        if dlg.exec():
+            self.effectUpdateRequested.emit(op_id, e["mode"], dlg.result_params(),
+                                            dlg.result_region())
 
     def _on_effect_item_changed(self, item: QListWidgetItem) -> None:
         if self._populating:
@@ -2098,62 +2236,18 @@ class InspectorPanel(QWidget):
         has_clip = self._clip_id is not None
         has_sel = self._selected_op is not None and has_clip
         self.add_btn.setEnabled(has_clip)
-        self.apply_btn.setEnabled(has_sel)
         self.remove_btn.setEnabled(has_sel)
         idx = next((i for i, e in enumerate(self._effects)
                     if e["id"] == self._selected_op), -1)
         self.up_btn.setEnabled(has_sel and idx > 0)
         self.down_btn.setEnabled(has_sel and 0 <= idx < len(self._effects) - 1)
 
-    # -- params form -------------------------------------------------------- #
-
-    def _rebuild_params(self, mode_name: str) -> None:
-        while self._form.rowCount():
-            self._form.removeRow(0)
-        self._getters = {}
-        self._param_widgets = {}
-        self._clip_ref_combos = []
-        if not mode_name:
-            return
-        mode = get_mode(mode_name)
-        self.desc_lbl.setText(mode.description)
-        for param in mode.params:
-            widget, getter = build_param_widget(param)
-            if param.kind == "clip_ref":
-                widget.addItems(self._motion_labels)
-                self._clip_ref_combos.append(widget)
-            if isinstance(widget, AutoParamWidget):
-                widget.beatsRequested.connect(
-                    lambda w=widget: self._fill_beats(w))
-            if param.help:
-                widget.setToolTip(param.help)
-            self._form.addRow(param.label or param.name, widget)
-            self._getters[param.name] = getter
-            self._param_widgets[param.name] = widget
-
     def set_beat_provider(self, provider) -> None:
-        """Inject a callable ``clip_id -> [normalised beat positions]``."""
+        """Inject a callable ``clip_id -> [normalised beat positions]`` (used by
+        the effect dialog's automatable params)."""
         self._beat_provider = provider
 
-    def _fill_beats(self, widget) -> None:
-        """Populate a parameter's keyframes from the audio beats of this clip."""
-        from .. import beats
-        if not self._beat_provider or not self._clip_id:
-            self.clip_lbl.setText(
-                "<span style='color:#ffd166'>Render a preview with audio first "
-                "(unmute) to detect beats.</span>")
-            return
-        positions = self._beat_provider(self._clip_id)
-        if not positions:
-            self.clip_lbl.setText(
-                "<span style='color:#ffd166'>No beats found in this clip's "
-                "audio.</span>")
-            return
-        low, high, is_int = widget.beat_range()
-        spec = beats.pulse_curve(positions, low, high, is_int=is_int)
-        widget.apply_curve(spec)
-
-    # -- presets & randomiser ----------------------------------------------- #
+    # -- presets ------------------------------------------------------------ #
 
     def set_presets(self, names: List[str]) -> None:
         cur = self.preset_combo.currentText()
@@ -2173,58 +2267,6 @@ class InspectorPanel(QWidget):
         name = self.preset_combo.currentText()
         if name:
             self.presetDeleteRequested.emit(name)
-
-    def _randomize_editor(self) -> None:
-        """Roll random values into the editor's numeric/choice params."""
-        import random
-        for p in get_mode(self.mode_combo.currentText()).params:
-            w = self._param_widgets.get(p.name)
-            has_range = p.lo is not None and p.hi is not None
-            rand_num = (random.randint(int(p.lo), int(p.hi)) if p.kind == "int"
-                        else round(random.uniform(float(p.lo), float(p.hi)), 2)
-                        ) if has_range else None
-            if isinstance(w, AutoParamWidget):
-                if has_range:
-                    w.set_value(rand_num)          # static (automation off)
-            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
-                if has_range:
-                    w.setValue(rand_num)
-            elif isinstance(w, QCheckBox):
-                w.setChecked(random.random() < 0.5)
-            elif isinstance(w, QComboBox) and p.kind == "choice" and p.choices:
-                w.setCurrentText(str(random.choice(p.choices)))
-
-    def _apply_values(self, params: dict) -> None:
-        # Reflect an existing op's params back into the controls (best effort).
-        for name, getter in self._getters.items():
-            if name in params:
-                _set_param_value(getattr(getter, "__self__", None), params[name])
-
-    def _editor_mode_params(self):
-        """Current editor mode + params, or (None, None) if a required motion
-        source is missing (with a hint shown)."""
-        params = {name: getter() for name, getter in self._getters.items()}
-        mode = self.mode_combo.currentText()
-        for param in get_mode(mode).params:
-            if param.kind == "clip_ref" and not params.get(param.name):
-                self.clip_lbl.setText(
-                    "<span style='color:#ff5470'>Import a motion clip and add "
-                    "it to the motion track first.</span>")
-                return None, None
-        return mode, params
-
-    def _emit_add(self) -> None:
-        mode, params = self._editor_mode_params()
-        if mode is not None:
-            self.effectAddRequested.emit(mode, params, self._editor_region())
-
-    def _emit_update(self) -> None:
-        if not self._selected_op:
-            return
-        mode, params = self._editor_mode_params()
-        if mode is not None:
-            self.effectUpdateRequested.emit(self._selected_op, mode, params,
-                                            self._editor_region())
 
     def _emit_remove(self) -> None:
         if self._selected_op:
