@@ -34,6 +34,39 @@ BLEND_MODES = {
     "softlight": "softlight",
 }
 
+# Matte sources for layer/effect masks.
+MASK_SOURCES = ("luma", "alpha", "motion")
+
+
+def mask_chain(spec: Dict) -> str:
+    """FFmpeg filter string turning a video into a grayscale matte per *spec*.
+
+    *spec* is ``{source, lo, hi, invert, feather}``: ``source`` is ``luma`` (the
+    picture's brightness), ``alpha`` (its transparency -- opaque where the source
+    carries no alpha) or ``motion`` (frame-to-frame difference). ``lo``/``hi``
+    (0..1) are a soft threshold ramp -- below ``lo`` the matte is black, above
+    ``hi`` white, linear between (so the band doubles as feathering). ``invert``
+    flips it; ``feather`` blurs the edges by that many pixels (sigma)."""
+    source = str(spec.get("source", "luma"))
+    lo = max(0.0, min(1.0, float(spec.get("lo", 0.0))))
+    hi = max(0.0, min(1.0, float(spec.get("hi", 1.0))))
+    invert = bool(spec.get("invert", False))
+    feather = max(0, int(spec.get("feather", 0)))
+    if source == "alpha":
+        chain = ["format=yuva420p", "alphaextract"]   # opaque -> white if no alpha
+    elif source == "motion":
+        chain = ["tblend=all_mode=difference", "format=gray"]
+    else:                                             # luma
+        chain = ["format=gray"]
+    lo255 = lo * 255.0
+    span = max(1.0, (hi - lo) * 255.0)
+    chain.append(f"lutyuv=y='clip((val-{lo255:.3f})/{span:.3f}*255,0,255)'")
+    if invert:
+        chain.append("lutyuv=y='255-val'")
+    if feather > 0:
+        chain.append(f"gblur=sigma={feather}")
+    return ",".join(chain)
+
 
 def _atempo_chain(speed: float) -> List[str]:
     """`atempo` filters whose product is *speed* (each stage stays in 0.5..2.0)."""
@@ -400,8 +433,10 @@ class FFmpeg:
         adjacent clips are folded together with ``xfade`` (crossfade) where
         ``transition_in`` is set, else ``concat`` (a hard cut). ``meta[i]`` is
         ``{n, speed, reverse, fade_in, fade_out, transition_in, pixel}`` (frame
-        counts plus a list of filter strings). ``settb`` pins a common timebase
-        so ``xfade`` accepts the concat output; pixel filters are followed by a
+        counts plus a list of filter strings), and an optional ``fx_mask`` matte
+        spec that gates the pixel filters through ``maskedmerge`` (the FX show
+        only where the matte is bright). ``settb`` pins a common timebase so
+        ``xfade`` accepts the concat output; pixel filters are followed by a
         ``scale`` back to ``width x height`` so size-changing ones stay foldable.
         """
         tb = int(round(fps))
@@ -411,26 +446,39 @@ class FFmpeg:
             n = int(m["n"])
             speed = float(m.get("speed", 1.0)) or 1.0
             mlen = max(1, round(n / speed)) if speed != 1.0 else n
-            chain: List[str] = []
+            head: List[str] = []                   # common: retime + fades
             if m.get("reverse"):
-                chain.append("reverse")
+                head.append("reverse")
             if speed != 1.0:
-                chain.append(f"setpts={1.0 / speed:.6f}*PTS")
-            chain.append(f"fps={fps:g}")
+                head.append(f"setpts={1.0 / speed:.6f}*PTS")
+            head.append(f"fps={fps:g}")
             fi, fo = int(m.get("fade_in", 0)), int(m.get("fade_out", 0))
             if fi > 0:
-                chain.append(f"fade=t=in:st=0:d={fi / fps:.6f}")
+                head.append(f"fade=t=in:st=0:d={fi / fps:.6f}")
             if fo > 0:
-                chain.append(f"fade=t=out:st={max(0.0, (mlen - fo) / fps):.6f}:"
-                             f"d={fo / fps:.6f}")
+                head.append(f"fade=t=out:st={max(0.0, (mlen - fo) / fps):.6f}:"
+                            f"d={fo / fps:.6f}")
             pixel = m.get("pixel") or []
-            if pixel:
-                chain.extend(pixel)
-                if width and height:           # restore exact geometry for the fold
-                    chain.append(f"scale={int(width)}:{int(height)}:flags=bicubic")
-            chain.append("format=yuv420p")
-            chain.append(f"settb=1/{tb}")
-            parts.append(f"[{i}:v]" + ",".join(chain) + f"[v{i}]")
+            fx: List[str] = list(pixel)
+            if pixel and width and height:         # restore exact geometry for the fold
+                fx.append(f"scale={int(width)}:{int(height)}:flags=bicubic")
+            fx_mask = m.get("fx_mask")
+            if pixel and fx_mask:                  # gate the FX through a matte
+                # alpha the FX branch by the matte and overlay it on the original,
+                # so only the matte's bright areas take the effect (overlay's
+                # single-channel alpha avoids maskedmerge's per-plane chroma bug)
+                mc = mask_chain(fx_mask)
+                parts.append(f"[{i}:v]" + ",".join(head) + f"[hd{i}]")
+                parts.append(f"[hd{i}]split=3[fo{i}][ff{i}][fm{i}]")
+                parts.append(f"[ff{i}]" + ",".join(fx) + f",format=yuva420p[fxc{i}]")
+                parts.append(f"[fm{i}]{mc}[fmk{i}]")
+                parts.append(f"[fxc{i}][fmk{i}]alphamerge[fxm{i}]")
+                parts.append(f"[fo{i}]format=yuv420p[forig{i}]")
+                parts.append(f"[forig{i}][fxm{i}]overlay=eof_action=pass,"
+                             f"format=yuv420p,settb=1/{tb}[v{i}]")
+            else:
+                chain = head + fx + ["format=yuv420p", f"settb=1/{tb}"]
+                parts.append(f"[{i}:v]" + ",".join(chain) + f"[v{i}]")
             lens.append(mlen)
 
         acc, acc_len = "[v0]", lens[0]
@@ -463,7 +511,9 @@ class FFmpeg:
         """Composite positioned layers onto a black canvas, bottom-to-top.
 
         *layers* is ordered bottom→top; each is ``{"input", "start", "length",
-        "opacity", "blend", "head_fade"}`` (frame counts). Each input becomes a
+        "opacity", "blend", "head_fade"}`` (frame counts) plus an optional
+        ``"mask"`` matte spec (see :func:`mask_chain`) multiplied into the layer's
+        alpha so it shows through only where the matte is bright. Each input becomes a
         full-length layer (transparent outside its [start, start+length] window),
         scaled to ``width x height`` with its alpha set by ``opacity`` and ramped
         in over its first ``head_fade`` frames (the crossfade with whatever is
@@ -494,10 +544,22 @@ class FFmpeg:
             if startT > 0:
                 chain.append(f"setpts=PTS+{startT:.6f}/TB")
             parts.append(f"[{i}:v]" + ",".join(chain) + f"[c{i}]")
+            # optional layer matte: derive a grayscale mask from the clip itself
+            # and multiply it into the clip's alpha (preserving opacity/head_fade)
+            clip_lbl = f"[c{i}]"
+            mask = lay.get("mask")
+            if mask:
+                mc = mask_chain(mask)
+                parts.append(f"[c{i}]split=3[cb{i}][cm{i}][ca{i}]")
+                parts.append(f"[cm{i}]{mc}[mk{i}]")
+                parts.append(f"[ca{i}]alphaextract[caa{i}]")
+                parts.append(f"[caa{i}][mk{i}]blend=all_mode=multiply[cmm{i}]")
+                parts.append(f"[cb{i}][cmm{i}]alphamerge[cmsk{i}]")
+                clip_lbl = f"[cmsk{i}]"
             # place the (delayed) clip on a full-length transparent canvas
             parts.append(f"color=c=black@0:s={w}x{h}:r={fps:g}:d={dur:.6f},"
                          f"format=yuva420p,settb=1/{tb}[t{i}]")
-            parts.append(f"[t{i}][c{i}]overlay=eof_action=pass:repeatlast=0[lay{i}]")
+            parts.append(f"[t{i}]{clip_lbl}overlay=eof_action=pass:repeatlast=0[lay{i}]")
             mode = str(lay.get("blend", "normal"))
             if mode == "normal" or mode not in BLEND_MODES:
                 parts.append(f"[acc{i}][lay{i}]overlay=eof_action=pass[acc{i + 1}]")

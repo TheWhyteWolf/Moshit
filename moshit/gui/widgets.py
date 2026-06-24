@@ -1214,6 +1214,7 @@ class InspectorPanel(QWidget):
     rawFxAddRequested = Signal(str)                # raw (numpy) mode name
     rawFxRemoveRequested = Signal(int)             # index in the clip's raw list
     rawFxParamsChanged = Signal(int, dict)         # index, params
+    maskChanged = Signal(str, object)              # kind ("layer"|"fx"), spec|None
     flowTransferRequested = Signal()               # optical-flow transfer (bake)
     flowChanged = Signal(object)                    # live flow_transfer dict / None
     bakeRequested = Signal()
@@ -1236,6 +1237,7 @@ class InspectorPanel(QWidget):
         self._raw_fx: List[dict] = []
         self._raw_getters: Dict[str, Callable] = {}
         self._raw_sel = -1
+        self._mask_editors: Dict[str, dict] = {}
         self._beat_provider: Optional[Callable] = None    # clip_id -> [pos, ...]
 
         layout = QVBoxLayout(self)
@@ -1247,6 +1249,7 @@ class InspectorPanel(QWidget):
         layout.addWidget(self._build_clip_group())
         layout.addWidget(self._build_pixel_group())
         layout.addWidget(self._build_raw_group())
+        layout.addWidget(self._build_mask_group())
         layout.addWidget(self._build_flow_group())
 
         layout.addWidget(_heading("Effects (top → bottom)"))
@@ -1648,6 +1651,93 @@ class InspectorPanel(QWidget):
         params = {name: getter() for name, getter in self._raw_getters.items()}
         self.rawFxParamsChanged.emit(self._raw_sel, params)
 
+    # -- masks (layer matte + FX matte, keyed by luma/alpha/motion) ---------- #
+
+    def _build_mask_group(self) -> QWidget:
+        group = QWidget()
+        v = QVBoxLayout(group)
+        v.setContentsMargins(0, 0, 0, 4)
+        v.setSpacing(3)
+        v.addWidget(_heading("Masks"))
+        self._mask_editors = {}
+        for kind, label, tip in (
+                ("layer", "Layer matte",
+                 "Show this clip through a matte when compositing "
+                 "(reveals the track below where the matte is dark)."),
+                ("fx", "FX matte",
+                 "Apply this clip's pixel FX only where the matte is bright.")):
+            self._mask_editors[kind] = self._build_mask_editor(v, kind, label, tip)
+        self._mask_group = group
+        return group
+
+    def _build_mask_editor(self, parent: QVBoxLayout, kind: str, label: str,
+                           tip: str) -> dict:
+        from ..ffmpeg import MASK_SOURCES
+        enable = QCheckBox(label)
+        enable.setToolTip(tip)
+        parent.addWidget(enable)
+        host = QWidget()
+        form = QFormLayout(host)
+        form.setContentsMargins(12, 0, 0, 2)
+        form.setSpacing(2)
+        source = QComboBox()
+        source.addItems(MASK_SOURCES)
+        lo = QDoubleSpinBox()
+        lo.setRange(0.0, 1.0)
+        lo.setSingleStep(0.05)
+        hi = QDoubleSpinBox()
+        hi.setRange(0.0, 1.0)
+        hi.setSingleStep(0.05)
+        hi.setValue(1.0)
+        invert = QCheckBox("Invert")
+        feather = QSpinBox()
+        feather.setRange(0, 50)
+        feather.setSuffix(" px")
+        form.addRow("Source", source)
+        form.addRow("Threshold lo", lo)
+        form.addRow("Threshold hi", hi)
+        form.addRow("", invert)
+        form.addRow("Feather", feather)
+        parent.addWidget(host)
+        host.setVisible(False)
+        ed = {"enable": enable, "host": host, "source": source, "lo": lo,
+              "hi": hi, "invert": invert, "feather": feather}
+        enable.toggled.connect(host.setVisible)
+        for w in (enable, invert):
+            w.toggled.connect(lambda _=False, k=kind: self._emit_mask(k))
+        source.currentTextChanged.connect(lambda _=None, k=kind: self._emit_mask(k))
+        for sp in (lo, hi, feather):
+            sp.valueChanged.connect(lambda _=None, k=kind: self._emit_mask(k))
+        return ed
+
+    def _emit_mask(self, kind: str) -> None:
+        if self._populating or self._clip_id is None:
+            return
+        self.maskChanged.emit(kind, self._read_mask(kind))
+
+    def _read_mask(self, kind: str):
+        ed = self._mask_editors[kind]
+        if not ed["enable"].isChecked():
+            return None
+        return {"source": ed["source"].currentText(),
+                "lo": round(ed["lo"].value(), 4), "hi": round(ed["hi"].value(), 4),
+                "invert": ed["invert"].isChecked(), "feather": ed["feather"].value()}
+
+    def set_clip_masks(self, layer_spec, fx_spec) -> None:
+        self._populating = True
+        for kind, spec in (("layer", layer_spec), ("fx", fx_spec)):
+            ed = self._mask_editors[kind]
+            on = bool(spec)
+            ed["enable"].setChecked(on)
+            ed["host"].setVisible(on)
+            spec = spec or {}
+            ed["source"].setCurrentText(str(spec.get("source", "luma")))
+            ed["lo"].setValue(float(spec.get("lo", 0.0)))
+            ed["hi"].setValue(float(spec.get("hi", 1.0)))
+            ed["invert"].setChecked(bool(spec.get("invert", False)))
+            ed["feather"].setValue(int(spec.get("feather", 0)))
+        self._populating = False
+
     # -- flow FX (live optical-flow warp) ----------------------------------- #
 
     def _build_flow_group(self) -> QWidget:
@@ -1842,6 +1932,7 @@ class InspectorPanel(QWidget):
         self._clip_group.setEnabled(on)
         self._pixel_group.setEnabled(on)
         self._raw_group.setEnabled(on)
+        self._mask_group.setEnabled(on)
         self._flow_group.setEnabled(on)
         self.effect_list.setEnabled(on)
         if on:
@@ -1849,6 +1940,8 @@ class InspectorPanel(QWidget):
             self._populate_clip_props(clip if clip is not None else object())
             self.set_clip_pixel_fx(getattr(clip, "pixel_effects", []))
             self.set_clip_raw_fx(getattr(clip, "raw_effects", []))
+            self.set_clip_masks(getattr(clip, "layer_mask", None),
+                                getattr(clip, "fx_mask", None))
             self._populate_flow(getattr(clip, "flow_transfer", None))
             self.set_clip_effects(effects or [])
         else:
@@ -1856,6 +1949,7 @@ class InspectorPanel(QWidget):
             self._populate_clip_props(object())        # reset to defaults
             self.set_clip_pixel_fx([])
             self.set_clip_raw_fx([])
+            self.set_clip_masks(None, None)
             self._populate_flow(None)
             self.set_clip_effects([])
         self._update_stack_buttons()

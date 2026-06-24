@@ -468,6 +468,7 @@ class MainWindow(QMainWindow):
         self.inspector.rawFxAddRequested.connect(self._on_raw_add)
         self.inspector.rawFxRemoveRequested.connect(self._on_raw_remove)
         self.inspector.rawFxParamsChanged.connect(self._on_raw_params)
+        self.inspector.maskChanged.connect(self._on_mask_changed)
         self.inspector.bakeRequested.connect(self._on_bake)
         self.inspector.revertRequested.connect(lambda: c.revert_last_bake())
         self.inspector.clipPropsChanged.connect(self._on_clip_props)
@@ -594,6 +595,11 @@ class MainWindow(QMainWindow):
     def _on_raw_params(self, index: int, params: dict) -> None:
         if self._selected_clip:
             self.controller.update_raw_fx(self._selected_clip, index, params)
+            self._schedule_auto_refresh(immediate=True)
+
+    def _on_mask_changed(self, kind: str, spec) -> None:
+        if self._selected_clip:
+            self.controller.set_clip_mask(self._selected_clip, kind, spec)
             self._schedule_auto_refresh(immediate=True)
 
     def _on_flow_transfer(self) -> None:

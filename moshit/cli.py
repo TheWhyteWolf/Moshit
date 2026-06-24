@@ -866,6 +866,27 @@ def cmd_selftest(args) -> int:
     else:
         print("  [skip] numpy not installed; pixel_sort math not exercised")
 
+    print("\nK3. Masking (layer + FX mattes)")
+    from .ffmpeg import MASK_SOURCES, mask_chain
+    _check(MASK_SOURCES == ("luma", "alpha", "motion"),
+           "mask sources are luma / alpha / motion", failures)
+    _check(mask_chain({"source": "luma", "lo": 0.0, "hi": 1.0})
+           .startswith("format=gray,lutyuv="),
+           "luma matte builds a gray + lutyuv ramp", failures)
+    _check("tblend=all_mode=difference" in mask_chain({"source": "motion"}),
+           "motion matte uses a frame-difference", failures)
+    _check("alphaextract" in mask_chain({"source": "alpha"}),
+           "alpha matte extracts the alpha plane", failures)
+    mc = mask_chain({"source": "luma", "invert": True, "feather": 4})
+    _check("255-val" in mc and "gblur=sigma=4" in mc,
+           "invert + feather extend the matte chain", failures)
+    mclip = Clip(id="mc", media_id="m", track="main",
+                 layer_mask={"source": "motion", "lo": 0.1, "hi": 0.6},
+                 fx_mask={"source": "luma", "invert": True})
+    mrt = Clip.from_dict(mclip.to_dict())
+    _check(mrt.layer_mask["source"] == "motion" and mrt.fx_mask["invert"] is True,
+           "layer/FX mattes survive a Clip JSON round-trip", failures)
+
     print("\nL. Compositing tracks & nested sequences")
     from .project import MAIN_TRACK_ID, MOTION_TRACK_ID
     lproj = Project(name="l", assets_dir=str(tmp / "assets_l"))

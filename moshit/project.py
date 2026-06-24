@@ -97,6 +97,8 @@ class Clip:
     pixel_effects: List = field(default_factory=list)  # [{name, params}] FFmpeg FX
     raw_effects: List = field(default_factory=list)     # [{name, params}] numpy FX
     flow_transfer: Optional[Dict] = None   # live optical-flow warp (see render)
+    layer_mask: Optional[Dict] = None      # compositing matte (luma/alpha/motion)
+    fx_mask: Optional[Dict] = None         # matte gating this clip's pixel FX
 
     def has_finish(self) -> bool:
         """True if this clip needs the pixel-domain finish pass."""
@@ -630,6 +632,7 @@ class Project:
         simple = len(occupied) == 1 and self._is_contiguous(clips) and all(
             abs(getattr(c, "opacity", 1.0) - 1.0) < 1e-6
             and getattr(c, "blend_mode", "normal") == "normal"
+            and getattr(c, "layer_mask", None) is None    # a matte needs compositing
             for c in clips)
         if simple:
             return self._render_flat(
@@ -776,7 +779,8 @@ class Project:
         meta = [{"n": len(frames), "speed": clip.speed, "reverse": clip.reverse,
                  "fade_in": clip.fade_in, "fade_out": clip.fade_out,
                  "transition_in": 0,
-                 "pixel": self._pixel_filters(clip, nframes=len(frames))}]
+                 "pixel": self._pixel_filters(clip, nframes=len(frames)),
+                 "fx_mask": clip.fx_mask}]
         finished = engine.finish_clips([seg], meta, engine._tmp(".avi"))
         try:
             Path(seg).unlink()
@@ -850,7 +854,8 @@ class Project:
             meta = [{"n": len(frames), "speed": c.speed, "reverse": c.reverse,
                      "fade_in": c.fade_in, "fade_out": c.fade_out,
                      "transition_in": c.transition_in,
-                     "pixel": self._pixel_filters(c, nframes=len(frames))}
+                     "pixel": self._pixel_filters(c, nframes=len(frames)),
+                     "fx_mask": c.fx_mask}
                     for c, _, frames in segs]
             out = engine.finish_clips(seg_avis, meta, out_avi)
             for s in seg_avis:               # consumed; don't pile up across renders
@@ -886,7 +891,8 @@ class Project:
                 seg, seglen = self._clip_segment(engine, clip)
                 layers.append({"input": seg, "start": int(start),
                                "length": seglen, "opacity": float(clip.opacity),
-                               "blend": clip.blend_mode, "head_fade": int(trans)})
+                               "blend": clip.blend_mode, "head_fade": int(trans),
+                               "mask": clip.layer_mask})
                 seq.append((clip, int(start), seglen, int(trans)))
             if seq:
                 track_seqs.append(seq)
@@ -1008,7 +1014,10 @@ class Project:
                         fade_in=target.fade_in, fade_out=target.fade_out,
                         transition_in=target.transition_in,
                         pixel_effects=[dict(pe) for pe in target.pixel_effects],
-                        raw_effects=[dict(re) for re in target.raw_effects])
+                        raw_effects=[dict(re) for re in target.raw_effects],
+                        layer_mask=dict(target.layer_mask) if target.layer_mask
+                        else None,
+                        fx_mask=dict(target.fx_mask) if target.fx_mask else None)
         self.clips.append(new_clip)
 
         target.enabled = False
@@ -1058,7 +1067,10 @@ class Project:
                         fade_in=target.fade_in, fade_out=target.fade_out,
                         transition_in=target.transition_in,
                         pixel_effects=[dict(pe) for pe in target.pixel_effects],
-                        raw_effects=[dict(re) for re in target.raw_effects])
+                        raw_effects=[dict(re) for re in target.raw_effects],
+                        layer_mask=dict(target.layer_mask) if target.layer_mask
+                        else None,
+                        fx_mask=dict(target.fx_mask) if target.fx_mask else None)
         self.clips.append(new_clip)
 
         target.enabled = False

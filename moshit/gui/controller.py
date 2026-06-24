@@ -664,6 +664,23 @@ class AppController(QObject):
         c.raw_effects[index]["params"] = dict(params)
         self.project_changed.emit()
 
+    def set_clip_mask(self, clip_id: str, kind: str, spec) -> None:
+        """Set a clip's ``layer`` or ``fx`` matte (None clears it)."""
+        try:
+            c = self.project.clip(clip_id)
+        except KeyError:
+            return
+        attr = {"layer": "layer_mask", "fx": "fx_mask"}.get(kind)
+        if attr is None:
+            return
+        spec = dict(spec) if spec else None
+        if getattr(c, attr) == spec:
+            return
+        self._push_undo()
+        setattr(c, attr, spec)
+        self.project_changed.emit()
+        self.status.emit(f"{'Layer' if kind == 'layer' else 'FX'} matte updated.")
+
     # -- effect stack ------------------------------------------------------- #
 
     @staticmethod

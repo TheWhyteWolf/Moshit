@@ -195,6 +195,36 @@ def test_inspector_raw_panel_round_trips(qapp):
     assert params[-1][1]["axis"] == "vertical"
 
 
+def test_set_clip_mask_and_undo(ctl):
+    _seed_clip(ctl, "c")
+    ctl.set_clip_mask("c", "layer", {"source": "motion", "lo": 0.1, "hi": 0.5})
+    assert ctl.project.clip("c").layer_mask["source"] == "motion"
+    ctl.set_clip_mask("c", "fx", {"source": "luma", "lo": 0.3, "hi": 0.8})
+    assert ctl.project.clip("c").fx_mask["lo"] == 0.3
+    ctl.undo()                                          # roll back the fx matte
+    assert ctl.project.clip("c").fx_mask is None
+    assert ctl.project.clip("c").layer_mask is not None
+    ctl.set_clip_mask("c", "layer", None)               # clearing it
+    assert ctl.project.clip("c").layer_mask is None
+
+
+def test_inspector_mask_editor_round_trips(qapp):
+    from moshit.gui.widgets import InspectorPanel
+    insp = InspectorPanel()
+    emitted = []
+    insp.maskChanged.connect(lambda k, s: emitted.append((k, s)))
+    insp._clip_id = "c"
+    insp.set_clip_masks({"source": "motion", "lo": 0.1, "hi": 0.5,
+                         "invert": True, "feather": 3}, None)
+    assert emitted == []                                # populating is silent
+    ed = insp._mask_editors["layer"]
+    assert ed["enable"].isChecked() and ed["source"].currentText() == "motion"
+    assert ed["invert"].isChecked() and ed["feather"].value() == 3
+    assert insp._read_mask("fx") is None                # disabled -> None
+    insp._mask_editors["fx"]["enable"].setChecked(True)  # user enables it -> emit
+    assert emitted and emitted[-1][0] == "fx" and emitted[-1][1] is not None
+
+
 def test_undo_redo_round_trips(win):
     ctl = win.controller
     _seed_clip(ctl, "c")
