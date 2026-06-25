@@ -315,22 +315,87 @@ class Project:
         return [{"name": re["name"], "params": re.get("params") or {}}
                 for re in (clip.raw_effects or []) if is_raw_mode(re.get("name"))]
 
-    def _apply_raw(self, engine: MoshEngine, clip: Clip, seg):
-        """Run a clip's raw effects on segment AVI *seg*, returning the (possibly
-        new) segment path; consumes *seg* when it produces a replacement. A clip's
-        ``fx_mask`` gates the raw effects too (same matte as its pixel FX)."""
-        from .modes import raw as _raw
-        specs = self._raw_specs(clip)
-        if not specs or not _raw.available():
-            return seg
-        out = engine.apply_raw_effects(seg, specs, engine._tmp(".avi"),
-                                       mask=clip.fx_mask)
+    def _flow_args(self, clip: Clip, nframes: int):
+        """``(flow_kwargs, motion_intermediate_path)`` for a clip's flow transfer,
+        or ``(None, None)`` if it has none / its motion source is missing. Shared
+        by the per-clip render paths so the flow region math lives in one place."""
+        ft = clip.flow_transfer
+        if not ft:
+            return None, None
+        motion_m = self._flow_motion_media(ft.get("source"))
+        if motion_m is None:
+            return None, None
+        n = int(nframes)
+        rs = max(0, int(ft.get("region_start", 0) or 0))
+        re = ft.get("region_end")
+        region = ((rs, n if re is None else min(int(re), n))
+                  if (rs > 0 or re is not None) else None)
+        return ({"hold": ft.get("hold", True),
+                 "accumulate": ft.get("accumulate", True),
+                 "strength": float(ft.get("strength", 1.0)),
+                 "preset": ft.get("preset", "fast"), "out_len": n,
+                 "region": region}, motion_m.intermediate_path)
+
+    def _clip_pixels(self, engine: MoshEngine, clip: Clip, seg, nframes: int):
+        """Fused flow + raw-FX pixel stage for one clip's segment AVI *seg*;
+        returns the (possibly new) segment path and consumes *seg* if replaced."""
+        flow_args, motion_src = self._flow_args(clip, nframes)
+        out = engine.apply_clip_pixels(
+            seg, engine._tmp(".avi"), flow_args=flow_args, motion_src=motion_src,
+            raw_specs=self._raw_specs(clip), mask=clip.fx_mask)
         if str(out) != str(seg):
             try:
                 Path(seg).unlink()
             except OSError:
                 pass
         return out
+
+    def _media_signature(self):
+        """A digest of every media's identity + on-disk state. Folding it into the
+        seg-cache key means re-imported footage or a re-rendered precomp (motion /
+        flow sources) invalidates dependent caches, without per-op dependency
+        tracking; ordinary effect edits leave it untouched, so other clips hit."""
+        sig = []
+        for m in self.media.values():
+            try:
+                mt = Path(m.intermediate_path).stat().st_mtime
+            except OSError:
+                mt = 0.0
+            sig.append((m.id, m.label, getattr(m, "digest", "") or "", mt))
+        return sorted(sig)
+
+    def _clip_seg_key(self, engine: MoshEngine, clip: Clip) -> str:
+        """Cache key for a clip's post-mosh, post-pixel segment. Captures only what
+        the *segment* depends on -- the codec mosh (media/trim/ops) plus the flow
+        and raw-FX pixel stages -- not the finish-pass speed/fade/pixel filters,
+        which are cheap to re-apply over a cached segment."""
+        import hashlib
+        payload = {
+            "geom": engine._pixel_geom(),                  # preview vs full-res
+            "media_id": clip.media_id,
+            "trim": [clip.in_point, clip.out_point],
+            "ops": [o.to_dict() for o in self._ops_for_clip(clip.id)],
+            "flow": clip.flow_transfer,
+            "raw": clip.raw_effects,
+            # fx_mask only changes the segment when it gates raw FX (pixel-FX
+            # masking happens later, in the finish pass).
+            "fx_mask": clip.fx_mask if clip.raw_effects else None,
+            "media_sig": self._media_signature(),
+        }
+        blob = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha1(blob.encode()).hexdigest()
+
+    def _clip_seg(self, engine: MoshEngine, clip: Clip, frames, media) -> Path:
+        """A clip's post-mosh, post-pixel segment AVI, served from the engine's
+        per-clip cache when its codec+pixel state is unchanged -- so editing one
+        clip reuses the others' expensive flow/raw output instead of redoing it."""
+        key = self._clip_seg_key(engine, clip)
+        cached = engine.seg_cache_get(key)
+        if cached is not None:
+            return cached
+        seg = engine.write_moshed(frames, media, engine._tmp(".avi"))
+        seg = self._clip_pixels(engine, clip, seg, len(frames))
+        return engine.seg_cache_put(key, seg)
 
     def _alpha_matte_segment(self, engine: MoshEngine, clip: Clip):
         """An aligned grayscale alpha-map segment for *clip*, or None.
@@ -692,12 +757,15 @@ class Project:
             and getattr(c, "layer_mask", None) is None    # a matte needs compositing
             for c in clips)
         if simple:
-            return self._render_flat(
+            result = self._render_flat(
                 engine, out_avi, clips,
                 profile=profile, export_path=export_path, audio=audio)
-        return self._render_composite(
-            engine, out_avi, vtracks,
-            profile=profile, export_path=export_path, audio=audio)
+        else:
+            result = self._render_composite(
+                engine, out_avi, vtracks,
+                profile=profile, export_path=export_path, audio=audio)
+        engine.seg_cache_trim()        # bound the cache now the fold is done
+        return result
 
     def _is_contiguous(self, clips) -> bool:
         """True if clips butt up start-to-end with no free-positioned gap/overlap
@@ -751,7 +819,14 @@ class Project:
         digest = self._sequence_digest(media.sequence_id)
         if media.digest == digest and out.exists():
             return                                 # cache hit: nothing changed
-        self.render(engine, out, sequence_id=media.sequence_id)
+        # A precomp's cached intermediate is shared with export, so always render
+        # it at full geometry/quality even when the outer render is a fast preview.
+        cap, ov = engine.preview_max_width, engine.flow_preset_override
+        engine.preview_max_width, engine.flow_preset_override = None, None
+        try:
+            self.render(engine, out, sequence_id=media.sequence_id)
+        finally:
+            engine.preview_max_width, engine.flow_preset_override = cap, ov
         av = avi.parse_avi(str(out))
         media.nb_frames = len(av.frames)
         media.width = media.width or self.config.width
@@ -804,7 +879,6 @@ class Project:
     def _clip_segment(self, engine: MoshEngine, clip: Clip):
         """Render one clip to a finished segment AVI at project geometry (mosh +
         flow + per-clip finish chain). Returns ``(path, post_speed_length)``."""
-        from . import flow as _flow
         media = self._parsed_media(clip.media_id)
         frames = self._clip_frames(clip)
         motion = self._motion_frames()
@@ -813,36 +887,14 @@ class Project:
                 _as_avivideo(frames, media), op.mode, op.params,
                 motion_clips=_wrap_motion(motion),
                 region=self._op_region(op, len(frames)))
-        seg = engine.write_moshed(frames, media, engine._tmp(".avi"))
-        ft = clip.flow_transfer
-        motion_m = self._flow_motion_media(ft.get("source")) if ft else None
-        if ft and motion_m is not None and _flow.available():
-            n = len(frames)
-            rs = max(0, int(ft.get("region_start", 0) or 0))
-            re = ft.get("region_end")
-            region = ((rs, n if re is None else min(int(re), n))
-                      if (rs > 0 or re is not None) else None)
-            warped = engine.optical_flow_transfer(
-                seg, motion_m.intermediate_path, engine._tmp(".avi"),
-                hold=ft.get("hold", True), accumulate=ft.get("accumulate", True),
-                strength=float(ft.get("strength", 1.0)),
-                preset=ft.get("preset", "fast"), out_len=n, region=region)
-            try:
-                Path(seg).unlink()
-            except OSError:
-                pass
-            seg = warped
-        seg = self._apply_raw(engine, clip, seg)
+        seg = self._clip_seg(engine, clip, frames, media)
         meta = [{"n": len(frames), "speed": clip.speed, "reverse": clip.reverse,
                  "fade_in": clip.fade_in, "fade_out": clip.fade_out,
                  "transition_in": 0,
                  "pixel": self._pixel_filters(clip, nframes=len(frames)),
                  "fx_mask": clip.fx_mask}]
         finished = engine.finish_clips([seg], meta, engine._tmp(".avi"))
-        try:
-            Path(seg).unlink()
-        except OSError:
-            pass
+        # seg is cache-owned (LRU-evicted); leave it for reuse.
         length = (max(1, round(len(frames) / clip.speed))
                   if (clip.speed and clip.speed != 1.0) else len(frames))
         return finished, length
@@ -883,31 +935,8 @@ class Project:
             prev_len = mlen
 
         if needs_finish:
-            from . import flow as _flow
-            seg_avis = []
-            for c, media, frames in segs:
-                seg = engine.write_moshed(frames, media, engine._tmp(".avi"))
-                ft = c.flow_transfer
-                motion_m = self._flow_motion_media(ft.get("source")) if ft else None
-                if ft and motion_m is not None and _flow.available():
-                    n = len(frames)
-                    rs = max(0, int(ft.get("region_start", 0) or 0))
-                    re = ft.get("region_end")
-                    region = ((rs, n if re is None else min(int(re), n))
-                              if (rs > 0 or re is not None) else None)
-                    warped = engine.optical_flow_transfer(
-                        seg, motion_m.intermediate_path, engine._tmp(".avi"),
-                        hold=ft.get("hold", True),
-                        accumulate=ft.get("accumulate", True),
-                        strength=float(ft.get("strength", 1.0)),
-                        preset=ft.get("preset", "fast"), out_len=n, region=region)
-                    try:
-                        Path(seg).unlink()
-                    except OSError:
-                        pass
-                    seg = warped
-                seg = self._apply_raw(engine, c, seg)
-                seg_avis.append(seg)
+            seg_avis = [self._clip_seg(engine, c, frames, media)
+                        for c, media, frames in segs]
             meta = [{"n": len(frames), "speed": c.speed, "reverse": c.reverse,
                      "fade_in": c.fade_in, "fade_out": c.fade_out,
                      "transition_in": c.transition_in,
@@ -915,11 +944,7 @@ class Project:
                      "fx_mask": c.fx_mask}
                     for c, _, frames in segs]
             out = engine.finish_clips(seg_avis, meta, out_avi)
-            for s in seg_avis:               # consumed; don't pile up across renders
-                try:
-                    Path(s).unlink()
-                except OSError:
-                    pass
+            # seg_avis are cache-owned (LRU-evicted); leave them for reuse.
         else:                                      # fast path: concat coded chunks
             sequence: List[Frame] = []
             for _, _, frames in segs:

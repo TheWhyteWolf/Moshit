@@ -64,3 +64,29 @@ def test_rgb_recurse_displaces_colour_preserves_geometry(project, engine,
                       zip(probe.pixel(base, 6, x, y),
                           probe.pixel(out, 6, x, y))) > 12)
     assert diff > 0                                    # recursion visibly shifts colour
+
+
+@requires_numpy
+def test_rgb_iterative_shift_glitches_and_preserves_geometry(
+        project, engine, make_clip, tmp_path, probe):
+    import moshit.project as P
+    plain = P.Project(name="plain", config=engine.config,
+                      assets_dir=str(tmp_path / "plain"))
+    mp = plain.import_media(engine, make_clip("s.mp4"), role="main")
+    plain.add_clip(mp.id, "main")
+    base = tmp_path / "base.avi"
+    plain.render(engine, base)
+
+    m = project.import_media(engine, make_clip("s.mp4"), role="main")
+    c = project.add_clip(m.id, "main")
+    c.raw_effects = [{"name": "rgb_iterative_shift",
+                      "params": {"iterations": 6, "shift_horizontal": True,
+                                 "shift_vertical": True, "seed": 1}}]
+    out = tmp_path / "ris.avi"
+    r = project.render(engine, out)
+    assert r["frames"] == 24 and probe.dims(out) == "160x120"  # finish preserves both
+    diff = sum(1 for x in range(0, 160, 8) for y in range(0, 120, 8)
+               if max(abs(a - b) for a, b in
+                      zip(probe.pixel(base, 6, x, y),
+                          probe.pixel(out, 6, x, y))) > 12)
+    assert diff > 0                                    # channel shifting glitches pixels

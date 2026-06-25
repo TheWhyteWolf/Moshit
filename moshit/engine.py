@@ -13,11 +13,12 @@ The engine is independent of any GUI and is fully exercisable from the CLI.
 """
 from __future__ import annotations
 
+import collections
 import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from . import avi
 from .avi import AviVideo, Frame
@@ -52,6 +53,20 @@ class MoshEngine:
         self._work = Path(self.config.work_dir or tempfile.mkdtemp(prefix="moshit_"))
         self._work.mkdir(parents=True, exist_ok=True)
         self._n = 0
+        # Preview tuning (left at defaults for full-quality export/bake):
+        #   preview_max_width -- cap the *pixel*-stage long edge (flow/raw/finish/
+        #     composite) so previews run the per-pixel work at display size, not
+        #     full res. The codec-domain mosh still runs on full-res frames, so the
+        #     glitch structure is unchanged; only re-rendered pixels shrink.
+        #   flow_preset_override -- force a DIS optical-flow preset (e.g. the
+        #     cheapest one for live previews) regardless of the clip's setting.
+        self.preview_max_width: Optional[int] = None
+        self.flow_preset_override: Optional[str] = None
+        # Per-clip segment cache: an edit to one clip can reuse the unchanged
+        # others' expensive (flow / raw-FX) segments instead of re-rendering them.
+        # Keyed by the caller (project) on the clip's codec+pixel state; LRU-bound.
+        self._seg_cache: "collections.OrderedDict[str, Path]" = collections.OrderedDict()
+        self._seg_cache_limit = 128
         load_modes()               # ensure built-in + user modes are registered
 
     # -- workspace ---------------------------------------------------------- #
@@ -59,6 +74,57 @@ class MoshEngine:
     def _tmp(self, suffix: str) -> Path:
         self._n += 1
         return self._work / f"_dm{self._n:04d}{suffix}"
+
+    def _pixel_geom(self) -> Tuple[int, int]:
+        """Geometry for the pixel-domain stages: full project geometry, unless
+        ``preview_max_width`` caps the long edge (even dimensions for yuv420p)."""
+        w, h = int(self.config.width), int(self.config.height)
+        cap = self.preview_max_width
+        if cap and w > int(cap):
+            s = int(cap) / w
+            w = max(2, (int(round(w * s)) // 2) * 2)
+            h = max(2, (int(round(h * s)) // 2) * 2)
+        return w, h
+
+    # -- per-clip segment cache --------------------------------------------- #
+
+    def seg_cache_get(self, key: str) -> Optional[Path]:
+        """The cached segment AVI for *key*, or None. Refreshes its LRU position."""
+        p = self._seg_cache.get(key)
+        if p is not None and Path(p).exists():
+            self._seg_cache.move_to_end(key)
+            return p
+        if p is not None:                          # recorded but the file vanished
+            self._seg_cache.pop(key, None)
+        return None
+
+    def seg_cache_put(self, key: str, seg) -> Path:
+        """Move segment AVI *seg* into the cache under *key* and return its new
+        path. Does not evict -- a single render may need more than the limit and
+        must keep them all live until its fold; call :meth:`seg_cache_trim`
+        between renders to bound the cache."""
+        cache_dir = self._work / "segcache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        dst = cache_dir / f"{key}.avi"
+        src = Path(seg)
+        if src.resolve() != dst.resolve():
+            try:
+                src.replace(dst)                   # atomic move within the work dir
+            except OSError:
+                shutil.copyfile(src, dst)
+        self._seg_cache[key] = dst
+        self._seg_cache.move_to_end(key)
+        return dst
+
+    def seg_cache_trim(self) -> None:
+        """Evict least-recently-used segments down to the limit. Safe only when no
+        render is mid-fold, so the project calls it once a render completes."""
+        while len(self._seg_cache) > self._seg_cache_limit:
+            _old, old_path = self._seg_cache.popitem(last=False)
+            try:
+                Path(old_path).unlink()
+            except OSError:
+                pass
 
     def cleanup(self) -> None:
         """Remove the scratch work dir if the engine created it.
@@ -194,12 +260,13 @@ class MoshEngine:
             raise FlowUnavailable(
                 "Optical-flow transfer needs OpenCV + numpy. Install them with: "
                 "pip install 'moshit[flow]'")
-        w, h = self.config.width, self.config.height
+        w, h = self._pixel_geom()
         base = list(self.ff.decode_rgb_raw(base_src, w, h))
         motion = list(self.ff.decode_rgb_raw(motion_src, w, h))
         warped = flow.transfer_raw(base, motion, w, h, hold=hold,
                                    accumulate=accumulate, strength=strength,
-                                   preset=preset, out_len=out_len, region=region)
+                                   preset=self.flow_preset_override or preset,
+                                   out_len=out_len, region=region)
         return self.ff.encode_rgb_raw(warped, out_avi, width=w, height=h,
                                       fps=self.config.fps,
                                       qscale=self.config.qscale, gop=self.config.gop)
@@ -214,28 +281,71 @@ class MoshEngine:
         where the matte is bright). Needs numpy (the ``flow`` extra); returns
         *src_avi* unchanged if it (or every spec) is unavailable.
         """
-        from .modes import raw as _raw, get_raw_mode
+        from .modes import raw as _raw
         if not _raw.available():
             return Path(src_avi)
         usable = [s for s in (specs or []) if _raw.is_raw_mode(s.get("name"))]
         if not usable:
             return Path(src_avi)
-        w, h = self.config.width, self.config.height
-        original = list(self.ff.decode_rgb_raw(src_avi, w, h))
+        w, h = self._pixel_geom()
+        frames = self._raw_frames(list(self.ff.decode_rgb_raw(src_avi, w, h)),
+                                  usable, w, h, mask=mask)
+        return self.ff.encode_rgb_raw(frames, out_avi, width=w, height=h,
+                                      fps=self.config.fps,
+                                      qscale=self.config.qscale, gop=self.config.gop)
+
+    def _raw_frames(self, frames, specs, w: int, h: int, *, mask=None):
+        """Run raw-FX *specs* over in-memory RGB *frames* at ``w x h`` (the shared
+        core of :meth:`apply_raw_effects` and :meth:`apply_clip_pixels`)."""
+        from .modes import raw as _raw, get_raw_mode
+        usable = [s for s in (specs or []) if _raw.is_raw_mode(s.get("name"))]
+        if not usable:
+            return frames
+        original = list(frames)
         matte_mode = str((mask or {}).get("mode", "confine"))
         # "source" mode feeds the effects the matte-cut island so their output is
         # free to spill; "confine" runs them on the full frame and limits output.
-        frames = (_raw.gate_island(original, w, h, mask)
-                  if mask and matte_mode == "source" else list(original))
+        out = (_raw.gate_island(original, w, h, mask)
+               if mask and matte_mode == "source" else list(original))
         for spec in usable:
             mode = get_raw_mode(spec["name"])
             params = mode.resolve(spec.get("params") or {})
-            frames = mode.apply(frames, width=w, height=h,
-                                fps=self.config.fps, **params)
+            out = mode.apply(out, width=w, height=h, fps=self.config.fps, **params)
         if mask:
-            frames = (_raw.overlay_spill(original, frames, w, h, mask)
-                      if matte_mode == "source"
-                      else _raw.blend_masked(original, frames, w, h, mask))
+            out = (_raw.overlay_spill(original, out, w, h, mask)
+                   if matte_mode == "source"
+                   else _raw.blend_masked(original, out, w, h, mask))
+        return out
+
+    def apply_clip_pixels(self, seg, out_avi, *, flow_args=None, motion_src=None,
+                          raw_specs=None, mask=None) -> Path:
+        """Fused per-clip pixel stage: decode *seg* once, optionally warp it by the
+        optical flow of *motion_src*, optionally run raw FX, then encode once.
+
+        Folding the flow and raw stages into one decode/encode saves a full
+        MPEG-4 round-trip versus running them back-to-back. Returns ``Path(seg)``
+        unchanged when there is nothing to do (or numpy/OpenCV is unavailable), so
+        callers can cheaply detect the no-op."""
+        from .modes import raw as _raw
+        from . import flow
+        do_flow = bool(flow_args and motion_src) and flow.available()
+        usable = [s for s in (raw_specs or []) if _raw.is_raw_mode(s.get("name"))]
+        do_raw = bool(usable) and _raw.available()
+        if not do_flow and not do_raw:
+            return Path(seg)
+        w, h = self._pixel_geom()
+        frames = list(self.ff.decode_rgb_raw(seg, w, h))
+        if do_flow:
+            motion = list(self.ff.decode_rgb_raw(motion_src, w, h))
+            frames = flow.transfer_raw(
+                frames, motion, w, h,
+                hold=flow_args.get("hold", True),
+                accumulate=flow_args.get("accumulate", True),
+                strength=float(flow_args.get("strength", 1.0)),
+                preset=self.flow_preset_override or flow_args.get("preset", "fast"),
+                out_len=flow_args.get("out_len"), region=flow_args.get("region"))
+        if do_raw:
+            frames = self._raw_frames(frames, usable, w, h, mask=mask)
         return self.ff.encode_rgb_raw(frames, out_avi, width=w, height=h,
                                       fps=self.config.fps,
                                       qscale=self.config.qscale, gop=self.config.gop)
@@ -243,17 +353,18 @@ class MoshEngine:
     def finish_clips(self, segments, meta, dst):
         """Pixel-domain finish pass: apply per-clip speed/reverse/fade/pixel-FX
         and fold clips with crossfade/hard-cut. Returns the finished AVI path."""
+        w, h = self._pixel_geom()
         return self.ff.finish_video(segments, meta, dst, fps=self.config.fps,
                                     gop=self.config.gop, qscale=self.config.qscale,
-                                    width=self.config.width, height=self.config.height)
+                                    width=w, height=h)
 
     def composite(self, layers, dst, *, total_frames):
         """Composite positioned video layers (opacity + blend + alpha) into one
         moshable AVI. Returns the written path."""
+        w, h = self._pixel_geom()
         return self.ff.composite_video(
             layers, dst, total_frames=total_frames, fps=self.config.fps,
-            width=self.config.width, height=self.config.height,
-            gop=self.config.gop, qscale=self.config.qscale)
+            width=w, height=h, gop=self.config.gop, qscale=self.config.qscale)
 
     # -- convenience: end-to-end two-clip mosh ------------------------------ #
 

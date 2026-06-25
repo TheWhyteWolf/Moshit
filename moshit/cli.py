@@ -366,6 +366,23 @@ class _FakeEngine:
         write_avi(out_avi, frames, template)
         return Path(out_avi)
 
+    # -- pixel-stage / cache surface (no-ops without ffmpeg) ---------------- #
+    def _pixel_geom(self):
+        return (0, 0)                          # geometry irrelevant in the selftest
+
+    def apply_clip_pixels(self, seg, out_avi, *, flow_args=None, motion_src=None,
+                          raw_specs=None, mask=None):
+        return Path(seg)                       # no flow/raw stage without ffmpeg
+
+    def seg_cache_get(self, key):
+        return None                            # selftest doesn't cache segments
+
+    def seg_cache_put(self, key, seg):
+        return Path(seg)                       # leave the segment where it is
+
+    def seg_cache_trim(self):
+        pass
+
     def bake(self, moshed_avi, out_avi):
         import shutil
         shutil.copy2(moshed_avi, out_avi)

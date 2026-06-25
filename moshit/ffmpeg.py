@@ -544,8 +544,15 @@ class FFmpeg:
                             f"d={fo / fps:.6f}")
             pixel = m.get("pixel") or []
             fx: List[str] = list(pixel)
-            if pixel and width and height:         # restore exact geometry for the fold
-                fx.append(f"scale={int(width)}:{int(height)}:flags=bicubic")
+            if width and height:
+                # Pin to the fold geometry: pixel clips restore size *after* the
+                # filters (some change it); bare clips (no pixel) get it up front
+                # so a proxy/full-res mix still folds at one consistent size.
+                scale = f"scale={int(width)}:{int(height)}:flags=bicubic"
+                if pixel:
+                    fx.append(scale)
+                else:
+                    head.append(scale)
             fx_mask = m.get("fx_mask")
             if pixel and fx_mask:                  # gate the FX through a matte
                 # Both modes overlay an alpha'd FX branch onto the original; the

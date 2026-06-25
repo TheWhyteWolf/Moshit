@@ -240,3 +240,30 @@ def test_pixel_sort_composes_with_pixel_fx(engine, project, make_clip, tmp_path,
     r = project.render(engine, tmp_path / "r.avi", profile="h264_mp4",
                        export_path=str(out))
     assert probe.nframes(out) == 24 and probe.dims(out) == "160x120"
+
+
+@requires_ffmpeg
+@requires_numpy
+def test_clip_segment_cache_reuses_and_invalidates(engine, project, make_clip,
+                                                   tmp_path):
+    # The expensive (raw-FX) segment is cached per clip: a finish-only edit
+    # (pixel filter) reuses it; a segment-level edit (raw FX) rebuilds it.
+    m = project.import_media(engine, make_clip("s.mp4"), role="main")
+    c = project.add_clip(m.id, "main")
+    c.raw_effects = [{"name": "pixel_sort", "params": {"lo": 0.0, "hi": 1.0}}]
+    project.render(engine, tmp_path / "a.avi")
+    key = project._clip_seg_key(engine, c)
+    seg = engine.seg_cache_get(key)
+    assert seg is not None and seg.exists()
+    mtime = seg.stat().st_mtime
+
+    # Pixel-effect edit doesn't touch the segment -> same key, cache hit (no rebuild).
+    c.pixel_effects = [{"name": "rgb_shift", "params": {"amount": 8}}]
+    project.render(engine, tmp_path / "b.avi")
+    assert project._clip_seg_key(engine, c) == key
+    assert engine.seg_cache_get(key).stat().st_mtime == mtime      # untouched
+
+    # Raw-effect edit changes the segment -> new key, fresh entry.
+    c.raw_effects = [{"name": "pixel_sort", "params": {"lo": 0.1, "hi": 0.9}}]
+    project.render(engine, tmp_path / "c.avi")
+    assert project._clip_seg_key(engine, c) != key

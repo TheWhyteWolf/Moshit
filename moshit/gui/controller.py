@@ -13,12 +13,18 @@ from __future__ import annotations
 
 import atexit
 import copy
+import dataclasses
 import os
 import shutil
 import tempfile
 import traceback
 from pathlib import Path
 from typing import Callable, List, Optional
+
+# Previews are rendered (and decoded) at this display width: the pixel-domain
+# stages run at preview size rather than full project resolution, which is the
+# single biggest speed-up on the interactive edit loop.
+PREVIEW_MAX_WIDTH = 720
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
@@ -97,6 +103,7 @@ class AppController(QObject):
         self.ff = FFmpeg(ffmpeg=ffmpeg_bin, ffprobe=ffprobe_bin)
         self.config = config or EngineConfig(work_dir=str(self._dir / "work"))
         self.engine = MoshEngine(self.config, self.ff)
+        self.preview_engine = self._make_preview_engine()
         self.project = Project(name="untitled", config=self.config,
                                assets_dir=str(self._dir / "assets"))
         self.decoder = PreviewDecoder(self.ff.ffmpeg)
@@ -119,6 +126,18 @@ class AppController(QObject):
         # Safety net: clean the temp dir even if the window's closeEvent never
         # fires (e.g. the process is interrupted from the terminal).
         atexit.register(self.cleanup)
+
+    def _make_preview_engine(self) -> MoshEngine:
+        """A second engine for previews: same geometry as the full-res engine, but
+        its pixel stages (flow / raw FX / finish / composite) run at preview width
+        and use the cheapest optical-flow preset. Export/bake stay on the full-res
+        engine. Rebuilt whenever the project geometry changes (e.g. open_project)."""
+        base = self.config.work_dir or str(self._dir / "work")
+        preview_cfg = dataclasses.replace(self.config, work_dir=base + "_preview")
+        eng = MoshEngine(preview_cfg, self.ff)
+        eng.preview_max_width = PREVIEW_MAX_WIDTH
+        eng.flow_preset_override = "ultrafast"
+        return eng
 
     # -- export profiles available on this ffmpeg --------------------------- #
 
@@ -285,8 +304,9 @@ class AppController(QObject):
         out = self._dir / "preview.avi"
 
         def work(emit_begin, emit_batch):
-            r = self.project.render(self.engine, out, sequence_id=seq_id)
-            self.decoder.decode_stream(out, emit_begin, emit_batch, max_width=720)
+            r = self.project.render(self.preview_engine, out, sequence_id=seq_id)
+            self.decoder.decode_stream(out, emit_begin, emit_batch,
+                                       max_width=PREVIEW_MAX_WIDTH)
             self._preview_audio = self._build_preview_audio(r.get("audio_plans"))
 
         worker = _StreamWorker(work)
@@ -955,6 +975,7 @@ class AppController(QObject):
         self.config = proj.config
         self.config.work_dir = str(self._dir / "work_open")
         self.engine = MoshEngine(self.config, self.ff)
+        self.preview_engine = self._make_preview_engine()
         self.project = proj
         self._clear_undo()
         self.project_changed.emit()
