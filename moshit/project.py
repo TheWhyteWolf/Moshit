@@ -215,6 +215,7 @@ class Project:
         self.tracks: List[Track] = []
         self.root_seq_id = ROOT_SEQ_ID
         self._parsed: Dict[str, AviVideo] = {}     # media_id -> AviVideo (cache)
+        self._seg_n: Dict[str, int] = {}           # seg-cache key -> frame count
         self._tmp_assets: Optional[Path] = None    # precomp cache when no assets_dir
         self._ensure_default_structure()
 
@@ -364,11 +365,13 @@ class Project:
             sig.append((m.id, m.label, getattr(m, "digest", "") or "", mt))
         return sorted(sig)
 
-    def _clip_seg_key(self, engine: MoshEngine, clip: Clip) -> str:
+    def _clip_seg_key(self, engine: MoshEngine, clip: Clip,
+                      media_sig=None) -> str:
         """Cache key for a clip's post-mosh, post-pixel segment. Captures only what
         the *segment* depends on -- the codec mosh (media/trim/ops) plus the flow
         and raw-FX pixel stages -- not the finish-pass speed/fade/pixel filters,
-        which are cheap to re-apply over a cached segment."""
+        which are cheap to re-apply over a cached segment. Render loops pass a
+        precomputed *media_sig* so it isn't re-stat'ed once per clip."""
         import hashlib
         payload = {
             "geom": engine._pixel_geom(),                  # preview vs full-res
@@ -380,24 +383,33 @@ class Project:
             # fx_mask only changes the segment when it gates raw FX (pixel-FX
             # masking happens later, in the finish pass).
             "fx_mask": clip.fx_mask if clip.raw_effects else None,
-            "media_sig": self._media_signature(),
+            "media_sig": media_sig if media_sig is not None
+                         else self._media_signature(),
         }
         blob = json.dumps(payload, sort_keys=True, default=str)
         return hashlib.sha1(blob.encode()).hexdigest()
 
-    def _clip_seg(self, engine: MoshEngine, clip: Clip, frames, media) -> Path:
-        """A clip's post-mosh, post-pixel segment AVI, served from the engine's
-        per-clip cache when its codec+pixel state is unchanged -- so editing one
-        clip reuses the others' expensive flow/raw output instead of redoing it."""
-        key = self._clip_seg_key(engine, clip)
+    def _clip_seg(self, engine: MoshEngine, clip: Clip, frames, media,
+                  media_sig=None) -> Tuple[Path, int]:
+        """A clip's post-mosh, post-pixel segment AVI plus its frame count,
+        served from the engine's per-clip cache when its codec+pixel state is
+        unchanged -- so editing one clip reuses the others' expensive output
+        instead of redoing it. *frames* may be a thunk; it is only called on a
+        cache miss, so a hit also skips the codec-domain mosh entirely."""
+        key = self._clip_seg_key(engine, clip, media_sig)
         cached = engine.seg_cache_get(key)
-        if cached is not None:
-            return cached
+        n = self._seg_n.get(key)
+        if cached is not None and n is not None:
+            return cached, n
+        frames = frames() if callable(frames) else frames
+        self._seg_n[key] = len(frames)
+        if cached is not None:                     # AVI cached, count forgotten
+            return cached, len(frames)
         seg = engine.write_moshed(frames, media, engine._tmp(".avi"))
         seg = self._clip_pixels(engine, clip, seg, len(frames))
-        return engine.seg_cache_put(key, seg)
+        return engine.seg_cache_put(key, seg), len(frames)
 
-    def _alpha_matte_segment(self, engine: MoshEngine, clip: Clip):
+    def _alpha_matte_segment(self, engine: MoshEngine, clip: Clip, motion=None):
         """An aligned grayscale alpha-map segment for *clip*, or None.
 
         The clip's source-file alpha map is trimmed to the clip and put through
@@ -434,7 +446,8 @@ class Project:
         aframes = list(alpha_av.frames[in_pt:out_pt])
         if not aframes:
             return None
-        motion = self._motion_frames()
+        if motion is None:
+            motion = self._motion_frames()
         for op in ops:
             aframes = engine.mosh(
                 _as_avivideo(aframes, alpha_av), op.mode, op.params,
@@ -876,78 +889,96 @@ class Project:
                                              audio_path=audio_path)
         return result
 
-    def _clip_segment(self, engine: MoshEngine, clip: Clip):
+    def _clip_segment(self, engine: MoshEngine, clip: Clip, motion=None,
+                      media_sig=None):
         """Render one clip to a finished segment AVI at project geometry (mosh +
         flow + per-clip finish chain). Returns ``(path, post_speed_length)``."""
         media = self._parsed_media(clip.media_id)
-        frames = self._clip_frames(clip)
-        motion = self._motion_frames()
-        for op in self._ops_for_clip(clip.id):
-            frames = engine.mosh(
-                _as_avivideo(frames, media), op.mode, op.params,
-                motion_clips=_wrap_motion(motion),
-                region=self._op_region(op, len(frames)))
-        seg = self._clip_seg(engine, clip, frames, media)
-        meta = [{"n": len(frames), "speed": clip.speed, "reverse": clip.reverse,
+        if motion is None:
+            motion = self._motion_frames()
+
+        def moshed():
+            frames = self._clip_frames(clip)
+            for op in self._ops_for_clip(clip.id):
+                frames = engine.mosh(
+                    _as_avivideo(frames, media), op.mode, op.params,
+                    motion_clips=_wrap_motion(motion),
+                    region=self._op_region(op, len(frames)))
+            return frames
+
+        seg, n = self._clip_seg(engine, clip, moshed, media, media_sig)
+        meta = [{"n": n, "speed": clip.speed, "reverse": clip.reverse,
                  "fade_in": clip.fade_in, "fade_out": clip.fade_out,
                  "transition_in": 0,
-                 "pixel": self._pixel_filters(clip, nframes=len(frames)),
+                 "pixel": self._pixel_filters(clip, nframes=n),
                  "fx_mask": clip.fx_mask}]
         finished = engine.finish_clips([seg], meta, engine._tmp(".avi"))
         # seg is cache-owned (LRU-evicted); leave it for reuse.
-        length = (max(1, round(len(frames) / clip.speed))
-                  if (clip.speed and clip.speed != 1.0) else len(frames))
+        length = (max(1, round(n / clip.speed))
+                  if (clip.speed and clip.speed != 1.0) else n)
         return finished, length
 
     def _render_flat(self, engine: MoshEngine, out_avi, clips, *,
                      profile=None, export_path=None, audio=False) -> Dict:
         fps = self.config.fps or 30.0
         motion = self._motion_frames()
+        media_sig = self._media_signature()        # computed once, not per clip
         needs_finish = any(c.has_finish() for c in clips)
 
-        # Codec-domain stage: each clip's moshed frame list (pure Python).
-        segs: List = []                            # (clip, media, frames)
-        template: Optional[AviVideo] = None
-        for c in clips:
-            media = self._parsed_media(c.media_id)
-            if template is None:
-                template = media
+        def moshed(c, media):
+            """The clip's codec-domain frame list (the pure-Python mosh)."""
             frames = self._clip_frames(c)
             for op in self._ops_for_clip(c.id):
                 frames = engine.mosh(
                     _as_avivideo(frames, media), op.mode, op.params,
                     motion_clips=_wrap_motion(motion),
                     region=self._op_region(op, len(frames)))
-            segs.append((c, media, frames))
+            return frames
+
+        # Codec-domain stage. On the finish path the mosh runs lazily inside
+        # _clip_seg, so a segment-cache hit skips it entirely; the fast path
+        # concatenates coded frames directly, so it always needs them.
+        segs: List = []                            # (clip, media, seg|frames, n)
+        template: Optional[AviVideo] = None
+        for c in clips:
+            media = self._parsed_media(c.media_id)
+            if template is None:
+                template = media
+            if needs_finish:
+                seg, n = self._clip_seg(
+                    engine, c, lambda c=c, media=media: moshed(c, media),
+                    media, media_sig)
+                segs.append((c, media, seg, n))
+            else:
+                frames = moshed(c, media)
+                segs.append((c, media, frames, len(frames)))
 
         # Per-clip finished (post-speed) length; crossfade overlap handled below.
-        finished = [(max(1, round(len(f) / c.speed))
-                     if (c.speed and c.speed != 1.0) else len(f))
-                    for c, _, f in segs]
+        finished = [(max(1, round(n / c.speed))
+                     if (c.speed and c.speed != 1.0) else n)
+                    for c, _, _, n in segs]
 
         audio_plan: List[Dict] = []
         total = 0
         prev_len = 0
-        for idx, ((c, media, frames), mlen) in enumerate(zip(segs, finished)):
+        for idx, ((c, _, _, _), mlen) in enumerate(zip(segs, finished)):
             seg, trans = self._audio_seg(c, mlen, prev_len, idx, fps)
             audio_plan.append(seg)
             total += mlen - trans
             prev_len = mlen
 
         if needs_finish:
-            seg_avis = [self._clip_seg(engine, c, frames, media)
-                        for c, media, frames in segs]
-            meta = [{"n": len(frames), "speed": c.speed, "reverse": c.reverse,
+            meta = [{"n": n, "speed": c.speed, "reverse": c.reverse,
                      "fade_in": c.fade_in, "fade_out": c.fade_out,
                      "transition_in": c.transition_in,
-                     "pixel": self._pixel_filters(c, nframes=len(frames)),
+                     "pixel": self._pixel_filters(c, nframes=n),
                      "fx_mask": c.fx_mask}
-                    for c, _, frames in segs]
-            out = engine.finish_clips(seg_avis, meta, out_avi)
-            # seg_avis are cache-owned (LRU-evicted); leave them for reuse.
+                    for c, _, _, n in segs]
+            out = engine.finish_clips([s for _, _, s, _ in segs], meta, out_avi)
+            # segments are cache-owned (LRU-evicted); leave them for reuse.
         else:                                      # fast path: concat coded chunks
             sequence: List[Frame] = []
-            for _, _, frames in segs:
+            for _, _, frames, _ in segs:
                 sequence.extend(frames)
             out = engine.write_moshed(sequence, template, out_avi)
 
@@ -967,13 +998,15 @@ class Project:
 
         layers: List[Dict] = []
         track_seqs: List[List] = []                # per enabled track: [(clip,start,length,trans)]
+        motion = self._motion_frames()             # shared by every clip below
+        media_sig = self._media_signature()
         for t in vtracks:                          # bottom -> top by index
             seq: List = []
             for clip, start, length, trans in layouts[t.id]:
-                seg, seglen = self._clip_segment(engine, clip)
+                seg, seglen = self._clip_segment(engine, clip, motion, media_sig)
                 lm = clip.layer_mask
                 # a source-file alpha matte pulls in the clip's aligned alpha map
-                mask_input = (self._alpha_matte_segment(engine, clip)
+                mask_input = (self._alpha_matte_segment(engine, clip, motion)
                               if lm and lm.get("source") == "alpha" else None)
                 layers.append({"input": seg, "start": int(start),
                                "length": seglen, "opacity": float(clip.opacity),

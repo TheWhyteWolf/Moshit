@@ -22,7 +22,8 @@ class MotionWeave(MoshMode):
         Param("source", "clip_ref", None, label="Motion source",
               help="Clip on the motion track to braid in."),
         Param("base_run", "int", 1, lo=0, hi=32, label="Base frames per cycle",
-              help="How many base P-frames before switching to the source."),
+              help="How many base P-frames before switching to the source "
+                   "(0 = the source's motion replaces the base's entirely)."),
         Param("motion_run", "int", 1, lo=0, hi=32, label="Source frames per cycle",
               help="How many source P-frames before switching back."),
         Param("hold_base_iframe", "bool", True, label="Hold base keyframe"),
@@ -58,4 +59,8 @@ class MotionWeave(MoshMode):
             for _ in range(motion_run):
                 out.append(motion[mi % len(motion)].copy())
                 mi += 1
+            if base_run == 0:
+                # base_run=0 emits no base frames, so the source's frames must
+                # stand in for base time or the loop never terminates.
+                bi += motion_run
         return out

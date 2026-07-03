@@ -67,6 +67,13 @@ class MoshEngine:
         # Keyed by the caller (project) on the clip's codec+pixel state; LRU-bound.
         self._seg_cache: "collections.OrderedDict[str, Path]" = collections.OrderedDict()
         self._seg_cache_limit = 128
+        # Decoded-RGB cache for flow motion sources: the same driver clip is
+        # typically reused by several clips and every preview, and its decode is
+        # a full ffmpeg run. Small LRU -- entries are whole decoded clips.
+        self._motion_rgb_cache: "collections.OrderedDict[tuple, List[bytes]]" = \
+            collections.OrderedDict()
+        self._motion_rgb_bytes = 0
+        self._motion_rgb_budget = 512 * 1024 * 1024   # ~512 MB of decoded drivers
         load_modes()               # ensure built-in + user modes are registered
 
     # -- workspace ---------------------------------------------------------- #
@@ -85,6 +92,40 @@ class MoshEngine:
             w = max(2, (int(round(w * s)) // 2) * 2)
             h = max(2, (int(round(h * s)) // 2) * 2)
         return w, h
+
+    def _motion_rgb(self, motion_src, w: int, h: int) -> List[bytes]:
+        """Decoded RGB frames of a flow motion source, cached across renders.
+
+        The same driver clip is typically reused by several clips and by every
+        preview, and its decode is a full ffmpeg run, so caching it is a real
+        win. Keyed on (path, mtime_ns, size, geometry) so re-imported footage or
+        a re-rendered precomp invalidates; frames are immutable bytes, safe to
+        share. The cache is bounded by total *bytes* (not entry count): a single
+        long full-res driver decodes to gigabytes, so a count-only bound would
+        pin multiple GB for the engine's lifetime."""
+        p = Path(motion_src)
+        try:
+            st = p.stat()
+            key = (str(p), st.st_mtime_ns, st.st_size, int(w), int(h))
+        except OSError:
+            key = None
+        if key is not None:
+            hit = self._motion_rgb_cache.get(key)
+            if hit is not None:
+                self._motion_rgb_cache.move_to_end(key)
+                return hit
+        frames = list(self.ff.decode_rgb_raw(motion_src, w, h))
+        if key is None:
+            return frames
+        self._motion_rgb_cache[key] = frames
+        self._motion_rgb_bytes += sum(len(f) for f in frames)
+        # Evict LRU while over budget, but always keep the just-inserted entry
+        # (an oversized single driver stays until the next decode displaces it).
+        while (self._motion_rgb_bytes > self._motion_rgb_budget
+               and len(self._motion_rgb_cache) > 1):
+            _k, old = self._motion_rgb_cache.popitem(last=False)
+            self._motion_rgb_bytes -= sum(len(f) for f in old)
+        return frames
 
     # -- per-clip segment cache --------------------------------------------- #
 
@@ -262,7 +303,7 @@ class MoshEngine:
                 "pip install 'moshit[flow]'")
         w, h = self._pixel_geom()
         base = list(self.ff.decode_rgb_raw(base_src, w, h))
-        motion = list(self.ff.decode_rgb_raw(motion_src, w, h))
+        motion = self._motion_rgb(motion_src, w, h)
         warped = flow.transfer_raw(base, motion, w, h, hold=hold,
                                    accumulate=accumulate, strength=strength,
                                    preset=self.flow_preset_override or preset,
@@ -303,18 +344,21 @@ class MoshEngine:
             return frames
         original = list(frames)
         matte_mode = str((mask or {}).get("mode", "confine"))
+        # The matte is computed once and shared: "source" mode needs it both to
+        # cut the FX input island and to overlay the spill afterwards.
+        mattes = _raw.mask_frames(original, w, h, mask) if mask else None
         # "source" mode feeds the effects the matte-cut island so their output is
         # free to spill; "confine" runs them on the full frame and limits output.
-        out = (_raw.gate_island(original, w, h, mask)
+        out = (_raw.gate_island(original, w, h, mask, masks=mattes)
                if mask and matte_mode == "source" else list(original))
         for spec in usable:
             mode = get_raw_mode(spec["name"])
             params = mode.resolve(spec.get("params") or {})
             out = mode.apply(out, width=w, height=h, fps=self.config.fps, **params)
         if mask:
-            out = (_raw.overlay_spill(original, out, w, h, mask)
+            out = (_raw.overlay_spill(original, out, w, h, mask, masks=mattes)
                    if matte_mode == "source"
-                   else _raw.blend_masked(original, out, w, h, mask))
+                   else _raw.blend_masked(original, out, w, h, mask, masks=mattes))
         return out
 
     def apply_clip_pixels(self, seg, out_avi, *, flow_args=None, motion_src=None,
@@ -336,7 +380,7 @@ class MoshEngine:
         w, h = self._pixel_geom()
         frames = list(self.ff.decode_rgb_raw(seg, w, h))
         if do_flow:
-            motion = list(self.ff.decode_rgb_raw(motion_src, w, h))
+            motion = self._motion_rgb(motion_src, w, h)
             frames = flow.transfer_raw(
                 frames, motion, w, h,
                 hold=flow_args.get("hold", True),

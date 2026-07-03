@@ -32,24 +32,19 @@ class MotionGain(MoshMode):
             return []
         out: List[Frame] = []
         acc = 0.0
-        if float(gain) >= 1.0:                 # amplify: re-apply P-frame motion
-            for i, f in enumerate(frames):
+        # One error-diffusion accumulator serves both directions, so an
+        # automation curve can cross 1.0 mid-clip (amplifying, then thinning).
+        for i, f in enumerate(frames):
+            if not f.is_pframe:
                 out.append(f)
-                if f.is_pframe:
-                    g = max(0.0, float(ctx.auto("gain", i, gain)))
-                    acc += g - 1.0
-                    while acc >= 1.0 - 1e-9:
-                        out.append(f.copy())
-                        acc -= 1.0
-        else:                                  # reduce: thin P-frames out
-            for i, f in enumerate(frames):
-                if f.is_iframe:
-                    out.append(f)
-                    continue
-                g = min(1.0, max(0.0, float(ctx.auto("gain", i, gain))))
-                acc += g
-                if acc >= 1.0 - 1e-9:
-                    out.append(f)
+                continue
+            g = max(0.0, float(ctx.auto("gain", i, gain)))
+            acc += g
+            if acc >= 1.0 - 1e-9:
+                out.append(f)
+                acc -= 1.0
+                while acc >= 1.0 - 1e-9:       # gain > 1: re-apply the motion
+                    out.append(f.copy())
                     acc -= 1.0
-                # else: drop this P-frame (its motion is removed)
+            # else: drop this P-frame (its motion is removed)
         return out

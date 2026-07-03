@@ -10,8 +10,14 @@ from __future__ import annotations
 
 import array
 import math
+import os
 import wave
 from typing import Dict, List, Optional
+
+# Detection is a pure function of the file, and the GUI asks for the same WAV's
+# onsets repeatedly (e.g. once per automatable param), so memoise per file state.
+_onsets_cache: Dict[tuple, List[float]] = {}
+_CACHE_MAX = 16
 
 
 def _read_mono(wav_path):
@@ -39,6 +45,14 @@ def onsets(wav_path, *, hop: int = 512, win: int = 1024,
     ``sensitivity`` scales the local-average threshold (higher = fewer onsets);
     ``min_gap_s`` is the shortest spacing between detected onsets.
     """
+    try:
+        st = os.stat(str(wav_path))
+        key = (str(wav_path), st.st_mtime_ns, st.st_size,
+               hop, win, sensitivity, min_gap_s)
+    except OSError:
+        key = None
+    if key is not None and key in _onsets_cache:
+        return list(_onsets_cache[key])
     samples, rate = _read_mono(wav_path)
     if not samples:
         return []
@@ -67,6 +81,10 @@ def onsets(wav_path, *, hop: int = 512, win: int = 1024,
                 and t - last >= min_gap_s):
             out.append(round(t, 4))
             last = t
+    if key is not None:
+        if len(_onsets_cache) >= _CACHE_MAX:
+            _onsets_cache.clear()
+        _onsets_cache[key] = list(out)
     return out
 
 

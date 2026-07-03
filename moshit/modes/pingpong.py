@@ -35,13 +35,14 @@ class Pingpong(MoshMode):
             return []
 
         if not per_gop:
-            out: List[Frame] = [f for f in frames if f.is_iframe]
-            # keep the structural I-frames up front, then bounce the P-stream
+            # anchor on the opening keyframe, then bounce the whole P-stream
+            # (interior I-frames would reset the picture mid-bounce, so they
+            # are dropped in whole-clip mode)
             anchor = [frames[0]] if frames[0].is_iframe else []
             prun = [f for f in frames if f.is_pframe]
             return anchor + self._bounce(prun, tail_only)
 
-        out = []
+        out: List[Frame] = []
         run: List[Frame] = []
         for f in frames:
             if f.is_pframe:

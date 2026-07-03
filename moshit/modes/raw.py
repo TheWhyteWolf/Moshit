@@ -197,11 +197,13 @@ def mask_frames(frames, width: int, height: int, spec: Dict):
     return out
 
 
-def gate_island(frames, width: int, height: int, spec: Dict):
-    """Black out everything outside the matte (the *source*-mode FX input)."""
+def gate_island(frames, width: int, height: int, spec: Dict, masks=None):
+    """Black out everything outside the matte (the *source*-mode FX input).
+    *masks* accepts precomputed :func:`mask_frames` output so callers that
+    apply the matte twice don't compute it twice."""
     import numpy as np
     H, W = int(height), int(width)
-    masks = mask_frames(frames, width, height, spec)
+    masks = mask_frames(frames, width, height, spec) if masks is None else masks
     out = []
     for f, m in zip(frames, masks):
         a = np.frombuffer(f, np.uint8).reshape(H, W, 3).astype(np.float32)
@@ -211,12 +213,13 @@ def gate_island(frames, width: int, height: int, spec: Dict):
     return out
 
 
-def blend_masked(original, processed, width: int, height: int, spec: Dict):
+def blend_masked(original, processed, width: int, height: int, spec: Dict,
+                 masks=None):
     """Blend *processed* over *original* per :func:`mask_frames` -- the *confine*
     raw-FX matte (effect shows where the matte is bright, original elsewhere)."""
     import numpy as np
     H, W = int(height), int(width)
-    masks = mask_frames(original, width, height, spec)
+    masks = mask_frames(original, width, height, spec) if masks is None else masks
     out = []
     for ob, pb, m in zip(original, processed, masks):
         o = np.frombuffer(ob, np.uint8).reshape(H, W, 3).astype(np.float32)
@@ -228,13 +231,14 @@ def blend_masked(original, processed, width: int, height: int, spec: Dict):
     return out
 
 
-def overlay_spill(original, processed, width: int, height: int, spec: Dict):
+def overlay_spill(original, processed, width: int, height: int, spec: Dict,
+                  masks=None):
     """*source*-mode raw-FX matte: *processed* (the effect run on the matte-cut
     island) overlays *original* wherever the matte is bright or the effect spilled
     non-black content beyond it -- so glitches are free to overspill the matte."""
     import numpy as np
     H, W = int(height), int(width)
-    masks = mask_frames(original, width, height, spec)
+    masks = mask_frames(original, width, height, spec) if masks is None else masks
     out = []
     for ob, pb, m in zip(original, processed, masks):
         o = np.frombuffer(ob, np.uint8).reshape(H, W, 3).astype(np.float32)

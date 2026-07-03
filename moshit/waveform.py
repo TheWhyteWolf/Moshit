@@ -7,8 +7,14 @@ normalised peaks (0..1) the timeline can draw. No numpy/ffmpeg needed.
 from __future__ import annotations
 
 import array
+import os
 import wave
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+# A pure function of the file; the GUI redraws from the same cached WAV often,
+# so memoise per file state (path + mtime + size + bucket count).
+_peaks_cache: Dict[tuple, List[float]] = {}
+_CACHE_MAX = 16
 
 
 def peaks(wav_path, buckets: int = 600) -> Optional[List[float]]:
@@ -18,6 +24,13 @@ def peaks(wav_path, buckets: int = 600) -> Optional[List[float]]:
     amplitude per bucket, normalised so the loudest bucket reaches 1.0. Returns
     None for an unreadable file, an empty track, or an unsupported sample width.
     """
+    try:
+        st = os.stat(str(wav_path))
+        key = (str(wav_path), st.st_mtime_ns, st.st_size, int(buckets))
+    except OSError:
+        key = None
+    if key is not None and key in _peaks_cache:
+        return list(_peaks_cache[key])
     try:
         with wave.open(str(wav_path), "rb") as w:
             channels = w.getnchannels()
@@ -46,4 +59,9 @@ def peaks(wav_path, buckets: int = 600) -> Optional[List[float]]:
         out.append(m)
         if m > top:
             top = m
-    return [v / top for v in out]
+    result = [v / top for v in out]
+    if key is not None:
+        if len(_peaks_cache) >= _CACHE_MAX:
+            _peaks_cache.clear()
+        _peaks_cache[key] = list(result)
+    return result
