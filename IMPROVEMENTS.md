@@ -53,9 +53,25 @@ misc) so commits can reference them. Tick items off as they land.
   (coalesced live-edit session in the controller); Cancel reverts to the pre-edit state,
   Ok commits. Follow-up: give the **pixel** and **raw** FX panels the same live editor
   (they still use the modal `_fx_dialog`); the controller session infra generalises.
-- [ ] P4: **composite-path fusion** — fold per-clip `finish_clips` into the single
-  `composite_video` filter_complex (today: one ffmpeg per clip). Also removes the
-  flat→composite cost cliff (P19).
+- [~] P4: **composite-path fusion** — **investigated, deferred (not cleanly safe).**
+  Prototyped folding the per-clip `finish_chain` (reverse/speed/fades/pixel/fx_mask)
+  into the single `composite_video` filter_complex so a composite is one ffmpeg
+  process instead of N+1. A pixel-equivalence harness (multi-track project across
+  opacity/blend/speed/reverse/fades/pixel-FX/fx_mask, tolerance-compared frame-by-
+  frame against the two-pass baseline) confirmed the fused output is **pixel-identical
+  for the common cases** (differing only by ~1/255 codec-quantisation noise — actually
+  *less* loss, since it drops one encode generation). **But** compositions mixing a
+  **non-normal blend mode** (screen/multiply/…) with a **retimed or frame-count-changing
+  clip** (speed/reverse, or a P-frame-duplicating mosh op) get a different output
+  *frame count*: the old path bakes each clip's retiming into a pre-encoded AVI and the
+  compositor decodes a clean 0-based CFR stream, whereas an in-graph `setpts` leaves
+  stream-duration metadata that ffmpeg's `blend` length semantics read differently
+  (verified: pre-retimed input → 16 frames, identical in-graph retime → 24; `trim`+PTS-
+  regen didn't reconcile them). Since the composite path isn't the hot editing path
+  (the flat path is) and the win is modest, shipping a length-changing edge wasn't
+  worth it. **Revisit** as a *hybrid*: fuse only `blend == normal` layers (proven
+  equivalent — plain overlay clamps to the canvas) and keep the per-clip finish for
+  non-normal-blend layers. Harness: `scratchpad/p4_equiv.py` (FEAT/SIMPLE toggles).
 
 ### Wave 3 — editing & safety fundamentals
 - [ ] U10: timeline zoom + horizontal scroll (fit-to-width `_ppf` is a hard NLE gap).
