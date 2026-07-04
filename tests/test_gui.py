@@ -455,6 +455,125 @@ def test_presets_save_and_apply(win):
     assert [e["mode"] for e in ctl.clip_effects("c2")] == ["bitrot"]
 
 
+def test_live_effect_edit_coalesces_undo(ctl):
+    # A drag fires many live updates; they must fold into ONE undo entry.
+    _seed_clip(ctl, "c")
+    op = ctl.add_effect("c", "bitrot", {"intensity": 0.2})
+    depth = len(ctl._undo)                               # 1: the add itself
+    ctl.begin_effect_edit(op.id)
+    for v in (0.3, 0.4, 0.5):
+        ctl.live_update_effect(op.id, "bitrot", {"intensity": v})
+    ctl.end_effect_edit(op.id, commit=True)
+    assert len(ctl._undo) == depth + 1                   # one entry for the whole drag
+    assert ctl.clip_effects("c")[0]["params"]["intensity"] == 0.5
+    ctl.undo()                                           # a single undo -> pre-edit
+    assert ctl.clip_effects("c")[0]["params"]["intensity"] == 0.2
+
+
+def test_live_effect_edit_noop_commit_adds_no_history(ctl):
+    # Opening the editor and committing without changing anything is not an edit.
+    _seed_clip(ctl, "c")
+    op = ctl.add_effect("c", "bitrot", {"intensity": 0.2})
+    depth = len(ctl._undo)
+    ctl.begin_effect_edit(op.id)
+    ctl.live_update_effect(op.id, "bitrot", {"intensity": 0.2})   # same value
+    ctl.end_effect_edit(op.id, commit=True)
+    assert len(ctl._undo) == depth                       # no spurious undo entry
+
+
+def test_live_effect_edit_cancel_reverts(ctl):
+    _seed_clip(ctl, "c")
+    op = ctl.add_effect("c", "bitrot", {"intensity": 0.2})
+    depth = len(ctl._undo)
+    ctl.begin_effect_edit(op.id)
+    ctl.live_update_effect(op.id, "bitrot", {"intensity": 0.9})
+    assert ctl.clip_effects("c")[0]["params"]["intensity"] == 0.9   # live-applied
+    ctl.end_effect_edit(op.id, commit=False)                        # Cancel
+    assert ctl.clip_effects("c")[0]["params"]["intensity"] == 0.2   # reverted
+    assert len(ctl._undo) == depth                                   # left no trace
+
+
+def test_live_effect_add_commit_and_cancel(ctl):
+    _seed_clip(ctl, "c")
+    assert not ctl.can_undo
+    # a cancelled add leaves neither an op nor any history
+    op = ctl.begin_effect_add("c", "bitrot")
+    assert [e["mode"] for e in ctl.clip_effects("c")] == ["bitrot"]
+    ctl.end_effect_edit(op.id, commit=False)
+    assert ctl.clip_effects("c") == [] and not ctl.can_undo
+    # a committed add (with a live tweak) is a single undo step back to empty
+    op2 = ctl.begin_effect_add("c", "bitrot")
+    ctl.live_update_effect(op2.id, "bitrot", {"intensity": 0.7})
+    ctl.end_effect_edit(op2.id, commit=True)
+    assert ctl.clip_effects("c")[0]["params"]["intensity"] == 0.7
+    ctl.undo()
+    assert ctl.clip_effects("c") == []
+
+
+def test_live_update_without_session_falls_back_to_atomic(ctl):
+    # Outside a session, live_update_effect behaves like the atomic update.
+    _seed_clip(ctl, "c")
+    op = ctl.add_effect("c", "bitrot", {"intensity": 0.2})
+    depth = len(ctl._undo)
+    ctl.live_update_effect(op.id, "bitrot", {"intensity": 0.8})
+    assert ctl.clip_effects("c")[0]["params"]["intensity"] == 0.8
+    assert len(ctl._undo) == depth + 1                   # atomic path pushed one
+
+
+def test_inspector_live_editor_round_trips(qapp):
+    from PySide6.QtWidgets import QDialog
+    from moshit.gui.widgets import InspectorPanel, EffectParamDialog
+    insp = InspectorPanel()
+    begins, updates, ends = [], [], []
+    insp.effectEditBegin.connect(begins.append)
+    insp.effectLiveUpdate.connect(lambda oid, m, p, r: updates.append((oid, p)))
+    insp.effectEditEnd.connect(lambda oid, ok: ends.append((oid, ok)))
+    insp._clip_id = "c"
+    insp._effects = [{"id": "op1", "mode": "bitrot",
+                      "params": {"intensity": 0.2, "hits": 6},
+                      "enabled": True, "region": None}]
+
+    insp.open_live_editor("op1")
+    assert begins == ["op1"]
+    dlg = insp._live_dlg
+    assert isinstance(dlg, EffectParamDialog) and not dlg.isModal()
+
+    dlg._param_widgets["hits"].setValue(12)             # a slider move -> live update
+    assert updates and updates[-1][0] == "op1"
+    assert updates[-1][1]["hits"] == 12
+
+    dlg.accept()                                        # Ok commits
+    assert ends == [("op1", True)] and insp._live_dlg is None
+
+
+def test_app_live_add_flow_commit_and_cancel(win):
+    # End-to-end through app.py: add opens a live editor, tweaks apply live,
+    # Ok commits as one undo step, and Cancel of an add removes the effect.
+    ctl = win.controller
+    _seed_clip(ctl, "c")
+    win._selected_clip = "c"
+
+    win._on_effect_add_begin("bitrot")
+    assert win._live_editing and win.inspector._live_dlg is not None
+    assert [e["mode"] for e in ctl.clip_effects("c")] == ["bitrot"]
+    dlg = win.inspector._live_dlg
+    dlg._param_widgets["hits"].setValue(20)              # live tweak re-applies
+    assert ctl.clip_effects("c")[0]["params"]["hits"] == 20
+    dlg.accept()                                         # Ok commits
+    assert not win._live_editing and win.inspector._live_dlg is None
+    ctl.undo()                                           # one step -> effect gone
+    assert ctl.clip_effects("c") == []
+    ctl.redo()
+
+    # Cancel of a fresh add drops the effect entirely.
+    win._on_effect_add_begin("bitrot")
+    dlg = win.inspector._live_dlg
+    before = [e["mode"] for e in ctl.clip_effects("c")]
+    dlg.reject()                                         # Cancel
+    assert [e["mode"] for e in ctl.clip_effects("c")] == before[:-1]
+    assert not win._live_editing
+
+
 def test_inspector_automation_control(win):
     from moshit.gui.widgets import AutoParamWidget, KeyframeDialog, EffectParamDialog
     dlg = EffectParamDialog(win.inspector, kind="mosh",

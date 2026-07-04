@@ -46,8 +46,13 @@ misc) so commits can reference them. Tick items off as they land.
       benchmark proving the encode is actually the bottleneck (e.g. 20+ clip timeline).
 
 ### Wave 2 — the two biggest user-facing wins
-- [ ] U18: **live parameter editing** — non-modal / in-inspector effect params with live
-  re-render (pairs with the seg cache: only the edited clip re-renders).
+- [x] U18: **live parameter editing** (mosh effect stack) — the param editor is now a
+  non-modal window that re-renders the preview as you drag (debounced onto the existing
+  auto-refresh; the seg cache means only the edited clip re-renders). Adding an effect
+  opens the live editor on it immediately. A whole drag folds into **one** undo entry
+  (coalesced live-edit session in the controller); Cancel reverts to the pre-edit state,
+  Ok commits. Follow-up: give the **pixel** and **raw** FX panels the same live editor
+  (they still use the modal `_fx_dialog`); the controller session infra generalises.
 - [ ] P4: **composite-path fusion** — fold per-clip `finish_clips` into the single
   `composite_video` filter_complex (today: one ffmpeg per clip). Also removes the
   flat→composite cost cliff (P19).

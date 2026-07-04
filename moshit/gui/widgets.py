@@ -208,6 +208,7 @@ class AutoParamWidget(QWidget):
     keyframes with linear/hold/smooth easing)."""
 
     beatsRequested = Signal()                 # fill keyframes from the audio beats
+    changed = Signal()                        # any value/automation edit (live preview)
 
     def __init__(self, param: Param):
         super().__init__()
@@ -263,10 +264,12 @@ class AutoParamWidget(QWidget):
         if on and self._spec is None:
             self._spec = self._ramp(self.value.value())
         self._sync()
+        self.changed.emit()
 
     def _on_value(self, v) -> None:
         if self.auto_chk.isChecked() and self._spec and self._spec["keys"]:
             self._spec["keys"][0][1] = v      # inline spin edits the first key
+        self.changed.emit()
 
     def _edit_curve(self) -> None:
         if self._spec is None:
@@ -280,6 +283,7 @@ class AutoParamWidget(QWidget):
                 self.value.setValue(int(keys[0][1]) if self._is_int
                                     else float(keys[0][1]))
                 self.value.blockSignals(False)
+            self.changed.emit()
 
     def get_value(self):
         if not self.auto_chk.isChecked():
@@ -307,6 +311,7 @@ class AutoParamWidget(QWidget):
             self.value.setValue(coerce(value))
             self.value.blockSignals(False)
         self._sync()
+        self.changed.emit()
 
 
 def build_param_widget(param: Param) -> Tuple[QWidget, Callable]:
@@ -435,24 +440,32 @@ class EffectParamDialog(QDialog):
     ``"pixel"`` or ``"raw"`` -- building controls from the mode's ``Param``
     schema; mosh effects also get a frame-range (region) row, and automatable
     params carry the full automation / curve / beats controls.
+
+    In *live* mode the dialog is non-modal and emits :sig:`paramsEdited` on every
+    control change, so the host can re-render the preview as sliders move; Ok /
+    Cancel then mean commit / revert rather than gating the values.
     """
+
+    paramsEdited = Signal(dict, object)       # (params, region) on any live change
 
     def __init__(self, parent, *, kind: str, mode_name: str,
                  params: Optional[dict] = None, region=None,
                  motion_labels: Optional[List[str]] = None,
                  beat_provider: Optional[Callable] = None,
-                 clip_id: Optional[str] = None, verb: str = "Edit"):
+                 clip_id: Optional[str] = None, verb: str = "Edit",
+                 live: bool = False):
         super().__init__(parent)
         self._kind = kind
         self.mode_name = mode_name
         self._beat_provider = beat_provider
         self._clip_id = clip_id
+        self._live = live
         self._getters: Dict[str, Callable] = {}
         self._param_widgets: Dict[str, QWidget] = {}
         self._clip_ref_names: List[str] = []
         mode = _mode_for(kind, mode_name)
         self.setWindowTitle(f"{verb}: {mode_name}")
-        self.setModal(True)
+        self.setModal(not live)
 
         v = QVBoxLayout(self)
         if getattr(mode, "description", ""):
@@ -508,11 +521,44 @@ class EffectParamDialog(QDialog):
         bar.addStretch(1)
         v.addLayout(bar)
 
+        # Ok commits (keeps the live-applied values); Cancel reverts to the
+        # values the editor opened with -- the host restores its pre-edit snapshot.
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                               | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self._on_accept)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
+
+        if live:
+            self._wire_live()
+
+    def _wire_live(self) -> None:
+        """Emit :sig:`paramsEdited` whenever any control changes, so the host can
+        live-render. Connected only in live mode, after the initial values are
+        populated, so seeding the controls doesn't fire spurious edits."""
+        for w in self._param_widgets.values():
+            if isinstance(w, AutoParamWidget):
+                w.changed.connect(self._emit_live)
+            elif isinstance(w, QCheckBox):
+                w.toggled.connect(lambda *_: self._emit_live())
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                w.valueChanged.connect(lambda *_: self._emit_live())
+            elif isinstance(w, QComboBox):
+                w.currentIndexChanged.connect(lambda *_: self._emit_live())
+            elif isinstance(w, QLineEdit):
+                w.textChanged.connect(lambda *_: self._emit_live())
+        if self._region_chk is not None:
+            self._region_chk.toggled.connect(lambda *_: self._emit_live())
+            self._region_start.valueChanged.connect(lambda *_: self._emit_live())
+            self._region_end.valueChanged.connect(lambda *_: self._emit_live())
+
+    def _emit_live(self) -> None:
+        params = self.result_params()
+        # A clip_ref mode is unrenderable until a motion source is picked; hold
+        # off live-updating (the OK-time validation still guards the commit).
+        if any(not params.get(n) for n in self._clip_ref_names):
+            return
+        self.paramsEdited.emit(params, self.result_region())
 
     def result_params(self) -> dict:
         return {name: g() for name, g in self._getters.items()}
@@ -1485,8 +1531,10 @@ class _HintListWidget(QListWidget):
 
 
 class InspectorPanel(QWidget):
-    effectAddRequested = Signal(str, dict, object)        # mode, params, region
-    effectUpdateRequested = Signal(str, str, dict, object)  # op_id, mode, params, region
+    effectAddBegin = Signal(str)                   # mode -> host creates the op live
+    effectEditBegin = Signal(str)                  # op_id -> open a live edit session
+    effectLiveUpdate = Signal(str, str, dict, object)  # op_id, mode, params, region
+    effectEditEnd = Signal(str, bool)              # op_id, committed
     effectRemoveRequested = Signal(str)            # op_id
     effectMoveRequested = Signal(str, int)         # op_id, delta (-1 up / +1 down)
     effectEnabledChanged = Signal(str, bool)       # op_id, enabled
@@ -1519,6 +1567,7 @@ class InspectorPanel(QWidget):
         self._raw_sel = -1
         self._mask_editors: Dict[str, dict] = {}
         self._beat_provider: Optional[Callable] = None    # clip_id -> [pos, ...]
+        self._live_dlg: Optional[EffectParamDialog] = None  # open live param editor
 
         outer = QVBoxLayout(self)
         outer.addWidget(_heading("Inspector"))
@@ -2220,26 +2269,40 @@ class InspectorPanel(QWidget):
         menu.exec(self.add_btn.mapToGlobal(self.add_btn.rect().bottomLeft()))
 
     def _add_effect(self, mode_name: str) -> None:
-        dlg = EffectParamDialog(
-            self, kind="mosh", mode_name=mode_name, verb="Add",
-            motion_labels=self._motion_labels, beat_provider=self._beat_provider,
-            clip_id=self._clip_id)
-        if dlg.exec():
-            self.effectAddRequested.emit(mode_name, dlg.result_params(),
-                                         dlg.result_region())
+        # The host creates the effect with its defaults, then calls
+        # open_live_editor() so the parameters can be tuned with a live preview.
+        self.effectAddBegin.emit(mode_name)
 
     def _edit_effect_item(self, item: QListWidgetItem) -> None:
-        op_id = item.data(Qt.ItemDataRole.UserRole)
+        self.open_live_editor(item.data(Qt.ItemDataRole.UserRole))
+
+    def open_live_editor(self, op_id: str) -> None:
+        """Open the non-modal live parameter editor for an effect in the stack.
+        Called on double-click and just after a live add."""
         e = next((x for x in self._effects if x["id"] == op_id), None)
         if e is None:
             return
+        if self._live_dlg is not None:                 # only one editor at a time;
+            self._live_dlg.accept()                    # commit the one it replaces
         dlg = EffectParamDialog(
             self, kind="mosh", mode_name=e["mode"], params=e.get("params") or {},
             region=e.get("region"), motion_labels=self._motion_labels,
-            beat_provider=self._beat_provider, clip_id=self._clip_id, verb="Edit")
-        if dlg.exec():
-            self.effectUpdateRequested.emit(op_id, e["mode"], dlg.result_params(),
-                                            dlg.result_region())
+            beat_provider=self._beat_provider, clip_id=self._clip_id,
+            verb="Edit", live=True)
+        self._live_dlg = dlg
+        mode = e["mode"]
+        self.effectEditBegin.emit(op_id)
+        dlg.paramsEdited.connect(
+            lambda params, region: self.effectLiveUpdate.emit(
+                op_id, mode, params, region))
+        dlg.finished.connect(lambda code: self._on_live_editor_done(op_id, code))
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dlg.show()
+        dlg.raise_()
+
+    def _on_live_editor_done(self, op_id: str, code: int) -> None:
+        self._live_dlg = None
+        self.effectEditEnd.emit(op_id, code == QDialog.DialogCode.Accepted)
 
     def _on_effect_item_changed(self, item: QListWidgetItem) -> None:
         if self._populating:

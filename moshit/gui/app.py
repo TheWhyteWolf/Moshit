@@ -200,6 +200,7 @@ class MainWindow(QMainWindow):
         self.controller = AppController(config=config, ffmpeg_bin=ffmpeg_bin,
                                         ffprobe_bin=ffprobe_bin)
         self._selected_clip: Optional[str] = None
+        self._live_editing = False             # a non-modal param editor is open
         self._dirty = False
 
         # Auto-refresh: edits re-render the preview after a short debounce.
@@ -480,8 +481,10 @@ class MainWindow(QMainWindow):
         c.sequence_changed.connect(self._on_sequence_changed)
         self.preview.frameChanged.connect(self._on_preview_frame)
 
-        self.inspector.effectAddRequested.connect(self._on_effect_add)
-        self.inspector.effectUpdateRequested.connect(self._on_effect_update)
+        self.inspector.effectAddBegin.connect(self._on_effect_add_begin)
+        self.inspector.effectEditBegin.connect(self._on_effect_edit_begin)
+        self.inspector.effectLiveUpdate.connect(self._on_effect_live_update)
+        self.inspector.effectEditEnd.connect(self._on_effect_edit_end)
         self.inspector.effectRemoveRequested.connect(self.controller.remove_effect)
         self.inspector.effectMoveRequested.connect(self.controller.move_effect)
         self.inspector.effectEnabledChanged.connect(self.controller.set_effect_enabled)
@@ -531,8 +534,10 @@ class MainWindow(QMainWindow):
         self.inspector.set_flow_sources(self.controller.media_choices())
         self.act_undo.setEnabled(self.controller.can_undo)
         self.act_redo.setEnabled(self.controller.can_redo)
-        # keep inspector in sync with the selected clip's current op
-        if self._selected_clip:
+        # keep inspector in sync with the selected clip's current op -- but not
+        # while a live param editor is open, or every drag tick would tear down
+        # and rebuild the inspector body (and the effect list) underneath it.
+        if self._selected_clip and not self._live_editing:
             self._on_clip_selected(self._selected_clip)
 
     def _on_clip_selected(self, clip_id: str) -> None:
@@ -563,14 +568,34 @@ class MainWindow(QMainWindow):
         self.controller.set_clip_props(self._selected_clip, props)
         self._schedule_auto_refresh(immediate=True)
 
-    def _on_effect_add(self, mode: str, params: dict, region) -> None:
+    # -- live effect editing (non-modal, re-renders as you drag) ------------- #
+
+    def _on_effect_add_begin(self, mode: str) -> None:
         if not self._selected_clip:
             return
-        self.controller.add_effect(self._selected_clip, mode, params, region)
-        self._schedule_auto_refresh(immediate=True)
+        op = self.controller.begin_effect_add(self._selected_clip, mode)
+        if op is None:
+            return
+        # begin_effect_add emitted project_changed, so the inspector's effect
+        # list already holds the new op; open its live editor bound to it.
+        self._live_editing = True
+        self.inspector.open_live_editor(op.id)
+        self._schedule_auto_refresh()              # debounced: show the default
 
-    def _on_effect_update(self, op_id: str, mode: str, params: dict, region) -> None:
-        self.controller.update_effect(op_id, mode, params, region)
+    def _on_effect_edit_begin(self, op_id: str) -> None:
+        self._live_editing = True
+        self.controller.begin_effect_edit(op_id)
+
+    def _on_effect_live_update(self, op_id: str, mode: str, params: dict,
+                               region) -> None:
+        self.controller.live_update_effect(op_id, mode, params, region)
+        self._schedule_auto_refresh()              # debounced so drags coalesce
+
+    def _on_effect_edit_end(self, op_id: str, committed: bool) -> None:
+        self._live_editing = False
+        self.controller.end_effect_edit(op_id, commit=committed)
+        if self._selected_clip:                    # resync the inspector body once
+            self._on_clip_selected(self._selected_clip)
         self._schedule_auto_refresh(immediate=True)
 
     def _on_preset_save(self) -> None:

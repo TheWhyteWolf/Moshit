@@ -123,6 +123,7 @@ class AppController(QObject):
         self._undo: List = []                 # snapshots (clips, ops, tracks, seqs)
         self._redo: List = []
         self._undo_limit = 64
+        self._live = None                     # in-flight live effect-edit session
         # Safety net: clean the temp dir even if the window's closeEvent never
         # fires (e.g. the process is interrupted from the terminal).
         atexit.register(self.cleanup)
@@ -779,6 +780,89 @@ class AppController(QObject):
         op.region_start, op.region_end = new_region
         self.project_changed.emit()
         return op
+
+    # -- live effect editing (coalesced undo) ------------------------------- #
+    #
+    # A live edit -- the non-modal param editor dragging a slider -- fires many
+    # updates in quick succession. These would each push_undo(), flooding the
+    # history with one entry per tick. Instead a *session* holds a single
+    # pre-edit snapshot aside and commits exactly one undo entry the first time a
+    # value actually changes (or, for an add, when the session commits). Cancel
+    # rolls back to the snapshot and drops that entry, so an abandoned edit
+    # leaves no trace.
+
+    def begin_effect_add(self, clip_id: str, mode: str, params: dict = None,
+                         region=None):
+        """Create an effect with its defaults inside a live session, then return
+        it so the caller can open the live editor bound to it. The add is not
+        undoable on its own until the session ends (or a value is changed)."""
+        pre = self._snapshot()
+        op = self.project.add_mosh(mode, params or {}, clip_id)
+        op.region_start, op.region_end = self._region_tuple(region)
+        self._live = {"op_id": op.id, "pre": pre, "created": True,
+                      "committed": False}
+        self.project_changed.emit()
+        return op
+
+    def begin_effect_edit(self, op_id: str) -> None:
+        """Open a live session over an existing effect, snapshotting its state.
+
+        A no-op if a session for this op is already open -- the live add flow
+        opens the editor (which signals begin) over the session begin_effect_add
+        just created, and that add session's pre-add snapshot must survive."""
+        if self._live and self._live.get("op_id") == op_id:
+            return
+        try:
+            op = self.project.op(op_id)
+        except KeyError:
+            self._live = None
+            return
+        self._live = {"op_id": op_id, "pre": self._snapshot(), "created": False,
+                      "committed": False,
+                      "orig": (op.mode, dict(op.params),
+                               (op.region_start, op.region_end))}
+
+    def live_update_effect(self, op_id: str, mode: str, params: dict,
+                           region=None):
+        """Apply a value during a live session. The first real change commits the
+        session's single undo entry; later changes mutate in place."""
+        live = self._live
+        if not live or live["op_id"] != op_id:     # no session: fall back to atomic
+            return self.update_effect(op_id, mode, params, region)
+        try:
+            op = self.project.op(op_id)
+        except KeyError:
+            return None
+        new_region = self._region_tuple(region)
+        if (op.mode == mode and op.params == params
+                and (op.region_start, op.region_end) == new_region):
+            return op                              # nothing changed
+        if not live["committed"]:
+            self._commit_undo(live["pre"])         # one entry for the whole session
+            live["committed"] = True
+        op.mode = mode
+        op.params = dict(params)
+        op.region_start, op.region_end = new_region
+        self.project_changed.emit()
+        return op
+
+    def end_effect_edit(self, op_id: str, *, commit: bool = True) -> None:
+        """Close a live session. ``commit`` keeps the edit (recording the bare
+        add if nothing was tweaked); otherwise revert to the pre-edit snapshot."""
+        live = self._live
+        if not live or live["op_id"] != op_id:
+            self._live = None
+            return
+        self._live = None
+        if commit:
+            if live["created"] and not live["committed"]:
+                self._commit_undo(live["pre"])     # a bare add is one undo step
+            return
+        # cancel: undo the session entirely
+        if live["committed"] and self._undo and self._undo[-1] is live["pre"]:
+            self._undo.pop()
+        self._restore(live["pre"])
+        self.project_changed.emit()
 
     def remove_effect(self, op_id: str) -> None:
         self._push_undo()
