@@ -83,6 +83,7 @@ class _StreamWorker(QRunnable):
 
 class AppController(QObject):
     media_added = Signal(object)          # MediaItem
+    media_relinked = Signal(object)       # list[MediaItem] (offline → restored)
     project_changed = Signal()
     busy = Signal(bool, str)              # (is_busy, message)
     error = Signal(str)
@@ -268,6 +269,31 @@ class AppController(QObject):
             self.status.emit(f"Imported {item.label} ({item.nb_frames} frames)")
         self._run(lambda: self._do_import(path, role), done,
                   f"Importing {Path(path).name}…")
+
+    def missing_media(self) -> list:
+        """Offline media items (their cached intermediate AVI is gone)."""
+        return self.project.missing_media()
+
+    def is_media_offline(self, media) -> bool:
+        return (not media.sequence_id
+                and not Path(media.intermediate_path).exists())
+
+    def relink_media(self, mapping: dict) -> None:
+        """Relink offline media: ``{media_id: new_source_path}``. Runs all
+        relinks as one background job (re-normalizes each source)."""
+        if not mapping:
+            return
+
+        def work():
+            return [self.project.relink_media(self.engine, mid, src)
+                    for mid, src in mapping.items()]
+
+        def done(items):
+            self.media_relinked.emit(items)
+            self.project_changed.emit()
+            self.status.emit(f"Relinked {len(items)} media file(s).")
+
+        self._run(work, done, f"Relinking {len(mapping)} media file(s)…")
 
     _TRANSFORM_LABELS = {"zoom_in": "zoom-in", "zoom_out": "zoom-out",
                          "pan_x": "pan-x", "pan_y": "pan-y", "rotate": "rotate"}

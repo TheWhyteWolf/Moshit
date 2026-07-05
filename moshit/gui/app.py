@@ -288,6 +288,8 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         a_settings = m.addAction("Project se&ttings…")
         a_settings.triggered.connect(self._project_settings)
+        a_relink = m.addAction("Relink offline &media…")
+        a_relink.triggered.connect(self._relink_offline_media)
         m.addSeparator()
         a_exp = m.addAction("&Export…")
         a_exp.setShortcut("Ctrl+E")
@@ -484,6 +486,7 @@ class MainWindow(QMainWindow):
         self.library.addToTrackRequested.connect(self._add_to_timeline)
 
         c.media_added.connect(self.library.add_media)
+        c.media_relinked.connect(lambda _items: self._reload_library())
         c.media_added.connect(lambda _:
                               self.inspector.set_motion_labels(c.motion_labels()))
         c.project_changed.connect(self._on_project_changed)
@@ -800,7 +803,8 @@ class MainWindow(QMainWindow):
     def _reload_library(self) -> None:
         self.library.list.clear()
         for media in self.controller.project.media.values():
-            self.library.add_media(media)
+            self.library.add_media(
+                media, offline=self.controller.is_media_offline(media))
         self.inspector.set_motion_labels(self.controller.motion_labels())
         self.timeline.set_project(self.controller.project)
 
@@ -901,6 +905,43 @@ class MainWindow(QMainWindow):
             self._set_dirty(False)
         except Exception as exc:                  # surface load errors
             self._on_error(str(exc))
+            return
+        self._offer_relink()
+
+    def _offer_relink(self) -> None:
+        """Prompt to relink any offline media right after a project opens."""
+        missing = self.controller.missing_media()
+        if not missing:
+            return
+        names = "\n".join(f"  • {m.label}" for m in missing[:8])
+        if len(missing) > 8:
+            names += "\n  …"
+        resp = QMessageBox.question(
+            self, "Missing media",
+            f"{len(missing)} media file(s) are offline (their cached video "
+            f"is missing):\n{names}\n\nRelink them now? (You can also use "
+            "File → Relink offline media… later.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if resp == QMessageBox.StandardButton.Yes:
+            self._relink_offline_media()
+
+    def _relink_offline_media(self) -> None:
+        missing = self.controller.missing_media()
+        if not missing:
+            self.statusBar().showMessage("No offline media.")
+            return
+        mapping = {}
+        for m in missing:
+            path, _ = QFileDialog.getOpenFileName(
+                self, f"Locate media for '{m.label}'",
+                self._start_dir("import"), _VIDEO_FILTER)
+            if path:
+                mapping[m.id] = path
+                self._remember_dir("import", path)
+        if mapping:
+            self._set_dirty(True)
+            self.controller.relink_media(mapping)
 
     def _save_project(self) -> bool:
         """Quick save: write to the known project file, or fall back to

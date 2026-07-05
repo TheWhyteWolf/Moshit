@@ -87,7 +87,11 @@ misc) so commits can reference them. Tick items off as they land.
 - [x] U23/U34: File → Open recent (8 entries, dedup, prune-on-missing, clear);
   QSettings persists window geometry + both splitters (saved on close); per-category
   last-directory memory for import / project / export / save-frame dialogs.
-- [ ] U25: missing-media detection on open, offline badge, relink dialog.
+- [x] U25: missing-media handling — `Project.load` first auto-repairs stale absolute
+  paths when the project folder was moved (sibling `_assets` dir wins); anything
+  still missing gets an ⚠ offline badge in the library, an offer-to-relink prompt
+  on open, and File → Relink offline media…; `Project.relink_media` re-normalizes
+  the new source in place (same id, clips/effects stay attached).
 - [ ] U7/U8: human-friendly errors; non-modal toast for auto-refresh failures.
 - [ ] U6/U30: determinate progress (parse ffmpeg `-progress`) + preview "rendering…" overlay.
 

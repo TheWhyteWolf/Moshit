@@ -378,6 +378,55 @@ def test_window_state_persists_across_sessions(qapp, tmp_path, monkeypatch):
         w2.controller.cleanup()
 
 
+def _seed_offline_media(win, mid="ghost"):
+    from moshit.project import MediaItem
+    win.controller.project.media[mid] = MediaItem(
+        id=mid, source_path="x", label=mid, role="main",
+        intermediate_path="/definitely/not/here.avi", nb_frames=10)
+    return mid
+
+
+def test_library_offline_badge(win):
+    mid = _seed_offline_media(win)
+    win._reload_library()
+    texts = [win.library.list.item(i).text()
+             for i in range(win.library.list.count())]
+    assert any("offline" in t for t in texts)
+    assert [m.id for m in win.controller.missing_media()] == [mid]
+
+
+def test_relink_flow_and_open_prompt(win, monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+    mid = _seed_offline_media(win)
+    picked = tmp_path / "new.mp4"
+    picked.write_bytes(b"x")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(picked), "")))
+    calls = {}
+    monkeypatch.setattr(win.controller, "relink_media",
+                        lambda mapping: calls.update(mapping))
+
+    # the on-open prompt routes into the relink flow on Yes
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    win._offer_relink()
+    assert calls == {mid: str(picked)}
+
+    # declining leaves everything untouched
+    calls.clear()
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.No))
+    win._offer_relink()
+    assert calls == {}
+
+    # no offline media → the menu action is a friendly no-op
+    win.controller.project.media.clear()
+    win._relink_offline_media()
+    assert calls == {}
+
+
 def test_effect_stack_region_and_pixel_fx(win):
     ctl = win.controller
     _seed_clip(ctl, "c")

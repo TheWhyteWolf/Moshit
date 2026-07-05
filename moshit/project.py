@@ -509,6 +509,35 @@ class Project:
         self._parsed[media_id] = avi.parse_avi(item.intermediate_path)
         return item
 
+    def relink_media(self, engine: MoshEngine, media_id: str,
+                     source_path) -> MediaItem:
+        """Rebuild an offline media item's cached intermediate from
+        *source_path*. The id is kept, so clips and effects stay attached."""
+        m = self.media[media_id]
+        clip = engine.normalize_clip(source_path, label=m.label,
+                                     single_keyframe=(m.role == "motion"))
+        inter = Path(clip.source)                  # engine's fresh intermediate
+        if self.assets_dir:
+            self.assets_dir.mkdir(parents=True, exist_ok=True)
+            dest = self.assets_dir / f"{media_id}.avi"
+            shutil.copy2(inter, dest)
+            inter = dest
+        m.source_path = str(source_path)
+        m.intermediate_path = str(inter)
+        m.width, m.height = clip.width, clip.height
+        m.fps, m.nb_frames = clip.fps, len(clip.frames)
+        m.alpha_path = None                        # re-capture source alpha
+        if m.role != "motion" and engine.source_has_alpha(source_path):
+            amap = (self.assets_dir / f"{media_id}.alpha.avi") if self.assets_dir \
+                else Path(inter).with_suffix(".alpha.avi")
+            try:
+                engine.extract_alpha_map(source_path, amap)
+                m.alpha_path = str(amap)
+            except Exception:
+                m.alpha_path = None                # falls back to opaque
+        self._parsed[media_id] = avi.parse_avi(m.intermediate_path)
+        return m
+
     def add_clip(self, media_id: str, track: str = "main", *,
                  start: Optional[int] = None, in_point: int = 0,
                  out_point: Optional[int] = None) -> Clip:
@@ -1272,7 +1301,32 @@ class Project:
 
     @classmethod
     def load(cls, path) -> "Project":
-        return cls.from_dict(json.loads(Path(path).read_text()))
+        p = cls.from_dict(json.loads(Path(path).read_text()))
+        p._repair_media_paths(Path(path))
+        return p
+
+    def _repair_media_paths(self, project_path: Path) -> None:
+        """Recover from a moved project folder: saved paths are absolute, so
+        relocating ``proj.json`` + ``proj_assets/`` together leaves them stale
+        even though every asset is right there next to the file."""
+        assets = project_path.parent / f"{project_path.stem}_assets"
+        if assets.is_dir():
+            # saves always place assets in this sibling dir, so it wins over
+            # the recorded path (which __init__ may have re-created, empty)
+            self.assets_dir = assets
+        for m in self.media.values():
+            for attr in ("intermediate_path", "alpha_path"):
+                val = getattr(m, attr)
+                if val and not Path(val).exists():
+                    cand = assets / Path(val).name
+                    if cand.exists():
+                        setattr(m, attr, str(cand))
+
+    def missing_media(self) -> List[MediaItem]:
+        """Media whose cached intermediate AVI is gone (offline). Precomp
+        media are excluded — they re-render from their sequence."""
+        return [m for m in self.media.values()
+                if not m.sequence_id and not Path(m.intermediate_path).exists()]
 
 
 # --------------------------------------------------------------------------- #

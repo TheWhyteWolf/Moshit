@@ -654,9 +654,17 @@ class MediaLibrary(QWidget):
         if mid:
             self.addToTrackRequested.emit(mid, track)
 
-    def add_media(self, item) -> None:
-        entry = QListWidgetItem(f"{item.label}  ·  {item.nb_frames}f")
+    def add_media(self, item, offline: bool = False) -> None:
+        text = f"{item.label}  ·  {item.nb_frames}f"
+        if offline:
+            text += "   ⚠ offline"
+        entry = QListWidgetItem(text)
         entry.setData(Qt.ItemDataRole.UserRole, item.id)
+        if offline:
+            entry.setForeground(QColor("#e07a5f"))
+            entry.setToolTip("Missing cached video:\n"
+                             f"{item.intermediate_path}\n"
+                             "Use File → Relink offline media… to restore it.")
         self.list.addItem(entry)
         self.list.setCurrentItem(entry)
 

@@ -74,3 +74,50 @@ def test_precomp_cycle_detected():
     p.add_sequence_clip(vt.id, a.id)                    # A contains A
     with pytest.raises(ValueError, match="cycle"):
         p.render(None, "x.avi", sequence_id=a.id)
+
+
+def test_moved_project_folder_repairs_media_paths(engine, tmp_path, make_clip):
+    from pathlib import Path
+    src = make_clip("s.mp4")
+    proj = Project(name="t", config=engine.config,
+                   assets_dir=str(tmp_path / "p_assets"))
+    m = proj.import_media(engine, src)
+    proj.save(tmp_path / "p.json")
+    # simulate moving the project folder: json + assets relocate together,
+    # leaving the absolute paths inside the json stale
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    (tmp_path / "p.json").rename(moved / "p.json")
+    (tmp_path / "p_assets").rename(moved / "p_assets")
+
+    p2 = Project.load(moved / "p.json")
+    m2 = p2.media[m.id]
+    assert Path(m2.intermediate_path).exists()
+    assert Path(m2.intermediate_path).parent == moved / "p_assets"
+    assert p2.missing_media() == []
+    assert Path(p2.assets_dir) == moved / "p_assets"
+
+
+def test_missing_media_detection_and_relink(engine, project, make_clip):
+    from pathlib import Path
+    src = make_clip("v.mp4")
+    m = project.import_media(engine, src)
+    assert project.missing_media() == []
+
+    Path(m.intermediate_path).unlink()                 # go offline
+    assert [x.id for x in project.missing_media()] == [m.id]
+
+    # precomp media are excluded (they re-render from their sequence)
+    project.media["pc"] = MediaItem(
+        id="pc", source_path="", label="pc", role="main",
+        intermediate_path="/nope.avi", sequence_id="seq1")
+    assert [x.id for x in project.missing_media()] == [m.id]
+
+    # relinking to a new source restores it in place: same id, clips attached
+    clip = project.add_clip(m.id)
+    src2 = make_clip("v2.mp4", color="red")
+    project.relink_media(engine, m.id, src2)
+    assert project.missing_media() == []
+    assert Path(m.intermediate_path).exists()
+    assert m.source_path == str(src2) and m.nb_frames > 0
+    assert project.clip(clip.id).media_id == m.id
