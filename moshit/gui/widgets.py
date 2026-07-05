@@ -1413,6 +1413,28 @@ class PreviewWidget(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._advance)
 
+        # busy badge over the image: the preview keeps showing the previous
+        # (stale) frames while a re-render runs, so say that it's updating
+        self._busy_badge = QLabel("Rendering…", self.view)
+        self._busy_badge.setStyleSheet(
+            "background: rgba(13, 15, 18, 190); color: #ffd166;"
+            "padding: 4px 10px; border-radius: 4px; font-weight: bold;")
+        self._busy_badge.hide()
+
+    def set_rendering(self, active: bool, text: str = "Rendering…") -> None:
+        if active:
+            self._busy_badge.setText(text or "Rendering…")
+            self._busy_badge.adjustSize()
+            self._place_badge()
+            self._busy_badge.show()
+            self._busy_badge.raise_()
+        else:
+            self._busy_badge.hide()
+
+    def _place_badge(self) -> None:
+        self._busy_badge.move(
+            self.view.width() - self._busy_badge.width() - 10, 10)
+
     def _current_fraction(self) -> Optional[float]:
         n = len(self._frames)
         return (self._idx / (n - 1)) if n > 1 else None
@@ -1630,6 +1652,8 @@ class PreviewWidget(QWidget):
         super().resizeEvent(event)
         if self._frames:
             self._show(self._idx)
+        if self._busy_badge.isVisible():
+            self._place_badge()
 
 
 # --------------------------------------------------------------------------- #

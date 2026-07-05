@@ -96,7 +96,11 @@ misc) so commits can reference them. Tick items off as they land.
   disk-full to actionable messages (with relink hints); ALL error surfacing is now
   non-modal — first line to the status bar, full text on a click-to-dismiss toast
   (`_Toast`), so a failing auto-refresh can't spam dialogs.
-- [ ] U6/U30: determinate progress (parse ffmpeg `-progress`) + preview "rendering…" overlay.
+- [x] U6/U30: determinate progress — `Project.render(progress=…)` reports per-clip /
+  per-layer steps (gen-guarded so cancelled jobs go quiet), the decode phase then
+  counts streamed frames against the known total; the preview shows a "Rendering…"
+  badge over the stale frames while any job runs. (ffmpeg `-progress` parsing wasn't
+  needed: step + frame-stream granularity already gives an honest bar.)
 
 ### Wave 4 — deeper perf restructurings
 - [ ] P8: per-clip dependency-scoped seg-cache keys (stop global cache busts).

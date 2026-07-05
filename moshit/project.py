@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass, field, fields as _dc_fields
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from . import avi
 from .avi import AviVideo, Frame
@@ -772,7 +772,8 @@ class Project:
 
     def render(self, engine: MoshEngine, out_avi, *,
                profile: Optional[str] = None, export_path=None,
-               audio: bool = False, sequence_id: Optional[str] = None) -> Dict:
+               audio: bool = False, sequence_id: Optional[str] = None,
+               progress: Optional[Callable[[int, int, str], None]] = None) -> Dict:
         """Materialise a sequence (the root by default). Does not mutate the
         project.
 
@@ -801,11 +802,13 @@ class Project:
         if simple:
             result = self._render_flat(
                 engine, out_avi, clips,
-                profile=profile, export_path=export_path, audio=audio)
+                profile=profile, export_path=export_path, audio=audio,
+                progress=progress)
         else:
             result = self._render_composite(
                 engine, out_avi, vtracks,
-                profile=profile, export_path=export_path, audio=audio)
+                profile=profile, export_path=export_path, audio=audio,
+                progress=progress)
         engine.seg_cache_trim()        # bound the cache now the fold is done
         return result
 
@@ -948,7 +951,8 @@ class Project:
         return finished, length
 
     def _render_flat(self, engine: MoshEngine, out_avi, clips, *,
-                     profile=None, export_path=None, audio=False) -> Dict:
+                     profile=None, export_path=None, audio=False,
+                     progress=None) -> Dict:
         fps = self.config.fps or 30.0
         motion = self._motion_frames()
         media_sig = self._media_signature()        # computed once, not per clip
@@ -969,7 +973,10 @@ class Project:
         # concatenates coded frames directly, so it always needs them.
         segs: List = []                            # (clip, media, seg|frames, n)
         template: Optional[AviVideo] = None
-        for c in clips:
+        steps = len(clips) + 1                     # per-clip work + assembly
+        for k, c in enumerate(clips):
+            if progress:
+                progress(k, steps, f"Rendering clip {k + 1}/{len(clips)}…")
             media = self._parsed_media(c.media_id)
             if template is None:
                 template = media
@@ -996,6 +1003,8 @@ class Project:
             total += mlen - trans
             prev_len = mlen
 
+        if progress:
+            progress(len(clips), steps, "Assembling sequence…")
         if needs_finish:
             meta = [{"n": n, "speed": c.speed, "reverse": c.reverse,
                      "fade_in": c.fade_in, "fade_out": c.fade_out,
@@ -1016,7 +1025,8 @@ class Project:
                                    audio=audio)
 
     def _render_composite(self, engine: MoshEngine, out_avi, vtracks, *,
-                          profile=None, export_path=None, audio=False) -> Dict:
+                          profile=None, export_path=None, audio=False,
+                          progress=None) -> Dict:
         fps = self.config.fps or 30.0
         layouts = {t.id: self.track_layout(t.id) for t in vtracks}
         total = max((start + length
@@ -1029,9 +1039,14 @@ class Project:
         track_seqs: List[List] = []                # per enabled track: [(clip,start,length,trans)]
         motion = self._motion_frames()             # shared by every clip below
         media_sig = self._media_signature()
+        nclips = sum(len(lay) for lay in layouts.values())
+        steps, k = nclips + 1, 0                   # per-clip work + composite
         for t in vtracks:                          # bottom -> top by index
             seq: List = []
             for clip, start, length, trans in layouts[t.id]:
+                if progress:
+                    progress(k, steps, f"Rendering layer {k + 1}/{nclips}…")
+                k += 1
                 seg, seglen = self._clip_segment(engine, clip, motion, media_sig)
                 lm = clip.layer_mask
                 # a source-file alpha matte pulls in the clip's aligned alpha map
@@ -1045,6 +1060,8 @@ class Project:
                 seq.append((clip, int(start), seglen, int(trans)))
             if seq:
                 track_seqs.append(seq)
+        if progress:
+            progress(nclips, steps, "Compositing layers…")
         out = engine.composite(layers, out_avi, total_frames=total)
         for lay in layers:                         # consumed
             for k in ("input", "mask_input"):

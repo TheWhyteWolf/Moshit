@@ -243,6 +243,7 @@ class MainWindow(QMainWindow):
         self._live_editing = False             # a non-modal param editor is open
         self._dirty = False
         self._project_path: Optional[str] = None    # set by Open / Save As
+        self._streamed = 0                          # decode-progress counter
         self._update_title()
 
         # Auto-refresh: edits re-render the preview after a short debounce.
@@ -534,6 +535,9 @@ class MainWindow(QMainWindow):
         c.preview_begin.connect(self.preview.begin_stream)
         c.preview_batch.connect(self.preview.append_frames)
         c.preview_done.connect(self.preview.end_stream)
+        c.progress.connect(self._on_progress)
+        c.preview_begin.connect(self._on_stream_begin)     # decode-phase progress
+        c.preview_batch.connect(self._on_stream_batch)
         c.preview_audio.connect(self.preview.set_audio)
         c.preview_waveform.connect(self.timeline.set_waveform)
         self.preview.muteToggled.connect(self.controller.set_preview_muted)
@@ -1111,11 +1115,35 @@ class MainWindow(QMainWindow):
         for act in (self.act_import, self.act_preview, self.act_export):
             act.setEnabled(not busy)
         self.inspector.setEnabled(not busy)
+        if busy:
+            self.progress.setRange(0, 0)        # indeterminate until steps arrive
         self.progress.setVisible(busy)
         self.cancel_btn.setVisible(busy)        # Cancel stays clickable while busy
+        self.preview.set_rendering(busy, message)
         if busy and message:
             self.statusBar().showMessage(message)
         self.setCursor(Qt.CursorShape.BusyCursor if busy else Qt.CursorShape.ArrowCursor)
+
+    def _on_progress(self, done: int, total: int, label: str) -> None:
+        """Determinate render progress (per-clip / per-layer steps)."""
+        if total > 0:
+            self.progress.setRange(0, total)
+            self.progress.setValue(done)
+        if label:
+            self.statusBar().showMessage(label)
+
+    def _on_stream_begin(self, total: int, _fps: float) -> None:
+        """Preview decode streams frames back — track them on the bar too."""
+        self._streamed = 0
+        if total > 0:
+            self.progress.setRange(0, total)
+            self.progress.setValue(0)
+            self.statusBar().showMessage("Loading preview frames…")
+
+    def _on_stream_batch(self, frames: list) -> None:
+        self._streamed += len(frames)
+        if self.progress.maximum() > 0:
+            self.progress.setValue(min(self._streamed, self.progress.maximum()))
 
     def _on_error(self, message: str) -> None:
         """Non-modal error surface: first line to the status bar, full text on

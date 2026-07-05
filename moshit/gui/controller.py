@@ -108,6 +108,7 @@ class _StreamWorker(QRunnable):
 class AppController(QObject):
     media_added = Signal(object)          # MediaItem
     media_relinked = Signal(object)       # list[MediaItem] (offline → restored)
+    progress = Signal(int, int, str)      # done steps, total steps, label
     project_changed = Signal()
     busy = Signal(bool, str)              # (is_busy, message)
     error = Signal(str)
@@ -219,11 +220,20 @@ class AppController(QObject):
         frames, fps, _ = self.decoder.decode(out, max_width=720)
         return frames, fps
 
-    def _do_export(self, profile, path, audio=True):
+    def _do_export(self, profile, path, audio=True, progress=None):
         out = self._dir / "export_src.avi"
         r = self.project.render(self.engine, out, profile=profile,
-                                export_path=str(path), audio=audio)
+                                export_path=str(path), audio=audio,
+                                progress=progress)
         return r["export"]
+
+    def _progress_cb(self, gen):
+        """A render progress callback (worker thread) that forwards to the
+        ``progress`` signal, dropping reports from a cancelled job."""
+        def cb(done: int, total: int, label: str) -> None:
+            if gen == self._job_gen:
+                self.progress.emit(done, total, label)
+        return cb
 
     def _do_bake(self, op_id):
         return self.project.bake_op(self.engine, op_id)
@@ -355,7 +365,8 @@ class AppController(QObject):
         out = self._dir / "preview.avi"
 
         def work(emit_begin, emit_batch):
-            r = self.project.render(self.preview_engine, out, sequence_id=seq_id)
+            r = self.project.render(self.preview_engine, out, sequence_id=seq_id,
+                                    progress=self._progress_cb(gen))
             self.decoder.decode_stream(out, emit_begin, emit_batch,
                                        max_width=PREVIEW_MAX_WIDTH)
             self._preview_audio = self._build_preview_audio(r.get("audio_plans"))
@@ -434,8 +445,10 @@ class AppController(QObject):
     def export(self, profile: str, path, audio: bool = True) -> None:
         def done(p):
             self.status.emit(f"Exported → {p}")
-        self._run(lambda: self._do_export(profile, path, audio), done,
-                  f"Exporting {profile}…")
+        gen = self._job_gen
+        self._run(lambda: self._do_export(profile, path, audio,
+                                          progress=self._progress_cb(gen)),
+                  done, f"Exporting {profile}…")
 
     def export_frame(self, frame_index: int, path) -> None:
         """Save one frame of the current preview render as a full-resolution

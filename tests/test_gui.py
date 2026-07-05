@@ -461,6 +461,28 @@ def test_error_shows_toast_not_dialog(win, monkeypatch, qapp):
     win.hide()
 
 
+def test_progress_bar_and_rendering_badge(win, qapp):
+    win.show()
+    win._on_busy(True, "Rendering preview…")
+    assert win.progress.isVisible() and win.progress.maximum() == 0   # indeterminate
+    assert win.preview._busy_badge.isVisible()
+    assert win.preview._busy_badge.text() == "Rendering preview…"
+
+    win._on_progress(2, 5, "Rendering clip 3/5…")     # render steps arrive
+    assert (win.progress.maximum(), win.progress.value()) == (5, 2)
+    assert win.statusBar().currentMessage() == "Rendering clip 3/5…"
+
+    win._on_stream_begin(100, 24.0)                   # decode phase takes over
+    win._on_stream_batch([object()] * 30)
+    win._on_stream_batch([object()] * 30)
+    assert (win.progress.maximum(), win.progress.value()) == (100, 60)
+
+    win._on_busy(False, "")
+    assert not win.progress.isVisible()
+    assert not win.preview._busy_badge.isVisible()
+    win.hide()
+
+
 def test_effect_stack_region_and_pixel_fx(win):
     ctl = win.controller
     _seed_clip(ctl, "c")

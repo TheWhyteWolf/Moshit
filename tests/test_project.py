@@ -121,3 +121,18 @@ def test_missing_media_detection_and_relink(engine, project, make_clip):
     assert Path(m.intermediate_path).exists()
     assert m.source_path == str(src2) and m.nb_frames > 0
     assert project.clip(clip.id).media_id == m.id
+
+
+def test_render_reports_determinate_progress(engine, project, make_clip, tmp_path):
+    m = project.import_media(engine, make_clip("p.mp4"))
+    project.add_clip(m.id)
+    project.add_clip(m.id)
+    calls = []
+    project.render(engine, tmp_path / "out.avi",
+                   progress=lambda i, n, s: calls.append((i, n, s)))
+    assert calls, "progress callback never fired"
+    total = calls[0][1]
+    assert total == 3                                  # 2 clips + assembly
+    assert all(n == total for _i, n, _s in calls)
+    assert [i for i, _n, _s in calls] == sorted(i for i, _n, _s in calls)
+    assert calls[-1] == (2, 3, "Assembling sequence…")
