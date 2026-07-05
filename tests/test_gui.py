@@ -281,6 +281,59 @@ def test_mainwindow_timeline_zoom_controls(win, qapp):
     assert win.zoom_label.text() == "1.0×"
 
 
+def test_quick_save_and_title(win, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+    assert win.windowTitle() == "untitled[*] — Moshit"
+
+    # never-saved: Ctrl+S falls through to Save As (one dialog, path recorded)
+    p1 = tmp_path / "myproj.json"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(p1), "Project (*.json)")))
+    win._set_dirty(True)
+    assert win._save_project()
+    assert p1.exists()
+    assert win._project_path == str(p1)
+    assert win.windowTitle() == "myproj[*] — Moshit"
+    assert not win._dirty
+
+    # saved once: quick save writes in place with NO dialog
+    def _boom(*a, **k):
+        raise AssertionError("quick save must not open a file dialog")
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(_boom))
+    win._set_dirty(True)
+    mtime = p1.stat().st_mtime_ns
+    assert win._save_project()
+    assert p1.stat().st_mtime_ns >= mtime and not win._dirty
+
+    # Save As redirects the project path
+    p2 = tmp_path / "renamed.json"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(p2), "Project (*.json)")))
+    assert win._save_project_as()
+    assert win._project_path == str(p2)
+    assert win.windowTitle() == "renamed[*] — Moshit"
+
+
+def test_open_project_sets_path_and_new_clears_it(win, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+    p = tmp_path / "roundtrip.json"
+    win.controller.save_project(str(p))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(p), "Project (*.json)")))
+    win._open_project()
+    assert win._project_path == str(p)
+    assert win.windowTitle() == "roundtrip[*] — Moshit"
+
+    # New project forgets the path so the next Ctrl+S prompts again
+    from PySide6.QtWidgets import QDialog
+    from moshit.gui.app import ProjectSettingsDialog
+    monkeypatch.setattr(ProjectSettingsDialog, "exec",
+                        lambda self: QDialog.DialogCode.Accepted)
+    win._new_project()
+    assert win._project_path is None
+    assert win.windowTitle() == "untitled[*] — Moshit"
+
+
 def test_effect_stack_region_and_pixel_fx(win):
     ctl = win.controller
     _seed_clip(ctl, "c")

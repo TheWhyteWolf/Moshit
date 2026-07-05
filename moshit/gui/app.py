@@ -195,7 +195,6 @@ class MainWindow(QMainWindow):
                  ffmpeg_bin: Optional[str] = None,
                  ffprobe_bin: Optional[str] = None):
         super().__init__()
-        self.setWindowTitle("Moshit[*]")
         self.resize(1180, 760)
 
         self.controller = AppController(config=config, ffmpeg_bin=ffmpeg_bin,
@@ -203,6 +202,8 @@ class MainWindow(QMainWindow):
         self._selected_clip: Optional[str] = None
         self._live_editing = False             # a non-modal param editor is open
         self._dirty = False
+        self._project_path: Optional[str] = None    # set by Open / Save As
+        self._update_title()
 
         # Auto-refresh: edits re-render the preview after a short debounce.
         self.auto_refresh = True
@@ -274,9 +275,12 @@ class MainWindow(QMainWindow):
         a_open = m.addAction("&Open project…")
         a_open.setShortcut("Ctrl+O")
         a_open.triggered.connect(self._open_project)
-        a_save = m.addAction("&Save project…")
+        a_save = m.addAction("&Save project")
         a_save.setShortcut("Ctrl+S")
         a_save.triggered.connect(self._save_project)
+        a_save_as = m.addAction("Save project &as…")
+        a_save_as.setShortcut("Ctrl+Shift+S")
+        a_save_as.triggered.connect(self._save_project_as)
         m.addSeparator()
         a_settings = m.addAction("Project se&ttings…")
         a_settings.triggered.connect(self._project_settings)
@@ -285,7 +289,7 @@ class MainWindow(QMainWindow):
         a_exp.setShortcut("Ctrl+E")
         a_exp.triggered.connect(self._export)
         a_frame = m.addAction("Save &frame as image…")
-        a_frame.setShortcut("Ctrl+Shift+S")
+        a_frame.setShortcut("Ctrl+Shift+F")
         a_frame.triggered.connect(self._save_frame)
         m.addSeparator()
         a_quit = m.addAction("&Quit")
@@ -827,6 +831,7 @@ class MainWindow(QMainWindow):
         self.library.list.clear()
         self.inspector.set_enabled_for_clip(None, None)
         self.preview.set_frames([], 30.0)
+        self._set_project_path(None)
         self._set_dirty(False)
 
     def _project_settings(self) -> None:
@@ -871,22 +876,44 @@ class MainWindow(QMainWindow):
             self._selected_clip = None
             self._reload_library()
             self.inspector.set_enabled_for_clip(None, None)
+            self._set_project_path(path)
             self._set_dirty(False)
         except Exception as exc:                  # surface load errors
             self._on_error(str(exc))
 
     def _save_project(self) -> bool:
-        path, _ = QFileDialog.getSaveFileName(self, "Save project", "project.json",
+        """Quick save: write to the known project file, or fall back to
+        Save As for a never-saved project."""
+        if not self._project_path:
+            return self._save_project_as()
+        return self._save_to(self._project_path)
+
+    def _save_project_as(self) -> bool:
+        default = self._project_path or f"{self.controller.project.name}.json"
+        path, _ = QFileDialog.getSaveFileName(self, "Save project", default,
                                               "Project (*.json)")
-        if not path:
-            return False
+        return bool(path) and self._save_to(path)
+
+    def _save_to(self, path: str) -> bool:
         try:
             self.controller.save_project(path)
-            self._set_dirty(False)
-            return True
         except Exception as exc:
             self._on_error(str(exc))
             return False
+        self._set_project_path(path)
+        self._set_dirty(False)
+        return True
+
+    def _set_project_path(self, path: Optional[str]) -> None:
+        self._project_path = path
+        if path:
+            self.controller.project.name = Path(path).stem
+        self._update_title()
+
+    def _update_title(self) -> None:
+        name = (Path(self._project_path).stem if self._project_path
+                else getattr(self.controller.project, "name", "") or "untitled")
+        self.setWindowTitle(f"{name}[*] — Moshit")
 
     def _export(self) -> None:
         profiles = self.controller.export_profiles()
