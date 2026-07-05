@@ -92,7 +92,10 @@ misc) so commits can reference them. Tick items off as they land.
   still missing gets an ⚠ offline badge in the library, an offer-to-relink prompt
   on open, and File → Relink offline media…; `Project.relink_media` re-normalizes
   the new source in place (same id, clips/effects stay attached).
-- [ ] U7/U8: human-friendly errors; non-modal toast for auto-refresh failures.
+- [x] U7/U8: `_friendly_error` maps FileNotFound / ffmpeg-missing-input / permission /
+  disk-full to actionable messages (with relink hints); ALL error surfacing is now
+  non-modal — first line to the status bar, full text on a click-to-dismiss toast
+  (`_Toast`), so a failing auto-refresh can't spam dialogs.
 - [ ] U6/U30: determinate progress (parse ffmpeg `-progress`) + preview "rendering…" overlay.
 
 ### Wave 4 — deeper perf restructurings

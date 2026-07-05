@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..engine import EngineConfig, _ext_for_profile
-from .controller import AppController
+from .controller import AppController, _friendly_error
 from .widgets import (InspectorPanel, MediaLibrary, PreviewWidget, TimelinePane,
                       TimelineWidget)
 
@@ -190,6 +190,45 @@ class FlowDialog(QDialog):
         }
 
 
+class _Toast(QLabel):
+    """Non-modal transient notice, bottom-centre over the main window.
+
+    Replaces modal error dialogs: a failing auto-refresh render used to spam
+    a QMessageBox per edit. Click to dismiss; auto-hides after a few seconds.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setVisible(False)
+        self.setWordWrap(True)
+        self.setMaximumWidth(560)
+        self.setStyleSheet(
+            "background: #5c2a33; color: #ffe3e3; border: 1px solid #a4454f;"
+            "border-radius: 6px; padding: 10px 14px; font-size: 12px;")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Click to dismiss")
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+
+    def show_message(self, text: str, msecs: int = 8000) -> None:
+        if len(text) > 700:                        # keep the toast glanceable
+            text = text[:700] + " …"
+        self.setText(text)
+        self.adjustSize()
+        self.reposition()
+        self.raise_()
+        self.show()
+        self._timer.start(msecs)
+
+    def reposition(self) -> None:
+        pw, ph = self.parent().width(), self.parent().height()
+        self.move((pw - self.width()) // 2, ph - self.height() - 46)
+
+    def mousePressEvent(self, _event) -> None:     # noqa: N802 (Qt signature)
+        self.hide()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: Optional[EngineConfig] = None,
                  ffmpeg_bin: Optional[str] = None,
@@ -251,6 +290,7 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(1, 2)
         self.setCentralWidget(split)
 
+        self._toast = _Toast(self)
         self._build_menu()
         self._build_toolbar()
         self._build_status_widgets()
@@ -904,7 +944,7 @@ class MainWindow(QMainWindow):
             self._set_project_path(path)
             self._set_dirty(False)
         except Exception as exc:                  # surface load errors
-            self._on_error(str(exc))
+            self._on_error(_friendly_error(exc))
             return
         self._offer_relink()
 
@@ -1078,10 +1118,17 @@ class MainWindow(QMainWindow):
         self.setCursor(Qt.CursorShape.BusyCursor if busy else Qt.CursorShape.ArrowCursor)
 
     def _on_error(self, message: str) -> None:
-        self.statusBar().showMessage(message)
-        QMessageBox.warning(self, "Moshit", message)
+        """Non-modal error surface: first line to the status bar, full text on
+        a transient toast (a failing auto-refresh must never spam dialogs)."""
+        self.statusBar().showMessage(message.splitlines()[0] if message else "")
+        self._toast.show_message(message)
 
     # -- lifecycle ---------------------------------------------------------- #
+
+    def resizeEvent(self, event) -> None:          # noqa: N802 (Qt signature)
+        super().resizeEvent(event)
+        if self._toast.isVisible():
+            self._toast.reposition()
 
     def closeEvent(self, event) -> None:
         if not self._maybe_save():

@@ -29,7 +29,7 @@ PREVIEW_MAX_WIDTH = 720
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
 from ..engine import EngineConfig, MoshEngine
-from ..ffmpeg import FFmpeg
+from ..ffmpeg import FFmpeg, FFmpegError
 from ..modes import load_modes
 from ..project import Project, ROOT_SEQ_ID, MAIN_TRACK_ID, MOTION_TRACK_ID
 from .. import beats, waveform
@@ -39,6 +39,30 @@ from .preview import PreviewDecoder
 class _WorkerSignals(QObject):
     finished = Signal(object)
     error = Signal(str)
+
+
+def _friendly_error(exc: Exception) -> str:
+    """Map common failures to actionable messages instead of raw exception
+    text (tracebacks still go to the terminal for debugging)."""
+    if isinstance(exc, FileNotFoundError):
+        missing = exc.filename or str(exc)
+        return (f"A file is missing:\n{missing}\n"
+                "If it's project media, use File → Relink offline media…; "
+                "otherwise re-import the source.")
+    msg = str(exc)
+    if isinstance(exc, FFmpegError):
+        # already descriptive (step + stderr tail); add a hint when the cause
+        # is clearly a vanished input file
+        if "No such file or directory" in msg:
+            msg += ("\n\nAn input file has moved or was deleted — try "
+                    "File → Relink offline media…")
+        return msg
+    if isinstance(exc, PermissionError):
+        return (f"Permission denied:\n{exc.filename or msg}\n"
+                "Pick a different location or check the file's permissions.")
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
+        return "The disk is full — free some space and try again."
+    return msg
 
 
 class _Worker(QRunnable):
@@ -53,7 +77,7 @@ class _Worker(QRunnable):
             self.signals.finished.emit(self.fn())
         except Exception as exc:                  # surfaced to the UI
             traceback.print_exc()
-            self.signals.error.emit(str(exc))
+            self.signals.error.emit(_friendly_error(exc))
 
 
 class _StreamSignals(QObject):
@@ -78,7 +102,7 @@ class _StreamWorker(QRunnable):
             self.signals.done.emit()
         except Exception as exc:
             traceback.print_exc()
-            self.signals.error.emit(str(exc))
+            self.signals.error.emit(_friendly_error(exc))
 
 
 class AppController(QObject):

@@ -427,6 +427,40 @@ def test_relink_flow_and_open_prompt(win, monkeypatch, tmp_path):
     assert calls == {}
 
 
+def test_friendly_error_mapping(qapp):
+    from moshit.gui.controller import _friendly_error
+    from moshit.ffmpeg import FFmpegError
+
+    msg = _friendly_error(FileNotFoundError(2, "No such file", "media_1.avi"))
+    assert "media_1.avi" in msg and "Relink" in msg
+
+    hinted = _friendly_error(FFmpegError(
+        "finish failed (exit 1):\n/x/gone.avi: No such file or directory"))
+    assert hinted.startswith("finish failed") and "Relink" in hinted
+
+    plain = _friendly_error(FFmpegError("encode failed (exit 1):\nbad option"))
+    assert plain == "encode failed (exit 1):\nbad option"
+
+    assert _friendly_error(ValueError("boom")) == "boom"
+
+
+def test_error_shows_toast_not_dialog(win, monkeypatch, qapp):
+    from PySide6.QtWidgets import QMessageBox
+
+    def _boom(*a, **k):
+        raise AssertionError("errors must not open a modal dialog")
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(_boom))
+
+    win.show()
+    win.controller.error.emit("render failed (exit 1):\nsome ffmpeg detail")
+    assert win._toast.isVisible()
+    assert "some ffmpeg detail" in win._toast.text()
+    assert win.statusBar().currentMessage() == "render failed (exit 1):"
+    win._toast.mousePressEvent(None)               # click dismisses
+    assert not win._toast.isVisible()
+    win.hide()
+
+
 def test_effect_stack_region_and_pixel_fx(win):
     ctl = win.controller
     _seed_clip(ctl, "c")
