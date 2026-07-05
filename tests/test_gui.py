@@ -334,6 +334,50 @@ def test_open_project_sets_path_and_new_clears_it(win, tmp_path, monkeypatch):
     assert win.windowTitle() == "untitled[*] — Moshit"
 
 
+def test_recent_projects_and_dir_memory(win, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+    monkeypatch.setattr(QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: None))
+    p1, p2 = tmp_path / "one.json", tmp_path / "two.json"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(p1), "")))
+    assert win._save_project()
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(p2), "")))
+    assert win._save_project_as()
+    assert win._recent_projects()[:2] == [str(p2), str(p1)]   # most recent first
+    assert win._save_project()                                # re-save dedups
+    assert win._recent_projects().count(str(p2)) == 1
+
+    labels = [a.text() for a in win._recent_menu.actions()]
+    assert "two.json" in labels and "one.json" in labels
+
+    assert win._start_dir("project") == str(tmp_path)         # last-dir memory
+
+    win._open_recent(str(p1))                                 # loads, no dialog
+    assert win._project_path == str(p1)
+    assert win._recent_projects()[0] == str(p1)
+
+    p2.unlink()                                               # vanished → pruned
+    win._open_recent(str(p2))
+    assert str(p2) not in win._recent_projects()
+    assert win._project_path == str(p1)                       # unchanged
+
+
+def test_window_state_persists_across_sessions(qapp, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from moshit.gui.app import MainWindow
+    w1 = MainWindow()
+    w1.resize(640, 480)
+    w1._save_ui_state()
+    w1.controller.cleanup()
+    w2 = MainWindow()
+    try:
+        assert (w2.width(), w2.height()) == (640, 480)
+    finally:
+        w2.controller.cleanup()
+
+
 def test_effect_stack_region_and_pixel_fx(win):
     ctl = win.controller
     _seed_clip(ctl, "c")

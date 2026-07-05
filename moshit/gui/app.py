@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -196,6 +196,7 @@ class MainWindow(QMainWindow):
                  ffprobe_bin: Optional[str] = None):
         super().__init__()
         self.resize(1180, 760)
+        self._settings = QSettings("moshit", "moshit")
 
         self.controller = AppController(config=config, ffmpeg_bin=ffmpeg_bin,
                                         ffprobe_bin=ffprobe_bin)
@@ -227,7 +228,7 @@ class MainWindow(QMainWindow):
             Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         insp_scroll.setMinimumWidth(260)
 
-        top = QSplitter(Qt.Orientation.Horizontal)
+        top = self._top_split = QSplitter(Qt.Orientation.Horizontal)
         top.addWidget(self.library)
         top.addWidget(self.preview)
         top.addWidget(insp_scroll)
@@ -243,7 +244,7 @@ class MainWindow(QMainWindow):
         bv.addWidget(self.timeline_pane, 1)
         bv.addWidget(self._build_tool_strip())
 
-        split = QSplitter(Qt.Orientation.Vertical)
+        split = self._main_split = QSplitter(Qt.Orientation.Vertical)
         split.addWidget(top)
         split.addWidget(bottom)
         split.setStretchFactor(0, 5)
@@ -262,6 +263,7 @@ class MainWindow(QMainWindow):
         self.inspector.set_presets(self.controller.preset_names())
         self.inspector.set_flow_sources(self.controller.media_choices())
         self.inspector.set_beat_provider(self.controller.beat_positions)
+        self._restore_ui_state()
 
     # -- toolbar ------------------------------------------------------------ #
 
@@ -275,6 +277,8 @@ class MainWindow(QMainWindow):
         a_open = m.addAction("&Open project…")
         a_open.setShortcut("Ctrl+O")
         a_open.triggered.connect(self._open_project)
+        self._recent_menu = m.addMenu("Open &recent")
+        self._rebuild_recent_menu()
         a_save = m.addAction("&Save project")
         a_save.setShortcut("Ctrl+S")
         a_save.triggered.connect(self._save_project)
@@ -549,9 +553,11 @@ class MainWindow(QMainWindow):
     # -- handlers ----------------------------------------------------------- #
 
     def _import(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Import video", "",
+        path, _ = QFileDialog.getOpenFileName(self, "Import video",
+                                              self._start_dir("import"),
                                               _VIDEO_FILTER)
         if path:
+            self._remember_dir("import", path)
             self.controller.import_media(path)
 
     def _add_to_timeline(self, media_id: str, track: str = "main") -> None:
@@ -860,17 +866,32 @@ class MainWindow(QMainWindow):
             return
         idx = self.preview.current_index()
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save frame", f"frame_{idx:05d}.png", "Images (*.png *.jpg)")
+            self, "Save frame", self._in_start_dir("export", f"frame_{idx:05d}.png"),
+            "Images (*.png *.jpg)")
         if path:
+            self._remember_dir("export", path)
             self.controller.export_frame(idx, path)
 
     def _open_project(self) -> None:
         if not self._maybe_save():
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open project", "",
+        path, _ = QFileDialog.getOpenFileName(self, "Open project",
+                                              self._start_dir("project"),
                                               "Project (*.json)")
-        if not path:
+        if path:
+            self._remember_dir("project", path)
+            self._open_path(path)
+
+    def _open_recent(self, path: str) -> None:
+        if not self._maybe_save():
             return
+        if not Path(path).exists():
+            self._on_error(f"Project file not found: {path}")
+            self._remove_recent(path)
+            return
+        self._open_path(path)
+
+    def _open_path(self, path: str) -> None:
         try:
             self.controller.open_project(path)
             self._selected_clip = None
@@ -889,10 +910,15 @@ class MainWindow(QMainWindow):
         return self._save_to(self._project_path)
 
     def _save_project_as(self) -> bool:
-        default = self._project_path or f"{self.controller.project.name}.json"
+        default = (self._project_path
+                   or self._in_start_dir("project",
+                                         f"{self.controller.project.name}.json"))
         path, _ = QFileDialog.getSaveFileName(self, "Save project", default,
                                               "Project (*.json)")
-        return bool(path) and self._save_to(path)
+        if not path:
+            return False
+        self._remember_dir("project", path)
+        return self._save_to(path)
 
     def _save_to(self, path: str) -> bool:
         try:
@@ -908,7 +934,69 @@ class MainWindow(QMainWindow):
         self._project_path = path
         if path:
             self.controller.project.name = Path(path).stem
+            self._add_recent(path)
         self._update_title()
+
+    # -- persistent UI state (QSettings) ------------------------------------- #
+
+    def _start_dir(self, key: str) -> str:
+        """Last directory used for this dialog category ('' on first use)."""
+        return str(self._settings.value(f"dir/{key}", "") or "")
+
+    def _remember_dir(self, key: str, path: str) -> None:
+        self._settings.setValue(f"dir/{key}", str(Path(path).parent))
+
+    def _in_start_dir(self, key: str, filename: str) -> str:
+        d = self._start_dir(key)
+        return str(Path(d) / filename) if d else filename
+
+    def _recent_projects(self) -> list:
+        val = self._settings.value("recent/projects") or []
+        if isinstance(val, str):                  # QSettings collapses 1-elem lists
+            val = [val]
+        return [str(p) for p in val if p]
+
+    def _add_recent(self, path: str) -> None:
+        rec = [p for p in self._recent_projects() if p != path]
+        rec.insert(0, path)
+        self._settings.setValue("recent/projects", rec[:8])
+        self._rebuild_recent_menu()
+
+    def _remove_recent(self, path: str) -> None:
+        rec = [p for p in self._recent_projects() if p != path]
+        self._settings.setValue("recent/projects", rec)
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self) -> None:
+        menu = self._recent_menu
+        menu.clear()
+        rec = self._recent_projects()
+        for p in rec:
+            act = menu.addAction(Path(p).name)
+            act.setToolTip(p)
+            act.triggered.connect(lambda _=False, p=p: self._open_recent(p))
+        menu.setEnabled(bool(rec))
+        if rec:
+            menu.addSeparator()
+            menu.addAction("Clear list",
+                           lambda: (self._settings.setValue("recent/projects", []),
+                                    self._rebuild_recent_menu()))
+
+    def _restore_ui_state(self) -> None:
+        g = self._settings.value("win/geometry")
+        if g is not None:
+            self.restoreGeometry(g)
+        for key, sp in (("win/top_split", self._top_split),
+                        ("win/main_split", self._main_split)):
+            st = self._settings.value(key)
+            if st is not None:
+                sp.restoreState(st)
+
+    def _save_ui_state(self) -> None:
+        s = self._settings
+        s.setValue("win/geometry", self.saveGeometry())
+        s.setValue("win/top_split", self._top_split.saveState())
+        s.setValue("win/main_split", self._main_split.saveState())
 
     def _update_title(self) -> None:
         name = (Path(self._project_path).stem if self._project_path
@@ -926,9 +1014,12 @@ class MainWindow(QMainWindow):
             return
         profile, audio = dlg.values()
         suffix = _ext_for_profile(profile)
-        path, _ = QFileDialog.getSaveFileName(self, "Export to", f"moshit{suffix}",
+        path, _ = QFileDialog.getSaveFileName(self, "Export to",
+                                              self._in_start_dir(
+                                                  "export", f"moshit{suffix}"),
                                               f"*{suffix}")
         if path:
+            self._remember_dir("export", path)
             self.controller.export(profile, path, audio)
 
     def _on_cancel(self) -> None:
@@ -955,6 +1046,7 @@ class MainWindow(QMainWindow):
         if not self._maybe_save():
             event.ignore()
             return
+        self._save_ui_state()
         try:
             self.controller.cleanup()
         finally:

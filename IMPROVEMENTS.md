@@ -81,8 +81,12 @@ misc) so commits can reference them. Tick items off as they land.
   `=`/`-`/`0` shortcuts + tool-strip buttons; ruler ticks use 1/2/5×10^k steps;
   waveform/ruler paint is visible-region-bounded; lane labels stick to the view
   edge; playback pages the view when the playhead exits it.
-- [ ] U24: quick-save in place + Save As; project name in window title.
-- [ ] U23/U34: recent projects, QSettings for window/splitter state, last-directory memory.
+- [x] U24: quick-save in place (Ctrl+S, no dialog once a path is known) + Save As
+  (Ctrl+Shift+S); project name + modified marker in the window title; save-frame
+  moved to Ctrl+Shift+F.
+- [x] U23/U34: File → Open recent (8 entries, dedup, prune-on-missing, clear);
+  QSettings persists window geometry + both splitters (saved on close); per-category
+  last-directory memory for import / project / export / save-frame dialogs.
 - [ ] U25: missing-media detection on open, offline badge, relink dialog.
 - [ ] U7/U8: human-friendly errors; non-modal toast for auto-refresh failures.
 - [ ] U6/U30: determinate progress (parse ffmpeg `-progress`) + preview "rendering…" overlay.
