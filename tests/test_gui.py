@@ -201,20 +201,29 @@ def test_raw_fx_add_update_remove_and_undo(ctl):
     assert ctl.clip_raw_fx("c") == []
 
 
-def test_inspector_pixel_panel_round_trips(qapp):
-    from moshit.gui.widgets import InspectorPanel
+def test_inspector_pixel_panel_live_round_trips(qapp):
+    from PySide6.QtWidgets import QDialog
+    from moshit.gui.widgets import InspectorPanel, EffectParamDialog
     insp = InspectorPanel()
-    added, params = [], []
-    insp.pixelFxAddRequested.connect(lambda n, p: added.append((n, p)))
-    insp.pixelFxParamsChanged.connect(lambda i, p: params.append((i, p)))
+    adds, begins, updates, ends = [], [], [], []
+    insp.pixelFxAddBegin.connect(adds.append)
+    insp.pixelFxEditBegin.connect(begins.append)
+    insp.pixelFxLiveUpdate.connect(lambda i, p: updates.append((i, p)))
+    insp.pixelFxEditEnd.connect(lambda i, ok: ends.append((i, ok)))
     insp._clip_id = "c"
-    insp._fx_dialog = lambda *a, **k: {"shift": 7}      # stub the modal pop-up
-    insp._add_pixel_fx("rgb_shift")
-    assert added == [("rgb_shift", {"shift": 7})]
-    insp.set_clip_pixel_fx([{"name": "rgb_shift", "params": {"shift": 1}}])
+    insp._add_pixel_fx("rgb_shift")                      # add asks the host to create
+    assert adds == ["rgb_shift"]
+    # edit an existing one through the non-modal live editor
+    insp.set_clip_pixel_fx([{"name": "rgb_shift", "params": {"amount": 3}}])
     assert insp.pixel_list.count() == 1
-    insp._edit_pixel_item(insp.pixel_list.item(0))      # double-click edit flow
-    assert params and params[-1] == (0, {"shift": 7})
+    insp._edit_pixel_item(insp.pixel_list.item(0))
+    assert begins == [0]
+    dlg = insp._live_dlg
+    assert isinstance(dlg, EffectParamDialog) and not dlg.isModal()
+    dlg._param_widgets["amount"].setValue(9)            # a slider move -> live update
+    assert updates and updates[-1] == (0, {"amount": 9})
+    dlg.accept()
+    assert ends == [(0, True)] and insp._live_dlg is None
 
 
 def test_cancel_drops_stale_result_and_is_idle_safe(ctl):
@@ -252,22 +261,28 @@ def test_cancel_serializes_until_worker_drains(ctl):
     assert not ctl._draining and not ctl.is_busy
 
 
-def test_inspector_raw_panel_round_trips(qapp):
-    from moshit.gui.widgets import InspectorPanel
+def test_inspector_raw_panel_live_round_trips(qapp):
+    from moshit.gui.widgets import InspectorPanel, EffectParamDialog
     insp = InspectorPanel()
-    added, params = [], []
-    insp.rawFxAddRequested.connect(lambda n, p: added.append((n, p)))
-    insp.rawFxParamsChanged.connect(lambda i, p: params.append((i, p)))
+    adds, begins, updates, ends = [], [], [], []
+    insp.rawFxAddBegin.connect(adds.append)
+    insp.rawFxEditBegin.connect(begins.append)
+    insp.rawFxLiveUpdate.connect(lambda i, p: updates.append((i, p)))
+    insp.rawFxEditEnd.connect(lambda i, ok: ends.append((i, ok)))
     insp._clip_id = "c"
-    # stub the param pop-up so the test doesn't open a modal dialog
-    insp._fx_dialog = lambda *a, **k: {"axis": "vertical", "lo": 0.2, "hi": 0.8}
-    insp._add_raw_fx("pixel_sort")                      # the "+ Add" flow
-    assert added == [("pixel_sort", {"axis": "vertical", "lo": 0.2, "hi": 0.8})]
+    insp._add_raw_fx("pixel_sort")                       # the "+ Add" flow
+    assert adds == ["pixel_sort"]
     insp.set_clip_raw_fx([{"name": "pixel_sort", "params": {"axis": "horizontal"}}])
     assert insp.raw_list.count() == 1
-    insp._edit_raw_item(insp.raw_list.item(0))          # double-click edit flow
-    assert params and params[-1][0] == 0
-    assert params[-1][1]["axis"] == "vertical"
+    insp._edit_raw_item(insp.raw_list.item(0))
+    assert begins == [0]
+    dlg = insp._live_dlg
+    assert isinstance(dlg, EffectParamDialog) and not dlg.isModal()
+    dlg._param_widgets["axis"].setCurrentText("vertical")   # a control edit -> live
+    assert updates and updates[-1][0] == 0
+    assert updates[-1][1]["axis"] == "vertical"
+    dlg.reject()                                            # Cancel
+    assert ends == [(0, False)] and insp._live_dlg is None
 
 
 def test_set_clip_mask_and_undo(ctl):
@@ -520,6 +535,42 @@ def test_live_update_without_session_falls_back_to_atomic(ctl):
     assert len(ctl._undo) == depth + 1                   # atomic path pushed one
 
 
+def test_live_pixel_fx_edit_coalesces_and_cancels(ctl):
+    _seed_clip(ctl, "c")
+    ctl.add_pixel_fx("c", "rgb_shift", {"amount": 3})
+    depth = len(ctl._undo)
+    ctl.begin_fx_edit("pixel", "c", 0)
+    for v in (5, 7, 9):
+        ctl.live_update_fx("pixel", "c", 0, {"amount": v})
+    ctl.end_fx_edit("pixel", "c", 0, commit=True)
+    assert len(ctl._undo) == depth + 1                   # one entry for the drag
+    assert ctl.clip_pixel_fx("c")[0]["params"]["amount"] == 9
+    # cancel reverts and leaves no history
+    ctl.begin_fx_edit("pixel", "c", 0)
+    ctl.live_update_fx("pixel", "c", 0, {"amount": 40})
+    assert ctl.clip_pixel_fx("c")[0]["params"]["amount"] == 40
+    ctl.end_fx_edit("pixel", "c", 0, commit=False)
+    assert ctl.clip_pixel_fx("c")[0]["params"]["amount"] == 9
+    assert len(ctl._undo) == depth + 1
+
+
+def test_live_raw_fx_add_commit_and_cancel(ctl):
+    _seed_clip(ctl, "c")
+    assert not ctl.can_undo
+    # cancelled add leaves neither the FX nor history
+    i = ctl.begin_fx_add("raw", "c", "pixel_sort")
+    assert i == 0 and len(ctl.clip_raw_fx("c")) == 1
+    ctl.end_fx_edit("raw", "c", i, commit=False)
+    assert ctl.clip_raw_fx("c") == [] and not ctl.can_undo
+    # committed add with a live tweak is a single undo step
+    i = ctl.begin_fx_add("raw", "c", "pixel_sort")
+    ctl.live_update_fx("raw", "c", i, {"axis": "vertical"})
+    ctl.end_fx_edit("raw", "c", i, commit=True)
+    assert ctl.clip_raw_fx("c")[0]["params"]["axis"] == "vertical"
+    ctl.undo()
+    assert ctl.clip_raw_fx("c") == []
+
+
 def test_inspector_live_editor_round_trips(qapp):
     from PySide6.QtWidgets import QDialog
     from moshit.gui.widgets import InspectorPanel, EffectParamDialog
@@ -572,6 +623,24 @@ def test_app_live_add_flow_commit_and_cancel(win):
     dlg.reject()                                         # Cancel
     assert [e["mode"] for e in ctl.clip_effects("c")] == before[:-1]
     assert not win._live_editing
+
+
+def test_app_live_pixel_add_flow(win):
+    # End-to-end through app.py: pixel add opens a live editor, a tweak applies
+    # live, Ok commits as one undo step.
+    ctl = win.controller
+    _seed_clip(ctl, "c")
+    win._selected_clip = "c"
+    win._on_fx_add_begin("pixel", "rgb_shift")
+    assert win._live_editing and win.inspector._live_dlg is not None
+    assert ctl.clip_pixel_fx("c")[0]["name"] == "rgb_shift"
+    dlg = win.inspector._live_dlg
+    dlg._param_widgets["amount"].setValue(11)
+    assert ctl.clip_pixel_fx("c")[0]["params"]["amount"] == 11
+    dlg.accept()
+    assert not win._live_editing and win.inspector._live_dlg is None
+    ctl.undo()
+    assert ctl.clip_pixel_fx("c") == []
 
 
 def test_inspector_automation_control(win):

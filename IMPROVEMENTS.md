@@ -46,13 +46,14 @@ misc) so commits can reference them. Tick items off as they land.
       benchmark proving the encode is actually the bottleneck (e.g. 20+ clip timeline).
 
 ### Wave 2 — the two biggest user-facing wins
-- [x] U18: **live parameter editing** (mosh effect stack) — the param editor is now a
-  non-modal window that re-renders the preview as you drag (debounced onto the existing
-  auto-refresh; the seg cache means only the edited clip re-renders). Adding an effect
-  opens the live editor on it immediately. A whole drag folds into **one** undo entry
-  (coalesced live-edit session in the controller); Cancel reverts to the pre-edit state,
-  Ok commits. Follow-up: give the **pixel** and **raw** FX panels the same live editor
-  (they still use the modal `_fx_dialog`); the controller session infra generalises.
+- [x] U18: **live parameter editing** — the param editor is now a non-modal window that
+  re-renders the preview as you drag (debounced onto the existing auto-refresh; the seg
+  cache means only the edited clip re-renders). Adding an effect opens the live editor on
+  it immediately. A whole drag folds into **one** undo entry (coalesced live-edit session
+  in the controller); Cancel reverts to the pre-edit state, Ok commits. Covers the **mosh
+  effect stack**, the **pixel FX** and the **raw FX** panels — all three share one generic
+  session core (keyed by op-id for mosh, by clip+index for pixel/raw) and one non-modal
+  editor launcher; the old modal `_fx_dialog` is gone.
 - [~] P4: **composite-path fusion** — **investigated, deferred (not cleanly safe).**
   Prototyped folding the per-clip `finish_chain` (reverse/speed/fades/pixel/fx_mask)
   into the single `composite_video` filter_complex so a composite is one ffmpeg

@@ -1541,12 +1541,16 @@ class InspectorPanel(QWidget):
     presetSaveRequested = Signal()                 # save the current stack
     presetApplyRequested = Signal(str)             # preset name
     presetDeleteRequested = Signal(str)            # preset name
-    pixelFxAddRequested = Signal(str, dict)        # pixel mode name, params
+    pixelFxAddBegin = Signal(str)                  # name -> host appends + opens editor
+    pixelFxEditBegin = Signal(int)                 # index -> open a live edit session
+    pixelFxLiveUpdate = Signal(int, dict)          # index, params
+    pixelFxEditEnd = Signal(int, bool)             # index, committed
     pixelFxRemoveRequested = Signal(int)           # index in the clip's pixel list
-    pixelFxParamsChanged = Signal(int, dict)       # index, params
-    rawFxAddRequested = Signal(str, dict)          # raw (numpy) mode name, params
+    rawFxAddBegin = Signal(str)                    # name -> host appends + opens editor
+    rawFxEditBegin = Signal(int)                   # index -> open a live edit session
+    rawFxLiveUpdate = Signal(int, dict)            # index, params
+    rawFxEditEnd = Signal(int, bool)               # index, committed
     rawFxRemoveRequested = Signal(int)             # index in the clip's raw list
-    rawFxParamsChanged = Signal(int, dict)         # index, params
     maskChanged = Signal(str, object)              # kind ("layer"|"fx"), spec|None
     flowTransferRequested = Signal()               # optical-flow transfer (bake)
     flowChanged = Signal(object)                    # live flow_transfer dict / None
@@ -1832,31 +1836,26 @@ class InspectorPanel(QWidget):
             self.pixel_add_btn.rect().bottomLeft()))
 
     def _add_pixel_fx(self, name: str) -> None:
-        params = self._fx_dialog("pixel", name)
-        if params is not None:
-            self.pixelFxAddRequested.emit(name, params)
+        # The host appends the FX with its defaults, then calls
+        # open_pixel_live_editor() so its params tune with a live preview.
+        self.pixelFxAddBegin.emit(name)
 
     def _edit_pixel_item(self, item: QListWidgetItem) -> None:
-        row = self.pixel_list.row(item)
-        if 0 <= row < len(self._pixel_fx):
-            pe = self._pixel_fx[row]
-            params = self._fx_dialog("pixel", pe.get("name", ""),
-                                     pe.get("params") or {}, verb="Edit")
-            if params is not None:
-                self.pixelFxParamsChanged.emit(row, params)
+        self.open_pixel_live_editor(self.pixel_list.row(item))
+
+    def open_pixel_live_editor(self, index: int) -> None:
+        if not (0 <= index < len(self._pixel_fx)):
+            return
+        pe = self._pixel_fx[index]
+        self._launch_live_editor(
+            "pixel", pe.get("name", ""), pe.get("params") or {}, None,
+            on_begin=lambda: self.pixelFxEditBegin.emit(index),
+            on_update=lambda p, _r: self.pixelFxLiveUpdate.emit(index, p),
+            on_end=lambda ok: self.pixelFxEditEnd.emit(index, ok))
 
     def _emit_pixel_remove(self) -> None:
         if 0 <= self._pixel_sel < len(self._pixel_fx):
             self.pixelFxRemoveRequested.emit(self._pixel_sel)
-
-    def _fx_dialog(self, kind: str, name: str, params: Optional[dict] = None,
-                   *, verb: str = "Add") -> Optional[dict]:
-        """Open the shared param pop-up for a pixel/raw effect; return the chosen
-        params on accept, else None. Used by both Add and double-click Edit."""
-        dlg = EffectParamDialog(self, kind=kind, mode_name=name, params=params,
-                                verb=verb, beat_provider=self._beat_provider,
-                                clip_id=self._clip_id)
-        return dlg.result_params() if dlg.exec() else None
 
     # -- raw FX (numpy frame processors: pixel sort, ...) ------------------- #
 
@@ -1925,18 +1924,20 @@ class InspectorPanel(QWidget):
             self.raw_add_btn.rect().bottomLeft()))
 
     def _add_raw_fx(self, name: str) -> None:
-        params = self._fx_dialog("raw", name)
-        if params is not None:
-            self.rawFxAddRequested.emit(name, params)
+        self.rawFxAddBegin.emit(name)
 
     def _edit_raw_item(self, item: QListWidgetItem) -> None:
-        row = self.raw_list.row(item)
-        if 0 <= row < len(self._raw_fx):
-            re = self._raw_fx[row]
-            params = self._fx_dialog("raw", re.get("name", ""),
-                                     re.get("params") or {}, verb="Edit")
-            if params is not None:
-                self.rawFxParamsChanged.emit(row, params)
+        self.open_raw_live_editor(self.raw_list.row(item))
+
+    def open_raw_live_editor(self, index: int) -> None:
+        if not (0 <= index < len(self._raw_fx)):
+            return
+        re = self._raw_fx[index]
+        self._launch_live_editor(
+            "raw", re.get("name", ""), re.get("params") or {}, None,
+            on_begin=lambda: self.rawFxEditBegin.emit(index),
+            on_update=lambda p, _r: self.rawFxLiveUpdate.emit(index, p),
+            on_end=lambda ok: self.rawFxEditEnd.emit(index, ok))
 
     def _emit_raw_remove(self) -> None:
         if 0 <= self._raw_sel < len(self._raw_fx):
@@ -2276,33 +2277,42 @@ class InspectorPanel(QWidget):
     def _edit_effect_item(self, item: QListWidgetItem) -> None:
         self.open_live_editor(item.data(Qt.ItemDataRole.UserRole))
 
-    def open_live_editor(self, op_id: str) -> None:
-        """Open the non-modal live parameter editor for an effect in the stack.
-        Called on double-click and just after a live add."""
-        e = next((x for x in self._effects if x["id"] == op_id), None)
-        if e is None:
-            return
-        if self._live_dlg is not None:                 # only one editor at a time;
-            self._live_dlg.accept()                    # commit the one it replaces
+    def _launch_live_editor(self, kind: str, name: str, params, region, *,
+                            on_begin, on_update, on_end) -> None:
+        """Open a non-modal live parameter editor for any effect *kind* and wire
+        its begin/live-update/finished signals through the supplied callbacks.
+        Only one editor is open at a time; a new one commits the last."""
+        if self._live_dlg is not None:                 # commit the one it replaces
+            self._live_dlg.accept()
         dlg = EffectParamDialog(
-            self, kind="mosh", mode_name=e["mode"], params=e.get("params") or {},
-            region=e.get("region"), motion_labels=self._motion_labels,
-            beat_provider=self._beat_provider, clip_id=self._clip_id,
-            verb="Edit", live=True)
+            self, kind=kind, mode_name=name, params=params or {}, region=region,
+            motion_labels=self._motion_labels, beat_provider=self._beat_provider,
+            clip_id=self._clip_id, verb="Edit", live=True)
         self._live_dlg = dlg
-        mode = e["mode"]
-        self.effectEditBegin.emit(op_id)
-        dlg.paramsEdited.connect(
-            lambda params, region: self.effectLiveUpdate.emit(
-                op_id, mode, params, region))
-        dlg.finished.connect(lambda code: self._on_live_editor_done(op_id, code))
+        on_begin()
+        dlg.paramsEdited.connect(lambda p, r: on_update(p, r))
+
+        def _done(code, _dlg=dlg):
+            if self._live_dlg is _dlg:
+                self._live_dlg = None
+            on_end(code == QDialog.DialogCode.Accepted)
+        dlg.finished.connect(_done)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dlg.show()
         dlg.raise_()
 
-    def _on_live_editor_done(self, op_id: str, code: int) -> None:
-        self._live_dlg = None
-        self.effectEditEnd.emit(op_id, code == QDialog.DialogCode.Accepted)
+    def open_live_editor(self, op_id: str) -> None:
+        """Open the non-modal live parameter editor for a mosh effect in the
+        stack. Called on double-click and just after a live add."""
+        e = next((x for x in self._effects if x["id"] == op_id), None)
+        if e is None:
+            return
+        mode = e["mode"]
+        self._launch_live_editor(
+            "mosh", mode, e.get("params") or {}, e.get("region"),
+            on_begin=lambda: self.effectEditBegin.emit(op_id),
+            on_update=lambda p, r: self.effectLiveUpdate.emit(op_id, mode, p, r),
+            on_end=lambda ok: self.effectEditEnd.emit(op_id, ok))
 
     def _on_effect_item_changed(self, item: QListWidgetItem) -> None:
         if self._populating:

@@ -491,12 +491,24 @@ class MainWindow(QMainWindow):
         self.inspector.presetSaveRequested.connect(self._on_preset_save)
         self.inspector.presetApplyRequested.connect(self._on_preset_apply)
         self.inspector.presetDeleteRequested.connect(self._on_preset_delete)
-        self.inspector.pixelFxAddRequested.connect(self._on_pixel_add)
+        self.inspector.pixelFxAddBegin.connect(
+            lambda name: self._on_fx_add_begin("pixel", name))
+        self.inspector.pixelFxEditBegin.connect(
+            lambda i: self._on_fx_edit_begin("pixel", i))
+        self.inspector.pixelFxLiveUpdate.connect(
+            lambda i, p: self._on_fx_live_update("pixel", i, p))
+        self.inspector.pixelFxEditEnd.connect(
+            lambda i, ok: self._on_fx_edit_end("pixel", i, ok))
         self.inspector.pixelFxRemoveRequested.connect(self._on_pixel_remove)
-        self.inspector.pixelFxParamsChanged.connect(self._on_pixel_params)
-        self.inspector.rawFxAddRequested.connect(self._on_raw_add)
+        self.inspector.rawFxAddBegin.connect(
+            lambda name: self._on_fx_add_begin("raw", name))
+        self.inspector.rawFxEditBegin.connect(
+            lambda i: self._on_fx_edit_begin("raw", i))
+        self.inspector.rawFxLiveUpdate.connect(
+            lambda i, p: self._on_fx_live_update("raw", i, p))
+        self.inspector.rawFxEditEnd.connect(
+            lambda i, ok: self._on_fx_edit_end("raw", i, ok))
         self.inspector.rawFxRemoveRequested.connect(self._on_raw_remove)
-        self.inspector.rawFxParamsChanged.connect(self._on_raw_params)
         self.inspector.maskChanged.connect(self._on_mask_changed)
         self.inspector.bakeRequested.connect(self._on_bake)
         self.inspector.revertRequested.connect(lambda: c.revert_last_bake())
@@ -618,34 +630,47 @@ class MainWindow(QMainWindow):
         self.controller.delete_preset(name)
         self.inspector.set_presets(self.controller.preset_names())
 
-    def _on_pixel_add(self, name: str, params: dict) -> None:
+    # -- live pixel / raw FX editing (mirrors the mosh live flow) ------------ #
+
+    def _on_fx_add_begin(self, kind: str, name: str) -> None:
+        if not self._selected_clip:
+            return
+        index = self.controller.begin_fx_add(kind, self._selected_clip, name)
+        if index is None:
+            return
+        self._live_editing = True
+        opener = (self.inspector.open_pixel_live_editor if kind == "pixel"
+                  else self.inspector.open_raw_live_editor)
+        opener(index)
+        self._schedule_auto_refresh()
+
+    def _on_fx_edit_begin(self, kind: str, index: int) -> None:
+        if not self._selected_clip:
+            return
+        self._live_editing = True
+        self.controller.begin_fx_edit(kind, self._selected_clip, index)
+
+    def _on_fx_live_update(self, kind: str, index: int, params: dict) -> None:
         if self._selected_clip:
-            self.controller.add_pixel_fx(self._selected_clip, name, params)
-            self._schedule_auto_refresh(immediate=True)
+            self.controller.live_update_fx(kind, self._selected_clip, index, params)
+            self._schedule_auto_refresh()
+
+    def _on_fx_edit_end(self, kind: str, index: int, committed: bool) -> None:
+        self._live_editing = False
+        if self._selected_clip:
+            self.controller.end_fx_edit(kind, self._selected_clip, index,
+                                        commit=committed)
+            self._on_clip_selected(self._selected_clip)
+        self._schedule_auto_refresh(immediate=True)
 
     def _on_pixel_remove(self, index: int) -> None:
         if self._selected_clip:
             self.controller.remove_pixel_fx(self._selected_clip, index)
             self._schedule_auto_refresh(immediate=True)
 
-    def _on_pixel_params(self, index: int, params: dict) -> None:
-        if self._selected_clip:
-            self.controller.update_pixel_fx(self._selected_clip, index, params)
-            self._schedule_auto_refresh(immediate=True)
-
-    def _on_raw_add(self, name: str, params: dict) -> None:
-        if self._selected_clip:
-            self.controller.add_raw_fx(self._selected_clip, name, params)
-            self._schedule_auto_refresh(immediate=True)
-
     def _on_raw_remove(self, index: int) -> None:
         if self._selected_clip:
             self.controller.remove_raw_fx(self._selected_clip, index)
-            self._schedule_auto_refresh(immediate=True)
-
-    def _on_raw_params(self, index: int, params: dict) -> None:
-        if self._selected_clip:
-            self.controller.update_raw_fx(self._selected_clip, index, params)
             self._schedule_auto_refresh(immediate=True)
 
     def _on_mask_changed(self, kind: str, spec) -> None:

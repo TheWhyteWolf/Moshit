@@ -789,68 +789,28 @@ class AppController(QObject):
     # pre-edit snapshot aside and commits exactly one undo entry the first time a
     # value actually changes (or, for an add, when the session commits). Cancel
     # rolls back to the snapshot and drops that entry, so an abandoned edit
-    # leaves no trace.
+    # leaves no trace. One generic core serves the mosh stack, the pixel FX and
+    # the raw FX; each identifies its session by a ``key`` tuple.
 
-    def begin_effect_add(self, clip_id: str, mode: str, params: dict = None,
-                         region=None):
-        """Create an effect with its defaults inside a live session, then return
-        it so the caller can open the live editor bound to it. The add is not
-        undoable on its own until the session ends (or a value is changed)."""
-        pre = self._snapshot()
-        op = self.project.add_mosh(mode, params or {}, clip_id)
-        op.region_start, op.region_end = self._region_tuple(region)
-        self._live = {"op_id": op.id, "pre": pre, "created": True,
-                      "committed": False}
-        self.project_changed.emit()
-        return op
-
-    def begin_effect_edit(self, op_id: str) -> None:
-        """Open a live session over an existing effect, snapshotting its state.
-
-        A no-op if a session for this op is already open -- the live add flow
-        opens the editor (which signals begin) over the session begin_effect_add
-        just created, and that add session's pre-add snapshot must survive."""
-        if self._live and self._live.get("op_id") == op_id:
+    def _begin_live(self, key, *, created: bool, pre=None) -> None:
+        """Open a live session identified by *key*. A no-op if one for the same
+        key is already open -- the live add flow opens the editor (which signals
+        begin) over the session the add just created, whose pre-snapshot must
+        survive. *pre* lets an add pass the snapshot it took before creating."""
+        if self._live and self._live.get("key") == key:
             return
-        try:
-            op = self.project.op(op_id)
-        except KeyError:
-            self._live = None
-            return
-        self._live = {"op_id": op_id, "pre": self._snapshot(), "created": False,
-                      "committed": False,
-                      "orig": (op.mode, dict(op.params),
-                               (op.region_start, op.region_end))}
+        self._live = {"key": key, "pre": pre if pre is not None else self._snapshot(),
+                      "created": created, "committed": False}
 
-    def live_update_effect(self, op_id: str, mode: str, params: dict,
-                           region=None):
-        """Apply a value during a live session. The first real change commits the
-        session's single undo entry; later changes mutate in place."""
-        live = self._live
-        if not live or live["op_id"] != op_id:     # no session: fall back to atomic
-            return self.update_effect(op_id, mode, params, region)
-        try:
-            op = self.project.op(op_id)
-        except KeyError:
-            return None
-        new_region = self._region_tuple(region)
-        if (op.mode == mode and op.params == params
-                and (op.region_start, op.region_end) == new_region):
-            return op                              # nothing changed
-        if not live["committed"]:
-            self._commit_undo(live["pre"])         # one entry for the whole session
-            live["committed"] = True
-        op.mode = mode
-        op.params = dict(params)
-        op.region_start, op.region_end = new_region
-        self.project_changed.emit()
-        return op
+    def _live_commit_point(self) -> None:
+        """Record the session's single undo entry on the first real change."""
+        if self._live and not self._live["committed"]:
+            self._commit_undo(self._live["pre"])
+            self._live["committed"] = True
 
-    def end_effect_edit(self, op_id: str, *, commit: bool = True) -> None:
-        """Close a live session. ``commit`` keeps the edit (recording the bare
-        add if nothing was tweaked); otherwise revert to the pre-edit snapshot."""
+    def _end_live(self, key, *, commit: bool) -> None:
         live = self._live
-        if not live or live["op_id"] != op_id:
+        if not live or live["key"] != key:
             self._live = None
             return
         self._live = None
@@ -863,6 +823,108 @@ class AppController(QObject):
             self._undo.pop()
         self._restore(live["pre"])
         self.project_changed.emit()
+
+    # -- mosh effect stack -------------------------------------------------- #
+
+    def begin_effect_add(self, clip_id: str, mode: str, params: dict = None,
+                         region=None):
+        """Create an effect with its defaults inside a live session, then return
+        it so the caller can open the live editor bound to it. The add is not
+        undoable on its own until the session ends (or a value is changed)."""
+        pre = self._snapshot()
+        op = self.project.add_mosh(mode, params or {}, clip_id)
+        op.region_start, op.region_end = self._region_tuple(region)
+        self._begin_live(("mosh", op.id), created=True, pre=pre)
+        self.project_changed.emit()
+        return op
+
+    def begin_effect_edit(self, op_id: str) -> None:
+        """Open a live session over an existing effect, snapshotting its state."""
+        try:
+            self.project.op(op_id)
+        except KeyError:
+            return
+        self._begin_live(("mosh", op_id), created=False)
+
+    def live_update_effect(self, op_id: str, mode: str, params: dict,
+                           region=None):
+        """Apply a value during a live session. The first real change commits the
+        session's single undo entry; later changes mutate in place."""
+        live = self._live
+        if not live or live["key"] != ("mosh", op_id):   # no session: atomic
+            return self.update_effect(op_id, mode, params, region)
+        try:
+            op = self.project.op(op_id)
+        except KeyError:
+            return None
+        new_region = self._region_tuple(region)
+        if (op.mode == mode and op.params == params
+                and (op.region_start, op.region_end) == new_region):
+            return op                              # nothing changed
+        self._live_commit_point()
+        op.mode = mode
+        op.params = dict(params)
+        op.region_start, op.region_end = new_region
+        self.project_changed.emit()
+        return op
+
+    def end_effect_edit(self, op_id: str, *, commit: bool = True) -> None:
+        """Close a live session. ``commit`` keeps the edit (recording the bare
+        add if nothing was tweaked); otherwise revert to the pre-edit snapshot."""
+        self._end_live(("mosh", op_id), commit=commit)
+
+    # -- pixel / raw FX (positional, keyed by clip + index) ----------------- #
+
+    def _fx_list(self, kind: str, clip_id: str):
+        c = self.project.clip(clip_id)             # may raise KeyError
+        return c.pixel_effects if kind == "pixel" else c.raw_effects
+
+    def begin_fx_add(self, kind: str, clip_id: str, name: str):
+        """Append a pixel/raw FX with its defaults inside a live session; returns
+        its index so the caller can open the live editor on it."""
+        from ..modes import get_pixel_mode, get_raw_mode
+        pre = self._snapshot()
+        try:
+            fx = self._fx_list(kind, clip_id)
+            mode = (get_pixel_mode if kind == "pixel" else get_raw_mode)(name)
+        except KeyError:
+            return None
+        fx.append({"name": name, "params": mode.defaults()})
+        index = len(fx) - 1
+        self._begin_live((kind, clip_id, index), created=True, pre=pre)
+        self.project_changed.emit()
+        self.status.emit(f"Added {kind} FX: {name}")
+        return index
+
+    def begin_fx_edit(self, kind: str, clip_id: str, index: int) -> None:
+        try:
+            fx = self._fx_list(kind, clip_id)
+        except KeyError:
+            return
+        if 0 <= index < len(fx):
+            self._begin_live((kind, clip_id, index), created=False)
+
+    def live_update_fx(self, kind: str, clip_id: str, index: int, params: dict):
+        """Apply a pixel/raw FX value during a live session (atomic fallback if no
+        session is open, mirroring live_update_effect)."""
+        key = (kind, clip_id, index)
+        live = self._live
+        if not live or live["key"] != key:
+            return (self.update_pixel_fx if kind == "pixel"
+                    else self.update_raw_fx)(clip_id, index, params)
+        try:
+            fx = self._fx_list(kind, clip_id)
+        except KeyError:
+            return
+        if not (0 <= index < len(fx)) or fx[index].get("params") == params:
+            return
+        self._live_commit_point()
+        fx[index]["params"] = dict(params)
+        self.project_changed.emit()
+
+    def end_fx_edit(self, kind: str, clip_id: str, index: int, *,
+                    commit: bool = True) -> None:
+        self._end_live((kind, clip_id, index), commit=commit)
 
     def remove_effect(self, op_id: str) -> None:
         self._push_undo()
