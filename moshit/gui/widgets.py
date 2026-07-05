@@ -13,8 +13,8 @@ from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMenu, QMessageBox, QPushButton, QSizePolicy, QSlider, QSpinBox, QVBoxLayout,
-    QWidget,
+    QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 try:
@@ -693,6 +693,10 @@ class TimelineWidget(QWidget):
     trackEnabledToggled = Signal(str, bool)        # track_id, enabled
     addClipToTrackRequested = Signal(str)          # track_id (uses library selection)
     enterSequenceRequested = Signal(str)           # seq_id (double-clicked a precomp)
+    zoomStepRequested = Signal(float, int)         # wheel steps, anchor x (widget px)
+    zoomFitRequested = Signal()
+    panRequested = Signal(int, int)                # dx, dy in px
+    playheadMoved = Signal(int)                    # playhead x (widget px)
 
     RULER_H = 20
     WAVE_H = 22                                     # audio waveform strip
@@ -738,6 +742,8 @@ class TimelineWidget(QWidget):
 
     def set_play_fraction(self, frac: float) -> None:
         self._play_frac = max(0.0, min(1.0, float(frac)))
+        x0, x1 = self._track_x()
+        self.playheadMoved.emit(int(x0 + self._play_frac * max(1, x1 - x0)))
         self.update()
 
     def set_waveform(self, peaks) -> None:
@@ -809,6 +815,23 @@ class TimelineWidget(QWidget):
         x0, x1 = self._track_x()
         return max(1, x1 - x0) / max(1, self._total)
 
+    def _tick_step(self, ppf: float) -> int:
+        """Smallest 1/2/5×10^k frame step that keeps ruler labels ~70px apart,
+        so tick density stays sane at any zoom level."""
+        target = 70.0 / max(ppf, 1e-9)
+        k = 1
+        while True:
+            for m in (1, 2, 5):
+                if m * k >= target:
+                    return m * k
+            k *= 10
+
+    def _visible(self) -> QRect:
+        """Visible portion of the widget (the whole rect when unscrolled or
+        rendered off-screen) — lets paint skip off-screen work when zoomed."""
+        vis = self.visibleRegion().boundingRect()
+        return self.rect() if vis.isEmpty() else vis
+
     def _lane_y(self, lane: int) -> int:
         return (self.RULER_H + self.WAVE_H + self.PAD
                 + lane * (self.LANE_H + self.PAD))
@@ -823,17 +846,21 @@ class TimelineWidget(QWidget):
         x0, x1 = self._track_x()
         track_w = max(1, x1 - x0)
         ppf = self._ppf()
+        vis = self._visible()
 
         font = QFont()
         font.setPointSize(8)
         p.setFont(font)
 
-        # ruler ticks + labels, with a scrub track underneath
+        # ruler ticks + labels, with a scrub track underneath (only the
+        # visible span — when zoomed the widget is far wider than the view)
         p.setPen(QColor("#4a5160"))
-        step = max(1, self._total // 10)
-        f = 0
+        step = self._tick_step(ppf)
+        f = max(0, int((vis.left() - x0) / ppf / step)) * step
         while f <= self._total:
             tx = int(x0 + f * ppf)
+            if tx > vis.right():
+                break
             p.drawLine(tx, 2, tx, 6)
             p.drawText(tx + 2, 12, str(f))
             f += step
@@ -841,7 +868,7 @@ class TimelineWidget(QWidget):
         p.drawLine(x0, self.RULER_H - 2, x1, self.RULER_H - 2)
 
         # audio waveform strip (spans the full rendered timeline)
-        self._draw_waveform(p, x0, track_w)
+        self._draw_waveform(p, x0, track_w, vis)
 
         # lanes (video tracks top-to-bottom, motion at the bottom)
         bands = []
@@ -850,11 +877,6 @@ class TimelineWidget(QWidget):
             on = getattr(t, "enabled", True)
             p.fillRect(QRect(x0, y, track_w, self.LANE_H),
                        QColor("#262b33") if on else QColor("#202329"))
-            p.setPen(QColor("#8a92a6") if on else QColor("#565d6b"))
-            name = t.name if len(t.name) <= 8 else t.name[:7] + "…"
-            p.drawText(self.PAD, y + 18, name)
-            if not on:
-                p.drawText(self.PAD, y + 32, "(off)")
             if t.role == "video":
                 for clip, start, length, trans in self._project.track_layout(t.id):
                     rect = QRect(int(x0 + start * ppf), y,
@@ -875,6 +897,22 @@ class TimelineWidget(QWidget):
                     cursor += length
         for band in bands:                            # overlay after all clips
             self._draw_xfade_band(p, band)
+
+        # lane labels — stick to the visible left edge when scrolled, drawn
+        # over the clips on a translucent chip so they stay readable
+        scrolled = vis.left() > 0
+        lx = self.PAD + max(0, vis.left())
+        for lane, t in enumerate(self._lanes()):
+            y = self._lane_y(lane)
+            on = getattr(t, "enabled", True)
+            if scrolled:
+                p.fillRect(QRect(lx - 4, y, self.LABEL_W, self.LANE_H),
+                           QColor(28, 31, 36, 215))
+            p.setPen(QColor("#8a92a6") if on else QColor("#565d6b"))
+            name = t.name if len(t.name) <= 8 else t.name[:7] + "…"
+            p.drawText(lx, y + 18, name)
+            if not on:
+                p.drawText(lx, y + 32, "(off)")
 
         # drag feedback
         if self._drag:
@@ -927,7 +965,7 @@ class TimelineWidget(QWidget):
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    f"{label}  {length}f{suffix}")
 
-    def _draw_waveform(self, p, x0, track_w) -> None:
+    def _draw_waveform(self, p, x0, track_w, vis) -> None:
         top = self.RULER_H + 2
         h = self.WAVE_H - 3
         p.fillRect(QRect(x0, top, track_w, h), QColor("#171a1f"))
@@ -937,14 +975,18 @@ class TimelineWidget(QWidget):
         mid = top + h / 2.0
         amp = h / 2.0 - 1
         n = len(peaks)
+        # only paint the visible columns — when zoomed, track_w can be tens
+        # of thousands of pixels wide
+        c0 = max(0, vis.left() - x0)
+        c1 = min(track_w, vis.right() - x0 + 1)
         p.setPen(QColor("#3aa6a0"))
-        for col in range(track_w):
+        for col in range(c0, c1):
             v = peaks[min(n - 1, col * n // track_w)]
             ph = v * amp
             x = x0 + col
             p.drawLine(x, int(mid - ph), x, int(mid + ph))
         p.setPen(QColor("#2a3038"))                   # centre baseline
-        p.drawLine(x0, int(mid), x0 + track_w, int(mid))
+        p.drawLine(x0 + c0, int(mid), x0 + c1, int(mid))
 
     def _draw_xfade_band(self, p, rect) -> None:
         """Shade the crossfade overlap region with a hatched translucent band."""
@@ -1110,6 +1152,20 @@ class TimelineWidget(QWidget):
         else:
             super().keyPressEvent(event)
 
+    def wheelEvent(self, event) -> None:
+        """Ctrl+wheel zooms around the cursor; plain wheel pans horizontally
+        (the timeline's primary axis); Shift+wheel pans vertically."""
+        delta = event.angleDelta()
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            steps = (delta.y() or delta.x()) / 120.0
+            if steps:
+                self.zoomStepRequested.emit(steps, int(event.position().x()))
+        elif event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self.panRequested.emit(0, -(delta.y() or delta.x()))
+        else:
+            self.panRequested.emit(-(delta.x() or delta.y()), 0)
+        event.accept()
+
     def contextMenuEvent(self, event) -> None:
         from PySide6.QtWidgets import QMenu
         hit = self._hit(event.pos())
@@ -1160,6 +1216,103 @@ class TimelineWidget(QWidget):
             self.trackEnabledToggled.emit(t.id, not t.enabled)
         elif chosen == act_rm:
             self.removeTrackRequested.emit(t.id)
+
+
+class TimelinePane(QScrollArea):
+    """Zoomable, scrollable host for the :class:`TimelineWidget`.
+
+    Zoom stretches the timeline widget horizontally (1× = fit to width, the
+    historical behaviour) and the scroll area supplies the scrollbars, so all
+    of the timeline's coordinate math keeps working unchanged. Ctrl+wheel
+    zooms around the cursor, plain wheel pans horizontally, Shift+wheel pans
+    vertically (useful once tracks overflow the pane).
+    """
+
+    MAX_ZOOM = 64.0
+    zoomChanged = Signal(float)
+
+    def __init__(self, timeline: TimelineWidget):
+        super().__init__()
+        self._timeline = timeline
+        self._zoom = 1.0
+        self.setWidget(timeline)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        timeline.zoomStepRequested.connect(self._on_zoom_step)
+        timeline.zoomFitRequested.connect(self.zoom_fit)
+        timeline.panRequested.connect(self._on_pan)
+        timeline.playheadMoved.connect(self._follow_playhead)
+
+    # -- zoom --------------------------------------------------------------- #
+
+    def zoom(self) -> float:
+        return self._zoom
+
+    def set_zoom(self, zoom: float, anchor_x: Optional[int] = None) -> None:
+        """Set the zoom factor, keeping ``anchor_x`` (timeline-widget px)
+        fixed on screen; defaults to the centre of the viewport."""
+        zoom = max(1.0, min(self.MAX_ZOOM, float(zoom)))
+        if abs(zoom - self._zoom) < 1e-9:
+            return
+        hbar = self.horizontalScrollBar()
+        if anchor_x is None:
+            anchor_x = hbar.value() + self.viewport().width() // 2
+        view_x = anchor_x - hbar.value()          # viewport column to keep fixed
+        t = self._timeline
+        x0 = t.PAD + t.LABEL_W                    # frame x scales with the track
+        old_track = max(1, t.width() - x0 - t.PAD)          # area, not the widget
+        self._zoom = zoom
+        new_w = self._apply_zoom_width()
+        scale = max(1, new_w - x0 - t.PAD) / old_track
+        hbar.setValue(int(round(x0 + (anchor_x - x0) * scale - view_x)))
+        self.zoomChanged.emit(zoom)
+
+    def zoom_in(self) -> None:
+        self.set_zoom(self._zoom * 1.5)
+
+    def zoom_out(self) -> None:
+        self.set_zoom(self._zoom / 1.5)
+
+    def zoom_fit(self) -> None:
+        self.set_zoom(1.0)
+        self.horizontalScrollBar().setValue(0)
+
+    def _apply_zoom_width(self) -> int:
+        """Sync the timeline widget's width to viewport × zoom."""
+        vw = max(1, self.viewport().width())
+        w = max(vw, int(round(vw * self._zoom)))
+        t = self._timeline
+        t.setMinimumWidth(w if self._zoom > 1.0 else 0)
+        t.resize(w, max(t.height(), t.minimumHeight()))
+        # the scroll range only refreshes on the next layout pass; set it now
+        # so an immediate setValue() isn't clamped against the stale range
+        self.horizontalScrollBar().setRange(0, max(0, w - vw))
+        return w
+
+    def resizeEvent(self, event) -> None:          # noqa: N802 (Qt signature)
+        super().resizeEvent(event)
+        self._apply_zoom_width()
+
+    # -- scrolling ---------------------------------------------------------- #
+
+    def _on_zoom_step(self, steps: float, anchor_x: int) -> None:
+        self.set_zoom(self._zoom * (1.25 ** steps), anchor_x)
+
+    def _on_pan(self, dx: int, dy: int) -> None:
+        if dx:
+            h = self.horizontalScrollBar()
+            h.setValue(h.value() + dx)
+        if dy:
+            v = self.verticalScrollBar()
+            v.setValue(v.value() + dy)
+
+    def _follow_playhead(self, px: int) -> None:
+        """Page the view when playback carries the playhead off-screen, so it
+        re-enters near the left edge (no continuous chase-scrolling)."""
+        hbar = self.horizontalScrollBar()
+        vw = self.viewport().width()
+        if hbar.maximum() > 0 and (px < hbar.value() or px > hbar.value() + vw):
+            hbar.setValue(max(0, min(hbar.maximum(), px - vw // 6)))
 
 
 # --------------------------------------------------------------------------- #

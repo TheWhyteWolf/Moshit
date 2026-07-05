@@ -75,7 +75,12 @@ misc) so commits can reference them. Tick items off as they land.
   non-normal-blend layers. Harness: `scratchpad/p4_equiv.py` (FEAT/SIMPLE toggles).
 
 ### Wave 3 — editing & safety fundamentals
-- [ ] U10: timeline zoom + horizontal scroll (fit-to-width `_ppf` is a hard NLE gap).
+- [x] U10: timeline zoom + horizontal scroll — `TimelinePane(QScrollArea)` hosts the
+  timeline; zoom stretches the widget width so all coordinate math is untouched.
+  Ctrl+wheel zooms at the cursor, wheel pans, Shift+wheel scrolls vertically;
+  `=`/`-`/`0` shortcuts + tool-strip buttons; ruler ticks use 1/2/5×10^k steps;
+  waveform/ruler paint is visible-region-bounded; lane labels stick to the view
+  edge; playback pages the view when the playhead exits it.
 - [ ] U24: quick-save in place + Save As; project name in window title.
 - [ ] U23/U34: recent projects, QSettings for window/splitter state, last-directory memory.
 - [ ] U25: missing-media detection on open, offline badge, relink dialog.

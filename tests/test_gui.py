@@ -167,6 +167,120 @@ def test_timeline_crossfade_overlap_layout(qapp):
     assert tl._main_length() == 32                       # 20 + 20 - 8 (matches render)
 
 
+def _timeline_in_pane(qapp, nb_frames=40):
+    """A TimelineWidget with one clip, hosted in a shown TimelinePane."""
+    from moshit.gui.widgets import TimelineWidget, TimelinePane
+    from moshit.project import Project, Clip, MediaItem
+    proj = Project()
+    proj.media["m"] = MediaItem(id="m", source_path="x", label="m", role="main",
+                                intermediate_path="x", nb_frames=nb_frames)
+    proj.clips.append(Clip(id="a", media_id="m", track="main"))
+    tl = TimelineWidget()
+    tl.set_project(proj)
+    pane = TimelinePane(tl)
+    pane.resize(800, 240)
+    pane.show()
+    qapp.processEvents()
+    return tl, pane
+
+
+def test_timeline_pane_zoom_scroll_and_fit(qapp):
+    from PySide6.QtGui import QPixmap
+    tl, pane = _timeline_in_pane(qapp)
+    ppf0 = tl._ppf()
+    assert pane.zoom() == 1.0
+    assert pane.horizontalScrollBar().maximum() == 0    # fit = nothing to scroll
+
+    pane.set_zoom(4.0)
+    qapp.processEvents()
+    assert pane.zoom() == 4.0
+    assert tl.width() >= pane.viewport().width() * 4 - 2
+    assert tl._ppf() > 3 * ppf0            # gutter is fixed px, so not exactly 4x
+    assert pane.horizontalScrollBar().maximum() > 0
+
+    # zoomed + scrolled paint (visible-bounded ruler/waveform/sticky labels)
+    tl.set_waveform([0.5] * 64)
+    hbar = pane.horizontalScrollBar()
+    hbar.setValue(hbar.maximum() // 2)
+    tl.render(QPixmap(tl.size()))
+
+    pane.set_zoom(0.25)                                 # clamped at both ends
+    assert pane.zoom() == 1.0
+    pane.set_zoom(10_000)
+    assert pane.zoom() == pane.MAX_ZOOM
+
+    pane.zoom_fit()
+    qapp.processEvents()
+    assert pane.zoom() == 1.0
+    assert pane.horizontalScrollBar().value() == 0
+    pane.hide()
+
+
+def test_timeline_pane_zoom_anchor_keeps_frame(qapp):
+    tl, pane = _timeline_in_pane(qapp)
+    pane.set_zoom(2.0)
+    qapp.processEvents()
+    hbar = pane.horizontalScrollBar()
+    x0 = tl.PAD + tl.LABEL_W
+    anchor = hbar.value() + 300            # timeline x under viewport column 300
+    f_before = (anchor - x0) / tl._ppf()
+    pane.set_zoom(8.0, anchor_x=anchor)
+    qapp.processEvents()
+    f_after = (hbar.value() + 300 - x0) / tl._ppf()
+    assert abs(f_before - f_after) <= 1.5  # same frame stays under the cursor
+    pane.hide()
+
+
+def test_timeline_wheel_zooms_and_pans(qapp):
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+
+    def wheel(widget, mods, dy):
+        ev = QWheelEvent(QPointF(400, 30), QPointF(400, 30), QPoint(0, 0),
+                         QPoint(0, dy), Qt.MouseButton.NoButton, mods,
+                         Qt.ScrollPhase.NoScrollPhase, False)
+        widget.wheelEvent(ev)
+
+    tl, pane = _timeline_in_pane(qapp)
+    wheel(tl, Qt.KeyboardModifier.ControlModifier, 120)   # ctrl+wheel = zoom in
+    assert pane.zoom() == pytest.approx(1.25)
+    wheel(tl, Qt.KeyboardModifier.ControlModifier, 120)
+    qapp.processEvents()
+    hbar = pane.horizontalScrollBar()
+    assert hbar.maximum() > 0
+    v0 = hbar.value()
+    wheel(tl, Qt.KeyboardModifier.NoModifier, -120)       # plain wheel = pan right
+    assert hbar.value() > v0 or v0 == hbar.maximum()
+    wheel(tl, Qt.KeyboardModifier.ControlModifier, -120)  # ctrl+wheel down = out
+    assert pane.zoom() == pytest.approx(1.25)
+    pane.hide()
+
+
+def test_timeline_pane_pages_to_follow_playhead(qapp):
+    tl, pane = _timeline_in_pane(qapp)
+    pane.set_zoom(8.0)
+    qapp.processEvents()
+    hbar = pane.horizontalScrollBar()
+    hbar.setValue(0)
+    tl.set_play_fraction(0.9)              # playback carries playhead off-screen
+    assert hbar.value() > 0
+    v = hbar.value()
+    tl.set_play_fraction(0.9)              # still visible: no chase-scrolling
+    assert hbar.value() == v
+    pane.hide()
+
+
+def test_mainwindow_timeline_zoom_controls(win, qapp):
+    win.resize(1100, 700)
+    qapp.processEvents()
+    win.timeline_pane.zoom_in()
+    assert win.timeline_pane.zoom() == pytest.approx(1.5)
+    assert win.zoom_label.text() == "1.5×"
+    win.timeline_pane.zoom_fit()
+    assert win.timeline_pane.zoom() == 1.0
+    assert win.zoom_label.text() == "1.0×"
+
+
 def test_effect_stack_region_and_pixel_fx(win):
     ctl = win.controller
     _seed_clip(ctl, "c")

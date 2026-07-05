@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
 
 from ..engine import EngineConfig, _ext_for_profile
 from .controller import AppController
-from .widgets import InspectorPanel, MediaLibrary, PreviewWidget, TimelineWidget
+from .widgets import (InspectorPanel, MediaLibrary, PreviewWidget, TimelinePane,
+                      TimelineWidget)
 
 _VIDEO_FILTER = "Video (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.gif);;All files (*)"
 
@@ -213,6 +214,7 @@ class MainWindow(QMainWindow):
         self.preview = PreviewWidget()
         self.inspector = InspectorPanel()
         self.timeline = TimelineWidget()
+        self.timeline_pane = TimelinePane(self.timeline)
 
         # The inspector scrolls inside its pane, so its (tall) content can never
         # force the whole window to grow vertically when a clip is selected.
@@ -237,7 +239,7 @@ class MainWindow(QMainWindow):
         bv.setContentsMargins(0, 0, 0, 0)
         bv.setSpacing(4)
         bv.addWidget(self._build_sequence_bar())
-        bv.addWidget(self.timeline, 1)
+        bv.addWidget(self.timeline_pane, 1)
         bv.addWidget(self._build_tool_strip())
 
         split = QSplitter(Qt.Orientation.Vertical)
@@ -427,6 +429,26 @@ class MainWindow(QMainWindow):
             b.setMaximumWidth(90)
             h.addWidget(b)
         h.addStretch(1)
+
+        # zoom controls (mirror Ctrl+wheel / the -, +, 0 shortcuts)
+        h.addWidget(QLabel("Zoom:"))
+        btn_zo = QPushButton("−")
+        btn_zo.setToolTip("Zoom out (-)")
+        btn_zo.clicked.connect(self.timeline_pane.zoom_out)
+        btn_zi = QPushButton("+")
+        btn_zi.setToolTip("Zoom in (=)  ·  Ctrl+wheel zooms at the cursor")
+        btn_zi.clicked.connect(self.timeline_pane.zoom_in)
+        btn_fit = QPushButton("Fit")
+        btn_fit.setToolTip("Fit the whole sequence to the pane (0)")
+        btn_fit.clicked.connect(self.timeline_pane.zoom_fit)
+        self.zoom_label = QLabel("1.0×")
+        self.zoom_label.setMinimumWidth(38)
+        self.timeline_pane.zoomChanged.connect(
+            lambda z: self.zoom_label.setText(f"{z:.1f}×"))
+        for b in (btn_zo, btn_fit, btn_zi):
+            b.setMaximumWidth(40)
+            h.addWidget(b)
+        h.addWidget(self.zoom_label)
         return strip
 
     def _build_shortcuts(self) -> None:
@@ -439,6 +461,10 @@ class MainWindow(QMainWindow):
             (".", lambda: self.preview.step(1)),
             ("Home", self.preview.go_start),
             ("End", self.preview.go_end),
+            ("=", self.timeline_pane.zoom_in),        # timeline zoom
+            ("+", self.timeline_pane.zoom_in),
+            ("-", self.timeline_pane.zoom_out),
+            ("0", self.timeline_pane.zoom_fit),
         ):
             QShortcut(QKeySequence(seq), self, activated=slot)
 
