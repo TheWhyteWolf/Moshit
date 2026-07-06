@@ -43,14 +43,35 @@ def _engine(args) -> MoshEngine:
     return MoshEngine(cfg, ff)
 
 
-def _coerce(value: str, kind: str):
-    if kind == "int":
-        return int(value)
-    if kind == "float":
-        return float(value)
-    if kind == "bool":
-        return value.strip().lower() in ("1", "true", "yes", "on", "y")
-    return value
+def _coerce(value: str, param):
+    """Parse and validate a ``--param`` value against its schema *param*.
+
+    Raises SystemExit with an actionable message for malformed numbers, a
+    ``choice`` outside the allowed set, or a number beyond the param's range,
+    rather than letting a raw ValueError/traceback escape."""
+    kind = param.kind
+    try:
+        if kind == "int":
+            v = int(value)
+        elif kind == "float":
+            v = float(value)
+        elif kind == "bool":
+            return value.strip().lower() in ("1", "true", "yes", "on", "y")
+        else:                                  # "choice" | "clip_ref" | str
+            v = value
+    except ValueError:
+        raise SystemExit(f"--param {param.name}: '{value}' is not a valid {kind}")
+    if kind == "choice" and param.choices and v not in param.choices:
+        raise SystemExit(f"--param {param.name}: '{value}' is not one of "
+                         f"{list(param.choices)}")
+    if kind in ("int", "float"):
+        if param.lo is not None and v < param.lo:
+            raise SystemExit(
+                f"--param {param.name}: {v} is below the minimum ({param.lo})")
+        if param.hi is not None and v > param.hi:
+            raise SystemExit(
+                f"--param {param.name}: {v} is above the maximum ({param.hi})")
+    return v
 
 
 def _parse_params(pairs: Optional[List[str]], mode_name: str) -> Dict:
@@ -65,7 +86,7 @@ def _parse_params(pairs: Optional[List[str]], mode_name: str) -> Dict:
         if key not in schema:
             raise SystemExit(f"mode '{mode_name}' has no parameter '{key}'. "
                              f"Known: {sorted(schema)}")
-        out[key] = _coerce(val, schema[key].kind)
+        out[key] = _coerce(val, schema[key])
     return out
 
 

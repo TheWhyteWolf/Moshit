@@ -30,7 +30,9 @@ class Bitrot(MoshMode):
               help="How many bytes to scramble in each affected frame."),
         Param("skip_header", "int", 32, lo=8, hi=256, label="Protect header bytes",
               help="Leading bytes left intact so the frame still parses."),
-        Param("seed", "int", 0, lo=0, hi=1_000_000, label="Seed"),
+        Param("seed", "int", 0, lo=0, hi=1_000_000, label="Seed",
+              help="Random seed for which bytes get flipped — keep it fixed for "
+                   "a repeatable glitch, change it to roll a different one."),
     ]
 
     def apply(self, frames: List[Frame], ctx: MoshContext, *,

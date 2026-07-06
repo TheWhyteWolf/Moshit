@@ -300,12 +300,18 @@ class PixelSort(RawMode):
               choices=("horizontal", "vertical"), label="Axis",
               help="Sort within rows (horizontal) or columns (vertical)."),
         Param("by", "choice", "brightness",
-              choices=("brightness", "hue", "saturation"), label="Sort by"),
+              choices=("brightness", "hue", "saturation"), label="Sort by",
+              help="Which pixel property to sort each span by — brightness is "
+                   "the classic look; hue/saturation give colour-led streaks."),
         Param("lo", "float", 0.25, lo=0.0, hi=1.0, label="Threshold lo",
               help="Only pixels whose brightness is in [lo, hi] get sorted."),
-        Param("hi", "float", 0.80, lo=0.0, hi=1.0, label="Threshold hi"),
+        Param("hi", "float", 0.80, lo=0.0, hi=1.0, label="Threshold hi",
+              help="Upper end of the brightness band that gets sorted; widen "
+                   "[lo, hi] to smear more of the frame."),
         Param("order", "choice", "ascending",
-              choices=("ascending", "descending"), label="Order"),
+              choices=("ascending", "descending"), label="Order",
+              help="Sort each span dark→bright (ascending) or bright→dark "
+                   "(descending) — flips which way the streaks run."),
     ]
 
     def apply(self, frames, *, width, height, fps, axis="horizontal",

@@ -78,7 +78,9 @@ def is_pixel_mode(name: str) -> bool:
 class RGBShift(PixelMode):
     name = "rgb_shift"
     description = "Offset the red and blue channels (chromatic-aberration fringing)."
-    params = [Param("amount", "int", 4, lo=0, hi=40, label="Shift px")]
+    params = [Param("amount", "int", 4, lo=0, hi=40, label="Shift px",
+                    help="How far (px) to pull red and blue apart; the vertical "
+                         "split is half this. 0 is off.")]
 
     def filter(self, *, amount: int = 4) -> str:
         a = max(0, int(amount))
@@ -88,8 +90,12 @@ class RGBShift(PixelMode):
 class HueRotate(PixelMode):
     name = "hue_rotate"
     description = "Rotate hue and push saturation."
-    params = [Param("degrees", "int", 90, lo=-180, hi=180, label="Hue°"),
-              Param("saturation", "float", 1.4, lo=0.0, hi=3.0, label="Saturation")]
+    params = [Param("degrees", "int", 90, lo=-180, hi=180, label="Hue°",
+                    help="Degrees to rotate the colour wheel (±180 is a full "
+                         "hue inversion; 0 leaves hue alone)."),
+              Param("saturation", "float", 1.4, lo=0.0, hi=3.0, label="Saturation",
+                    help="Saturation multiplier: 1.0 unchanged, 0 greyscale, "
+                         ">1 pushes colours harder.")]
 
     def filter(self, *, degrees: int = 90, saturation: float = 1.4) -> str:
         return f"hue=h={int(degrees)}:s={float(saturation):.2f}"
@@ -98,7 +104,9 @@ class HueRotate(PixelMode):
 class Pixelate(PixelMode):
     name = "pixelate"
     description = "Mosaic blocks (downscale then nearest-neighbour upscale)."
-    params = [Param("block", "int", 8, lo=2, hi=64, label="Block px")]
+    params = [Param("block", "int", 8, lo=2, hi=64, label="Block px",
+                    help="Mosaic cell size in pixels — bigger blocks are "
+                         "coarser/chunkier.")]
 
     def filter(self, *, block: int = 8) -> str:
         b = max(2, int(block))
@@ -110,7 +118,9 @@ class Pixelate(PixelMode):
 class Noise(PixelMode):
     name = "noise"
     description = "Add animated grain / static."
-    params = [Param("amount", "int", 20, lo=0, hi=100, label="Amount")]
+    params = [Param("amount", "int", 20, lo=0, hi=100, label="Amount",
+                    help="Grain strength (0 = clean, 100 = heavy static); the "
+                         "grain re-rolls every frame.")]
 
     def filter(self, *, amount: int = 20) -> str:
         return f"noise=alls={max(0, int(amount))}:allf=t"
@@ -119,7 +129,9 @@ class Noise(PixelMode):
 class Echo(PixelMode):
     name = "echo"
     description = "Temporal blend of recent frames (ghosting / smear)."
-    params = [Param("frames", "int", 3, lo=2, hi=16, label="Frames")]
+    params = [Param("frames", "int", 3, lo=2, hi=16, label="Frames",
+                    help="How many recent frames to average together — more "
+                         "frames = longer ghost/smear trails.")]
 
     def filter(self, *, frames: int = 3) -> str:
         return f"tmix=frames={max(2, int(frames))}"
@@ -128,7 +140,9 @@ class Echo(PixelMode):
 class Trails(PixelMode):
     name = "trails"
     description = "Bright-pixel trails / light streaks."
-    params = [Param("decay", "float", 0.95, lo=0.0, hi=1.0, label="Decay")]
+    params = [Param("decay", "float", 0.95, lo=0.0, hi=1.0, label="Decay",
+                    help="How slowly bright pixels fade (0 = none, near 1 = long "
+                         "persistent light streaks).")]
 
     def filter(self, *, decay: float = 0.95) -> str:
         return f"lagfun=decay={max(0.0, min(1.0, float(decay))):.3f}"
@@ -153,8 +167,12 @@ class Zoom(PixelMode):
     name = "zoom"
     description = "Push in / pull out -- magnify, optionally animated across the clip."
     needs_ctx = True
-    params = [Param("start", "float", 1.0, lo=1.0, hi=8.0, label="Start ×"),
-              Param("end", "float", 1.5, lo=1.0, hi=8.0, label="End ×")]
+    params = [Param("start", "float", 1.0, lo=1.0, hi=8.0, label="Start ×",
+                    help="Magnification at the clip's first frame (1.0 = no "
+                         "zoom)."),
+              Param("end", "float", 1.5, lo=1.0, hi=8.0, label="End ×",
+                    help="Magnification at the last frame; the zoom ramps evenly "
+                         "from Start to End. Equal values = a static zoom.")]
 
     def filter(self, *, start: float = 1.0, end: float = 1.5) -> str:
         # context-free fallback: a static zoom at the start magnification
@@ -176,9 +194,14 @@ class Pan(PixelMode):
     name = "pan"
     description = "Drift the frame by a pixel offset across the clip (with headroom)."
     needs_ctx = True
-    params = [Param("dx", "int", 0, lo=-400, hi=400, label="Δx px"),
-              Param("dy", "int", 0, lo=-400, hi=400, label="Δy px"),
-              Param("zoom", "float", 1.2, lo=1.0, hi=3.0, label="Headroom ×")]
+    params = [Param("dx", "int", 0, lo=-400, hi=400, label="Δx px",
+                    help="Total horizontal drift over the clip (px; + right, "
+                         "- left)."),
+              Param("dy", "int", 0, lo=-400, hi=400, label="Δy px",
+                    help="Total vertical drift over the clip (px; + down, - up)."),
+              Param("zoom", "float", 1.2, lo=1.0, hi=3.0, label="Headroom ×",
+                    help="Pre-zoom so the drift doesn't expose blank edges — "
+                         "raise it if a big pan reaches the frame border.")]
 
     def filter(self, *, dx: int = 0, dy: int = 0, zoom: float = 1.2) -> str:
         return self.filter_ctx({"dx": dx, "dy": dy, "zoom": zoom},
@@ -199,8 +222,12 @@ class Rotate(PixelMode):
     name = "rotate"
     description = "Rotate / spin the frame (static angle plus optional spin over the clip)."
     needs_ctx = True
-    params = [Param("angle", "float", 0.0, lo=-180.0, hi=180.0, label="Angle°"),
-              Param("spin", "float", 0.0, lo=-1440.0, hi=1440.0, label="Spin° total")]
+    params = [Param("angle", "float", 0.0, lo=-180.0, hi=180.0, label="Angle°",
+                    help="Starting rotation in degrees (held for the whole clip "
+                         "unless Spin is set)."),
+              Param("spin", "float", 0.0, lo=-1440.0, hi=1440.0, label="Spin° total",
+                    help="Extra degrees swept over the clip on top of Angle "
+                         "(360 = one full turn; ± sets direction).")]
 
     def filter(self, *, angle: float = 0.0, spin: float = 0.0) -> str:
         return self.filter_ctx({"angle": angle, "spin": spin},
@@ -219,8 +246,12 @@ class Shake(PixelMode):
     name = "shake"
     description = "Hand-held camera jitter (deterministic sinusoidal wobble)."
     needs_ctx = True
-    params = [Param("amount", "int", 8, lo=0, hi=80, label="Amplitude px"),
-              Param("speed", "float", 1.0, lo=0.1, hi=6.0, label="Speed")]
+    params = [Param("amount", "int", 8, lo=0, hi=80, label="Amplitude px",
+                    help="How far the frame wobbles (px). 0 is off; the frame "
+                         "is pre-zoomed to hide the shaking edges."),
+              Param("speed", "float", 1.0, lo=0.1, hi=6.0, label="Speed",
+                    help="How fast the jitter oscillates — higher is a more "
+                         "frantic shake.")]
 
     def filter(self, *, amount: int = 8, speed: float = 1.0) -> str:
         return self.filter_ctx({"amount": amount, "speed": speed},

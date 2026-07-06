@@ -19,7 +19,9 @@ class PframeDrop(MoshMode):
     params = [
         Param("probability", "float", 0.3, lo=0.0, hi=1.0, label="Drop chance",
               help="Probability each P-frame is dropped (0–1)."),
-        Param("seed", "int", 0, lo=0, hi=1_000_000, label="Seed"),
+        Param("seed", "int", 0, lo=0, hi=1_000_000, label="Seed",
+              help="Random seed for which P-frames drop — fix it for a "
+                   "repeatable stutter, change it to reshuffle the skips."),
     ]
 
     def apply(self, frames: List[Frame], ctx: MoshContext, *,

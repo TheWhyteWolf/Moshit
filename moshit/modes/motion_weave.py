@@ -26,7 +26,10 @@ class MotionWeave(MoshMode):
                    "(0 = the source's motion replaces the base's entirely)."),
         Param("motion_run", "int", 1, lo=0, hi=32, label="Source frames per cycle",
               help="How many source P-frames before switching back."),
-        Param("hold_base_iframe", "bool", True, label="Hold base keyframe"),
+        Param("hold_base_iframe", "bool", True, label="Hold base keyframe",
+              help="Keep the base clip's opening keyframe so the weave stays "
+                   "decodable on its own; turn off to smear from preceding "
+                   "timeline content."),
     ]
 
     def apply(self, frames: List[Frame], ctx: MoshContext, *, source=None,
