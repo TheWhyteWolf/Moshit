@@ -167,6 +167,125 @@ def test_timeline_crossfade_overlap_layout(qapp):
     assert tl._main_length() == 32                       # 20 + 20 - 8 (matches render)
 
 
+def _mouse_ev(etype, x, y, *, button=None, buttons=None, mods=None):
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    button = Qt.MouseButton.LeftButton if button is None else button
+    buttons = button if buttons is None else buttons
+    mods = Qt.KeyboardModifier.NoModifier if mods is None else mods
+    return QMouseEvent(etype, QPointF(x, y), QPointF(x, y), button, buttons, mods)
+
+
+def _snap_timeline():
+    """An 800px timeline with a(0..100) and b(110..210) for snap tests."""
+    from PySide6.QtGui import QPixmap
+    from moshit.gui.widgets import TimelineWidget
+    from moshit.project import Project, Clip, MediaItem
+    proj = Project()
+    proj.media["m"] = MediaItem(id="m", source_path="x", label="m", role="main",
+                                intermediate_path="x", nb_frames=100)
+    proj.clips.append(Clip(id="a", media_id="m", track="main"))
+    proj.clips.append(Clip(id="b", media_id="m", track="main", start=110))
+    tl = TimelineWidget()
+    tl.resize(800, 240)
+    tl.set_project(proj)
+    tl.render(QPixmap(tl.size()))                  # populate hit rects
+    return tl
+
+
+def test_timeline_move_snaps_to_neighbor_end(qapp):
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QPixmap
+    tl = _snap_timeline()
+    x0, _ = tl._track_x()
+    ppf = tl._ppf()
+    y = tl._lane_y(tl._lane_index("main")) + tl.LANE_H // 2
+    press_x = x0 + 160 * ppf                       # b's body
+    got = []
+    tl.moveRequested.connect(lambda cid, start: got.append((cid, start)))
+    tl.mousePressEvent(_mouse_ev(QEvent.Type.MouseButtonPress, press_x, y))
+    assert tl._drag and tl._drag["mode"] == "move" and tl._drag["start"] == 110
+    move_x = press_x - 8 * ppf                     # left edge lands ~2f from 100
+    tl.mouseMoveEvent(_mouse_ev(QEvent.Type.MouseMove, move_x, y,
+                                button=Qt.MouseButton.NoButton))
+    assert tl._snap_frame == 100                   # snap engaged on a's end
+    tl.render(QPixmap(tl.size()))                  # ghost + snap-line paint path
+    tl.mouseReleaseEvent(_mouse_ev(QEvent.Type.MouseButtonRelease, move_x, y,
+                                   buttons=Qt.MouseButton.NoButton))
+    assert got == [("b", 100)]                     # butted exactly: melt chains
+    assert tl._snap_frame is None
+
+
+def test_timeline_move_alt_disables_snap(qapp):
+    from PySide6.QtCore import QEvent, Qt
+    tl = _snap_timeline()
+    x0, _ = tl._track_x()
+    ppf = tl._ppf()
+    y = tl._lane_y(tl._lane_index("main")) + tl.LANE_H // 2
+    press_x = x0 + 160 * ppf
+    got = []
+    tl.moveRequested.connect(lambda cid, start: got.append((cid, start)))
+    tl.mousePressEvent(_mouse_ev(QEvent.Type.MouseButtonPress, press_x, y))
+    move_x = press_x - 8 * ppf
+    alt = Qt.KeyboardModifier.AltModifier
+    tl.mouseMoveEvent(_mouse_ev(QEvent.Type.MouseMove, move_x, y,
+                                button=Qt.MouseButton.NoButton, mods=alt))
+    assert tl._snap_frame is None                  # Alt: no snap feedback
+    tl.mouseReleaseEvent(_mouse_ev(QEvent.Type.MouseButtonRelease, move_x, y,
+                                   buttons=Qt.MouseButton.NoButton, mods=alt))
+    assert got == [("b", 102)]                     # free placement kept the gap
+
+
+def test_timeline_trim_snaps_to_playhead(qapp):
+    from PySide6.QtCore import QEvent, Qt
+    tl = _snap_timeline()
+    tl.set_play_fraction(205 / 210)                # playhead at frame 205
+    rect = next(r for r, cid, _t in tl._hits if cid == "b")
+    ppf = tl._ppf()
+    y = rect.center().y()
+    press_x = rect.right() - 1
+    got = []
+    tl.trimRequested.connect(lambda cid, i, o: got.append((cid, i, o)))
+    tl.mousePressEvent(_mouse_ev(QEvent.Type.MouseButtonPress, press_x, y))
+    assert tl._drag and tl._drag["mode"] == "trim_r"
+    move_x = press_x - 4 * ppf                     # edge lands 1f past the playhead
+    tl.mouseMoveEvent(_mouse_ev(QEvent.Type.MouseMove, move_x, y,
+                                button=Qt.MouseButton.NoButton))
+    assert tl._snap_frame == 205
+    tl.mouseReleaseEvent(_mouse_ev(QEvent.Type.MouseButtonRelease, move_x, y,
+                                   buttons=Qt.MouseButton.NoButton))
+    assert got == [("b", -1, 95)]                  # out 100 -> 95 (edge 210 -> 205)
+
+
+def test_timeline_melt_marker_and_fx_badge_scan(qapp):
+    from PySide6.QtGui import QPixmap
+    from moshit.gui.widgets import TimelineWidget
+    from moshit.project import Project, Clip, MediaItem, MoshOp
+    proj = Project()
+    proj.media["m"] = MediaItem(id="m", source_path="x", label="m", role="main",
+                                intermediate_path="x", nb_frames=50)
+    for cid, start in (("a", 0), ("b", 50), ("c", 100), ("d", 150)):
+        proj.clips.append(Clip(id=cid, media_id="m", track="main", start=start))
+    melt = {"keep_first": False, "keep_every": 0}
+    proj.mosh_ops += [
+        MoshOp(id="o1", mode="iframe_removal", params=dict(melt),
+               target_clip_id="b", region_start=0, region_end=1),   # melt head
+        MoshOp(id="o2", mode="iframe_removal",                      # periodic keeps
+               params={"keep_first": False, "keep_every": 4}, target_clip_id="c"),
+        MoshOp(id="o3", mode="bitrot", params={}, target_clip_id="c"),
+        MoshOp(id="o4", mode="iframe_removal", params=dict(melt),   # not at the head
+               target_clip_id="d", region_start=3, region_end=4),
+        MoshOp(id="o5", mode="iframe_removal", params=dict(melt),   # disabled
+               target_clip_id="a", enabled=False),
+    ]
+    tl = TimelineWidget()
+    tl.resize(800, 240)
+    tl.set_project(proj)
+    assert tl._melt_heads == {"b"}                 # only the true melt junction
+    assert tl._fx_count == {"b": 1, "c": 2, "d": 1}
+    tl.render(QPixmap(tl.size()))                  # badge + zigzag paint path
+
+
 def _timeline_in_pane(qapp, nb_frames=40):
     """A TimelineWidget with one clip, hosted in a shown TimelinePane."""
     from moshit.gui.widgets import TimelineWidget, TimelinePane

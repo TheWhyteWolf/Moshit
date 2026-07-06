@@ -731,15 +731,39 @@ class TimelineWidget(QWidget):
         self._cursor_x = 0
         self._waveform: Optional[List[float]] = None      # audio peak envelope
         self._seq_id: Optional[str] = None          # sequence shown (None = root)
+        self._snap_frame: Optional[int] = None      # engaged snap target (frames)
+        self._fx_count: Dict[str, int] = {}         # clip_id -> live mosh-op count
+        self._melt_heads: set = set()               # clips whose opening cut melts
 
     def set_project(self, project) -> None:
         self._project = project
         if self._seq_id is None or not any(s.id == self._seq_id
                                            for s in project.sequences):
             self._seq_id = project.root_seq_id
+        self._scan_ops(project)
         self._total = self._seq_total()
         self._update_height()
         self.update()
+
+    def _scan_ops(self, project) -> None:
+        """Per-clip effect summary for painting, rebuilt once per project change
+        (never in paintEvent): how many live mosh ops each clip carries, and
+        which clips open with a deleted keyframe — the Easy-mode melt junction
+        (iframe_removal, keep_first off, no periodic keeps, region covering
+        frame 0) — so the timeline can mark moshed clips and melting cuts."""
+        self._fx_count = {}
+        self._melt_heads = set()
+        for o in project.mosh_ops:
+            if o.archived or not o.enabled:
+                continue
+            self._fx_count[o.target_clip_id] = \
+                self._fx_count.get(o.target_clip_id, 0) + 1
+            if (o.mode == "iframe_removal"
+                    and not (o.params or {}).get("keep_first", True)
+                    and not (o.params or {}).get("keep_every", 0)
+                    and int(o.region_start or 0) == 0
+                    and (o.region_end is None or int(o.region_end) >= 1)):
+                self._melt_heads.add(o.target_clip_id)
 
     def set_sequence(self, seq_id) -> None:
         self._seq_id = seq_id
@@ -922,15 +946,29 @@ class TimelineWidget(QWidget):
             if not on:
                 p.drawText(lx, y + 32, "(off)")
 
-        # drag feedback
+        # drag feedback: the snapped ghost of what release would commit, a line
+        # at the engaged snap target, and the plain cursor line
         if self._drag:
+            d = self._drag
+            gy = self._lane_y(self._lane_index(d["track"]))
+            if d["mode"] == "move" and self._is_video(d["track"]):
+                gx = int(x0 + (d["start"] + d.get("dsnap", 0)) * ppf)
+                p.setPen(QColor(255, 209, 102, 200))
+                p.drawRect(QRect(gx, gy, max(2, int(d["length"] * ppf) - 2),
+                                 self.LANE_H).adjusted(0, 0, -1, -1))
+            elif d["mode"] in ("trim_l", "trim_r"):  # bracket the moving edge
+                edge = (d["start"] + d.get("dsnap", 0) if d["mode"] == "trim_l"
+                        else d["start"] + d["length"] + d.get("dsnap", 0))
+                ex = int(x0 + edge * ppf)
+                p.setPen(QColor("#ffd166"))
+                p.drawLine(ex, gy, ex, gy + self.LANE_H)
+            if self._snap_frame is not None:
+                sx = int(x0 + self._snap_frame * ppf)
+                p.setPen(QColor("#4ecdc4"))
+                p.drawLine(sx, self.RULER_H, sx, self.height() - 2)
             p.setPen(QColor("#ffd166"))
-            if self._drag["mode"] == "move":
-                p.drawLine(self._cursor_x, self.RULER_H, self._cursor_x,
-                           self.height() - 2)
-            else:
-                p.drawLine(self._cursor_x, self.RULER_H, self._cursor_x,
-                           self.height() - 2)
+            p.drawLine(self._cursor_x, self.RULER_H, self._cursor_x,
+                       self.height() - 2)
 
         # playhead (proportional to the preview position) + scrub handle
         px = int(x0 + self._play_frac * track_w)
@@ -967,11 +1005,21 @@ class TimelineWidget(QWidget):
             badges.append(f"{clip.opacity * 100:.0f}%")
         if getattr(clip, "blend_mode", "normal") != "normal":
             badges.append(clip.blend_mode)
+        n_fx = self._fx_count.get(clip.id, 0)
+        if n_fx:                                     # clip carries mosh ops
+            badges.append(f"≋{n_fx}")
         suffix = ("   " + " ".join(badges)) if badges else ""
         p.setPen(QColor("#eef1f6"))
         p.drawText(rect.adjusted(5, 0, -3, 0),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    f"{label}  {length}f{suffix}")
+        if clip.id in self._melt_heads:              # melting head: this cut smears
+            p.setPen(QColor("#ff9f1c"))
+            xl = rect.left() + 1
+            pts = [QPoint(xl + (3 if i % 2 else 0), y) for i, y
+                   in enumerate(range(rect.top() + 2, rect.bottom() - 1, 4))]
+            if len(pts) > 1:
+                p.drawPolyline(QPolygon(pts))
 
     def _draw_waveform(self, p, x0, track_w, vis) -> None:
         top = self.RULER_H + 2
@@ -1070,6 +1118,48 @@ class TimelineWidget(QWidget):
         self.update()
         self.seekRequested.emit(frac)
 
+    # -- drag snapping ------------------------------------------------------- #
+
+    SNAP_PX = 12                                     # snap radius, screen px
+
+    def _snap_targets(self, track_id: str, exclude_clip_id: Optional[str]) -> List[int]:
+        """Frames a dragged edge snaps to: the sequence start, the playhead,
+        and every other same-track clip edge."""
+        targets = [0, round(self._play_frac * self._total)]
+        for clip, start, length, _t in self._project.track_layout(track_id):
+            if clip.id != exclude_clip_id:
+                targets.extend((start, start + length))
+        return targets
+
+    def _snap_adjust(self, dframes: int, d: dict, modifiers) -> Tuple[int, Optional[int]]:
+        """Snap drag delta *dframes* so the moving edge lands on a nearby target.
+
+        Returns ``(adjusted_dframes, target_frame_or_None)``. A move considers
+        both clip edges (the leading one wins ties), a trim just the trimmed
+        edge. Butting a clip against its neighbour keeps an Easy-mode melt
+        chained and the render on the fast flat path, so snapping is the
+        default; hold Alt to place freely.
+        """
+        if (modifiers & Qt.KeyboardModifier.AltModifier) or not self._project \
+                or not self._is_video(d["track"]):
+            return dframes, None
+        thresh = self.SNAP_PX / d["ppf"]
+        if d["mode"] == "move":
+            edges = [d["start"] + dframes, d["start"] + d["length"] + dframes]
+        elif d["mode"] == "trim_l":
+            edges = [d["start"] + dframes]
+        else:                                        # trim_r
+            edges = [d["start"] + d["length"] + dframes]
+        best = None                                  # (distance, edge, target)
+        for edge in edges:                           # leading edge first: wins ties
+            for tgt in self._snap_targets(d["track"], d["id"]):
+                dist = abs(edge - tgt)
+                if dist <= thresh and (best is None or dist < best[0]):
+                    best = (dist, edge, tgt)
+        if best is None:
+            return dframes, None
+        return dframes + best[2] - best[1], best[2]
+
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton or not self._project:
             return
@@ -1101,10 +1191,19 @@ class TimelineWidget(QWidget):
         else:
             mode = "move"
         x0, _x1 = self._track_x()
-        disp_start = round((rect.left() - x0) / self._ppf())   # current timeline pos
+        # pixel-derived fallback (motion pool); video lanes use the exact layout
+        disp_start = round((rect.left() - x0) / self._ppf())
+        length = round(rect.width() / self._ppf())
+        if self._is_video(track):
+            lay = next(((s, ln) for c, s, ln, _t
+                        in self._project.track_layout(track) if c.id == clip_id),
+                       None)
+            if lay:
+                disp_start, length = lay
         self._drag = {"id": clip_id, "track": track, "mode": mode,
                       "press_x": pos.x(), "in": clip.in_point, "out": orig_out,
-                      "ppf": self._ppf(), "start": disp_start}
+                      "ppf": self._ppf(), "start": disp_start, "length": length,
+                      "dsnap": 0}
         self._cursor_x = pos.x()
         self.update()
 
@@ -1115,6 +1214,10 @@ class TimelineWidget(QWidget):
             self._emit_seek(pos.x())
             return
         if self._drag:
+            d = self._drag
+            raw = round((pos.x() - d["press_x"]) / d["ppf"])
+            d["dsnap"], self._snap_frame = self._snap_adjust(
+                raw, d, event.modifiers())
             self.update()
             return
         if self._tool == "pointer":                  # edge-trim cursor affordance
@@ -1133,7 +1236,11 @@ class TimelineWidget(QWidget):
         if not self._drag:
             return
         d, self._drag = self._drag, None
-        dframes = round((self._cursor_x - d["press_x"]) / d["ppf"])
+        # same snap as the live feedback, from the release's own modifiers
+        dframes, _ = self._snap_adjust(
+            round((self._cursor_x - d["press_x"]) / d["ppf"]), d,
+            event.modifiers())
+        self._snap_frame = None
         if d["mode"] == "move":
             if self._is_video(d["track"]) and dframes != 0:    # free positioning
                 self.moveRequested.emit(d["id"], max(0, d["start"] + dframes))
