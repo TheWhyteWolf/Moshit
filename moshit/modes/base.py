@@ -163,17 +163,25 @@ class MoshContext:
         return ev(pos)
 
 
-class MoshMode:
-    """Base class for all effects. Subclass and implement :meth:`apply`."""
+class RegisteredMode:
+    """Shared surface for the three effect families (mosh / pixel / raw).
+
+    Each family subclass sets ``_registry`` to its own name→class dict; a mode
+    self-registers there on definition, and every family gets the same
+    ``defaults``/``resolve`` (merge overrides onto the schema defaults). The
+    families differ only in what a mode *does* (``apply`` vs ``filter``), which
+    stays on each family base.
+    """
 
     name: str = ""
     description: str = ""
     params: List[Param] = []
+    _registry: Dict[str, type] = {}            # each family overrides this
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if cls.name:
-            _REGISTRY[cls.name] = cls
+            cls._registry[cls.name] = cls
 
     def defaults(self) -> Dict[str, Any]:
         return {p.name: p.default for p in self.params}
@@ -186,6 +194,13 @@ class MoshMode:
             if key in known:
                 values[key] = val
         return values
+
+
+class MoshMode(RegisteredMode):
+    """Base class for all codec-domain effects. Subclass and implement
+    :meth:`apply`."""
+
+    _registry = _REGISTRY
 
     def apply(self, frames: List[Frame], ctx: MoshContext,
               **params) -> List[Frame]:

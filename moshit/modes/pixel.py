@@ -12,33 +12,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from .base import Param
+from .base import Param, RegisteredMode
 
 _PIXEL_REGISTRY: Dict[str, type] = {}
 
 
-class PixelMode:
+class PixelMode(RegisteredMode):
     """Base class for pixel-domain effects. Subclass and implement :meth:`filter`."""
 
-    name: str = ""
-    description: str = ""
-    params: List[Param] = []
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        if cls.name:
-            _PIXEL_REGISTRY[cls.name] = cls
-
-    def defaults(self) -> Dict[str, Any]:
-        return {p.name: p.default for p in self.params}
-
-    def resolve(self, overrides) -> Dict[str, Any]:
-        values = self.defaults()
-        known = {p.name for p in self.params}
-        for key, val in (overrides or {}).items():
-            if key in known:
-                values[key] = val
-        return values
+    _registry = _PIXEL_REGISTRY
 
     # Set on modes whose filter depends on the clip's geometry / fps / length
     # (e.g. motion injection animates across the exact clip duration). The

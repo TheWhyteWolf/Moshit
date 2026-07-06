@@ -11,11 +11,11 @@ the render skips raw effects with a note rather than failing, mirroring flow.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Dict, List
 
-from .base import Param
+from .base import Param, RegisteredMode
 
-_RAW_REGISTRY: Dict[str, type] = {}
+_RAW_REGISTRY: dict = {}
 
 
 def available() -> bool:
@@ -27,29 +27,11 @@ def available() -> bool:
         return False
 
 
-class RawMode:
+class RawMode(RegisteredMode):
     """Base class for raw-frame effects. Subclass and implement :meth:`apply`."""
 
-    name: str = ""
-    description: str = ""
     category: str = "Raw FX"        # GUI/CLI grouping (e.g. "RAW DATA - AUDIO")
-    params: List[Param] = []
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        if cls.name:
-            _RAW_REGISTRY[cls.name] = cls
-
-    def defaults(self) -> Dict[str, Any]:
-        return {p.name: p.default for p in self.params}
-
-    def resolve(self, overrides) -> Dict[str, Any]:
-        values = self.defaults()
-        known = {p.name for p in self.params}
-        for key, val in (overrides or {}).items():
-            if key in known:
-                values[key] = val
-        return values
+    _registry = _RAW_REGISTRY
 
     def apply(self, frames: List[bytes], *, width: int, height: int,
               fps: float, **params) -> List[bytes]:
