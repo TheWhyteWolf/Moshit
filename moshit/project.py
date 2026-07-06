@@ -351,28 +351,63 @@ class Project:
                 pass
         return out
 
-    def _media_signature(self):
-        """A digest of every media's identity + on-disk state. Folding it into the
-        seg-cache key means re-imported footage or a re-rendered precomp (motion /
-        flow sources) invalidates dependent caches, without per-op dependency
-        tracking; ordinary effect edits leave it untouched, so other clips hit."""
-        sig = []
+    def _media_state(self):
+        """Each media's identity + on-disk state, as ``{id: (label, digest,
+        mtime)}`` (one stat per media). Render loops compute this once and pass
+        it down; :meth:`_clip_seg_key` folds in only the entries a clip actually
+        depends on, so re-imported footage or a re-rendered precomp invalidates
+        exactly the segments that read it — and nothing else."""
+        state = {}
         for m in self.media.values():
             try:
                 mt = Path(m.intermediate_path).stat().st_mtime
             except OSError:
                 mt = 0.0
-            sig.append((m.id, m.label, getattr(m, "digest", "") or "", mt))
-        return sorted(sig)
+            state[m.id] = (m.label, getattr(m, "digest", "") or "", mt)
+        return state
+
+    def _clip_media_deps(self, clip: Clip) -> Optional[List[str]]:
+        """Media ids this clip's segment reads: its own media, its flow-transfer
+        motion source, and any media referenced by a mosh op's ``clip_ref``
+        param. Returns None when an op's mode is unregistered (it could read any
+        motion clip), meaning "depend on everything"."""
+        from .modes import get_mode
+        deps = {clip.media_id}
+        ft = clip.flow_transfer
+        if ft:
+            mm = self._flow_motion_media(ft.get("source"))
+            if mm:
+                deps.add(mm.id)
+        for op in self._ops_for_clip(clip.id):
+            try:
+                mode = get_mode(op.mode)
+            except Exception:
+                return None                    # unknown mode: assume anything
+            for p in getattr(mode, "params", []):
+                if getattr(p, "kind", None) != "clip_ref":
+                    continue
+                src = (op.params or {}).get(p.name)
+                m = self._flow_motion_media(src) if src else None
+                if m:
+                    deps.add(m.id)
+        return sorted(deps)
 
     def _clip_seg_key(self, engine: MoshEngine, clip: Clip,
-                      media_sig=None) -> str:
+                      media_state=None) -> str:
         """Cache key for a clip's post-mosh, post-pixel segment. Captures only what
         the *segment* depends on -- the codec mosh (media/trim/ops) plus the flow
         and raw-FX pixel stages -- not the finish-pass speed/fade/pixel filters,
         which are cheap to re-apply over a cached segment. Render loops pass a
-        precomputed *media_sig* so it isn't re-stat'ed once per clip."""
+        precomputed *media_state* so it isn't re-stat'ed once per clip; only the
+        clip's own dependency subset is folded in (see :meth:`_clip_media_deps`),
+        so touching one media no longer busts every other clip's segment."""
         import hashlib
+        state = media_state if media_state is not None else self._media_state()
+        deps = self._clip_media_deps(clip)
+        if deps is None:                               # conservative: everything
+            media_sig = sorted((mid, *v) for mid, v in state.items())
+        else:
+            media_sig = [(mid, *state[mid]) for mid in deps if mid in state]
         payload = {
             "geom": engine._pixel_geom(),                  # preview vs full-res
             "media_id": clip.media_id,
@@ -383,20 +418,19 @@ class Project:
             # fx_mask only changes the segment when it gates raw FX (pixel-FX
             # masking happens later, in the finish pass).
             "fx_mask": clip.fx_mask if clip.raw_effects else None,
-            "media_sig": media_sig if media_sig is not None
-                         else self._media_signature(),
+            "media_sig": media_sig,
         }
         blob = json.dumps(payload, sort_keys=True, default=str)
         return hashlib.sha1(blob.encode()).hexdigest()
 
     def _clip_seg(self, engine: MoshEngine, clip: Clip, frames, media,
-                  media_sig=None) -> Tuple[Path, int]:
+                  media_state=None) -> Tuple[Path, int]:
         """A clip's post-mosh, post-pixel segment AVI plus its frame count,
         served from the engine's per-clip cache when its codec+pixel state is
         unchanged -- so editing one clip reuses the others' expensive output
         instead of redoing it. *frames* may be a thunk; it is only called on a
         cache miss, so a hit also skips the codec-domain mosh entirely."""
-        key = self._clip_seg_key(engine, clip, media_sig)
+        key = self._clip_seg_key(engine, clip, media_state)
         cached = engine.seg_cache_get(key)
         n = self._seg_n.get(key)
         if cached is not None and n is not None:
@@ -922,7 +956,7 @@ class Project:
         return result
 
     def _clip_segment(self, engine: MoshEngine, clip: Clip, motion=None,
-                      media_sig=None):
+                      media_state=None):
         """Render one clip to a finished segment AVI at project geometry (mosh +
         flow + per-clip finish chain). Returns ``(path, post_speed_length)``."""
         media = self._parsed_media(clip.media_id)
@@ -938,7 +972,7 @@ class Project:
                     region=self._op_region(op, len(frames)))
             return frames
 
-        seg, n = self._clip_seg(engine, clip, moshed, media, media_sig)
+        seg, n = self._clip_seg(engine, clip, moshed, media, media_state)
         meta = [{"n": n, "speed": clip.speed, "reverse": clip.reverse,
                  "fade_in": clip.fade_in, "fade_out": clip.fade_out,
                  "transition_in": 0,
@@ -955,7 +989,7 @@ class Project:
                      progress=None) -> Dict:
         fps = self.config.fps or 30.0
         motion = self._motion_frames()
-        media_sig = self._media_signature()        # computed once, not per clip
+        media_state = self._media_state()          # one stat per media
         needs_finish = any(c.has_finish() for c in clips)
 
         def moshed(c, media):
@@ -983,7 +1017,7 @@ class Project:
             if needs_finish:
                 seg, n = self._clip_seg(
                     engine, c, lambda c=c, media=media: moshed(c, media),
-                    media, media_sig)
+                    media, media_state)
                 segs.append((c, media, seg, n))
             else:
                 frames = moshed(c, media)
@@ -1038,7 +1072,7 @@ class Project:
         layers: List[Dict] = []
         track_seqs: List[List] = []                # per enabled track: [(clip,start,length,trans)]
         motion = self._motion_frames()             # shared by every clip below
-        media_sig = self._media_signature()
+        media_state = self._media_state()
         nclips = sum(len(lay) for lay in layouts.values())
         steps, k = nclips + 1, 0                   # per-clip work + composite
         for t in vtracks:                          # bottom -> top by index
@@ -1047,7 +1081,8 @@ class Project:
                 if progress:
                     progress(k, steps, f"Rendering layer {k + 1}/{nclips}…")
                 k += 1
-                seg, seglen = self._clip_segment(engine, clip, motion, media_sig)
+                seg, seglen = self._clip_segment(engine, clip, motion,
+                                                  media_state)
                 lm = clip.layer_mask
                 # a source-file alpha matte pulls in the clip's aligned alpha map
                 mask_input = (self._alpha_matte_segment(engine, clip, motion)

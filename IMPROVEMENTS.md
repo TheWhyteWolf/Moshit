@@ -103,7 +103,10 @@ misc) so commits can reference them. Tick items off as they land.
   needed: step + frame-stream granularity already gives an honest bar.)
 
 ### Wave 4 — deeper perf restructurings
-- [ ] P8: per-clip dependency-scoped seg-cache keys (stop global cache busts).
+- [x] P8: per-clip dependency-scoped seg-cache keys — `_media_state()` (one stat per
+  media, computed once per render) + `_clip_media_deps()` (own media + flow source +
+  `clip_ref`'d op sources; unknown modes fall back to depend-on-everything). Importing
+  or touching unrelated media no longer busts other clips' cached segments.
 - [ ] P17: parallel per-clip segment rendering (first make `engine._tmp()` and the
   seg-cache OrderedDict thread-safe).
 - [ ] P11: cache the folded finish output keyed on (ordered seg keys + layout).

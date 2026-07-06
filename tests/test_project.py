@@ -2,7 +2,7 @@
 (pure model, no ffmpeg)."""
 import pytest
 
-from moshit.project import (Clip, MediaItem, Project, Sequence, Track,
+from moshit.project import (Clip, MediaItem, MoshOp, Project, Sequence, Track,
                             MAIN_TRACK_ID, MOTION_TRACK_ID, ROOT_SEQ_ID)
 
 
@@ -136,3 +136,74 @@ def test_render_reports_determinate_progress(engine, project, make_clip, tmp_pat
     assert all(n == total for _i, n, _s in calls)
     assert [i for i, _n, _s in calls] == sorted(i for i, _n, _s in calls)
     assert calls[-1] == (2, 3, "Assembling sequence…")
+
+
+def test_seg_key_scoped_to_clip_dependencies(engine, project, make_clip):
+    import os
+    from pathlib import Path
+    m1 = project.import_media(engine, make_clip("a.mp4"))
+    clip = project.add_clip(m1.id)
+    k0 = project._clip_seg_key(engine, clip)
+
+    # importing unrelated media must NOT bust the segment key (it used to)
+    m2 = project.import_media(engine, make_clip("b.mp4", color="red"))
+    assert project._clip_seg_key(engine, clip) == k0
+
+    # touching an unrelated media's file: still no bust
+    st = Path(m2.intermediate_path).stat()
+    os.utime(m2.intermediate_path, (st.st_atime, st.st_mtime + 100))
+    assert project._clip_seg_key(engine, clip) == k0
+
+    # touching the clip's OWN media does bust it
+    st = Path(m1.intermediate_path).stat()
+    os.utime(m1.intermediate_path, (st.st_atime, st.st_mtime + 100))
+    assert project._clip_seg_key(engine, clip) != k0
+
+
+def test_seg_key_tracks_motion_and_flow_sources(engine, project, make_clip):
+    import os
+    from pathlib import Path
+    m1 = project.import_media(engine, make_clip("base.mp4"))
+    mo = project.import_media(engine, make_clip("mo.mp4", color="red"),
+                              role="motion")
+    other = project.import_media(engine, make_clip("other.mp4", color="blue"))
+    clip = project.add_clip(m1.id)
+
+    def touch(m, dt):
+        st = Path(m.intermediate_path).stat()
+        os.utime(m.intermediate_path, (st.st_atime, st.st_mtime + dt))
+
+    # a motion_splice op depends on its clip_ref'd source
+    project.mosh_ops.append(MoshOp(id="op1", mode="motion_splice",
+                                   params={"source": mo.label},
+                                   target_clip_id=clip.id))
+    k0 = project._clip_seg_key(engine, clip)
+    touch(other, 100)                          # unrelated media: no bust
+    assert project._clip_seg_key(engine, clip) == k0
+    touch(mo, 100)                             # the referenced source: bust
+    k1 = project._clip_seg_key(engine, clip)
+    assert k1 != k0
+
+    # a flow transfer depends on its motion source the same way
+    project.mosh_ops.clear()
+    clip.flow_transfer = {"source": other.label}
+    k2 = project._clip_seg_key(engine, clip)
+    touch(mo, 100)                             # no longer referenced: no bust
+    assert project._clip_seg_key(engine, clip) == k2
+    touch(other, 100)                          # flow source: bust
+    assert project._clip_seg_key(engine, clip) != k2
+
+
+def test_seg_key_unknown_mode_depends_on_everything(engine, project, make_clip):
+    import os
+    from pathlib import Path
+    m1 = project.import_media(engine, make_clip("u.mp4"))
+    m2 = project.import_media(engine, make_clip("u2.mp4", color="red"))
+    clip = project.add_clip(m1.id)
+    project.mosh_ops.append(MoshOp(id="op1", mode="not_a_registered_mode",
+                                   params={}, target_clip_id=clip.id))
+    assert project._clip_media_deps(clip) is None      # conservative fallback
+    k0 = project._clip_seg_key(engine, clip)
+    st = Path(m2.intermediate_path).stat()
+    os.utime(m2.intermediate_path, (st.st_atime, st.st_mtime + 100))
+    assert project._clip_seg_key(engine, clip) != k0   # any media change busts
