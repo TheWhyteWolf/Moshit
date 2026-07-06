@@ -1149,6 +1149,32 @@ def test_undo_survives_bake(qapp, tmp_path, monkeypatch, make_clip):
         c.cleanup()
 
 
+def test_inspector_stays_live_during_preview_render(win):
+    c = win.controller
+    c._busy_preview = True                              # a read-only preview render
+    win._on_busy(True, "Rendering preview…")
+    assert win.inspector.isEnabled()                   # editing stays available
+    c._busy_preview = False                             # a heavy op (bake/export)
+    win._on_busy(True, "Baking…")
+    assert not win.inspector.isEnabled()               # locked while state changes
+    win._on_busy(False, "")
+    assert win.inspector.isEnabled()                   # re-enabled when idle
+
+
+def test_beat_cache_warmed_off_thread(ctl, monkeypatch, tmp_path):
+    from moshit import beats, waveform
+    wav = tmp_path / "preview.wav"
+    wav.write_bytes(b"")
+    warmed = []
+    monkeypatch.setattr(ctl.engine, "mix_audio", lambda *a, **k: wav)
+    monkeypatch.setattr(waveform, "peaks", lambda *a, **k: [])
+    monkeypatch.setattr(beats, "onsets", lambda p, **k: warmed.append(str(p)) or [])
+    # _build_preview_audio runs on the audio worker thread; it should warm the
+    # onset cache so the later main-thread beat_positions() call is instant.
+    ctl._build_preview_audio([[{"source": "x", "silent": False, "duration": 1.0}]])
+    assert warmed == [str(wav)]
+
+
 def test_undo_preserves_media_imported_afterwards(ctl):
     from moshit.project import MediaItem
     ctl.project.media["m0"] = MediaItem(

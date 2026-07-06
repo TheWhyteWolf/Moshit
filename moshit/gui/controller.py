@@ -136,6 +136,7 @@ class AppController(QObject):
         self.decoder = PreviewDecoder(self.ff.ffmpeg)
         self.pool = QThreadPool.globalInstance()
         self._busy = False
+        self._busy_preview = False             # True while a read-only preview renders
         self._job_gen = 0                      # bumped on cancel; stale results ignored
         self._draining = False                 # a cancelled worker may still be running
         self._pending: Optional[Callable] = None
@@ -179,6 +180,13 @@ class AppController(QObject):
         # Draining counts as busy: a cancelled worker may still mutate state, so
         # callers (auto-refresh) must wait for it to finish before the next job.
         return self._busy or self._draining
+
+    @property
+    def busy_is_preview(self) -> bool:
+        """True while the current busy job is a read-only preview render (so the
+        UI can stay editable) rather than a heavy state-changing op (bake/export/
+        import, where editing should be blocked)."""
+        return self._busy_preview
 
     def export_profiles(self) -> List[str]:
         return self.ff.capabilities().available_export_profiles()
@@ -253,6 +261,7 @@ class AppController(QObject):
                             "Finishing the cancelled task - try again in a moment.")
             return
         self._busy = True
+        self._busy_preview = False             # a _run job is a heavy op, not a preview
         self._pending = on_done
         gen = self._job_gen
         self.ff.reset_abort()                  # a prior cancel must not block us
@@ -404,6 +413,7 @@ class AppController(QObject):
             self.error.emit("Add a clip to a video track first.")
             return
         self._busy = True
+        self._busy_preview = True              # read-only render; leave editing live
         gen = self._job_gen
         self.ff.reset_abort()                  # a prior cancel must not block us
         self.busy.emit(True, "Rendering preview…")
@@ -440,6 +450,14 @@ class AppController(QObject):
         self._audio_path_cache = str(path) if path else None
         self._preview_waveform = (waveform.peaks(self._audio_path_cache)
                                   if self._audio_path_cache else None)
+        if self._audio_path_cache:
+            # Warm the onset cache here, on the audio-build worker thread, so the
+            # later beat_positions() call (main thread, on the ♪ button) is a
+            # cache hit instead of scanning the whole WAV under the UI (U1).
+            try:
+                beats.onsets(self._audio_path_cache)
+            except Exception:
+                pass
         return self._audio_path_cache
 
     def set_preview_muted(self, muted: bool) -> None:

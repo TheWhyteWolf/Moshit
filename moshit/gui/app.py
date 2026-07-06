@@ -1187,7 +1187,12 @@ class MainWindow(QMainWindow):
     def _on_busy(self, busy: bool, message: str) -> None:
         for act in (self.act_import, self.act_preview, self.act_export):
             act.setEnabled(not busy)
-        self.inspector.setEnabled(not busy)
+        # A preview render is read-only, so keep the inspector editable (it's the
+        # frequent auto-refresh; greying it on every edit was jarring). Heavy
+        # state-changing ops (bake/export/import) still lock it (U4). The timeline
+        # is likewise left live during previews, so this just matches it.
+        keep_editable = busy and self.controller.busy_is_preview
+        self.inspector.setEnabled(not busy or keep_editable)
         if busy:
             self.progress.setRange(0, 0)        # indeterminate until steps arrive
         self.progress.setVisible(busy)
@@ -1195,7 +1200,9 @@ class MainWindow(QMainWindow):
         self.preview.set_rendering(busy, message)
         if busy and message:
             self.statusBar().showMessage(message)
-        self.setCursor(Qt.CursorShape.BusyCursor if busy else Qt.CursorShape.ArrowCursor)
+        # a busy cursor on every debounced preview render reads as sluggish
+        self.setCursor(Qt.CursorShape.BusyCursor
+                       if (busy and not keep_editable) else Qt.CursorShape.ArrowCursor)
 
     def _on_progress(self, done: int, total: int, label: str) -> None:
         """Determinate render progress (per-clip / per-layer steps)."""
