@@ -249,6 +249,7 @@ class AppController(QObject):
         self._busy = True
         self._pending = on_done
         gen = self._job_gen
+        self.ff.reset_abort()                  # a prior cancel must not block us
         self.busy.emit(True, message)
         worker = _Worker(fn)
         # gen is captured so a result that arrives after a cancel is dropped.
@@ -361,6 +362,7 @@ class AppController(QObject):
             return
         self._busy = True
         gen = self._job_gen
+        self.ff.reset_abort()                  # a prior cancel must not block us
         self.busy.emit(True, "Rendering preview…")
         out = self._dir / "preview.avi"
 

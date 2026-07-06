@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import uuid
 from dataclasses import dataclass, field, fields as _dc_fields
 from datetime import datetime
@@ -217,6 +218,8 @@ class Project:
         self._parsed: Dict[str, AviVideo] = {}     # media_id -> AviVideo (cache)
         self._seg_n: Dict[str, int] = {}           # seg-cache key -> frame count
         self._tmp_assets: Optional[Path] = None    # precomp cache when no assets_dir
+        self._seg_locks: Dict[str, threading.Lock] = {}   # per-key in-flight locks
+        self._seg_locks_mutex = threading.Lock()
         self._ensure_default_structure()
 
     def _ensure_default_structure(self) -> None:
@@ -429,19 +432,69 @@ class Project:
         served from the engine's per-clip cache when its codec+pixel state is
         unchanged -- so editing one clip reuses the others' expensive output
         instead of redoing it. *frames* may be a thunk; it is only called on a
-        cache miss, so a hit also skips the codec-domain mosh entirely."""
+        cache miss, so a hit also skips the codec-domain mosh entirely.
+
+        A per-key lock serialises concurrent builders of the *same* segment
+        (e.g. duplicated clips rendered by parallel workers): the first one
+        computes, the rest wait and take the cache hit."""
         key = self._clip_seg_key(engine, clip, media_state)
-        cached = engine.seg_cache_get(key)
-        n = self._seg_n.get(key)
-        if cached is not None and n is not None:
-            return cached, n
-        frames = frames() if callable(frames) else frames
-        self._seg_n[key] = len(frames)
-        if cached is not None:                     # AVI cached, count forgotten
-            return cached, len(frames)
-        seg = engine.write_moshed(frames, media, engine._tmp(".avi"))
-        seg = self._clip_pixels(engine, clip, seg, len(frames))
-        return engine.seg_cache_put(key, seg), len(frames)
+        with self._seg_lock_for(key):
+            cached = engine.seg_cache_get(key)
+            n = self._seg_n.get(key)
+            if cached is not None and n is not None:
+                return cached, n
+            frames = frames() if callable(frames) else frames
+            self._seg_n[key] = len(frames)
+            if cached is not None:                 # AVI cached, count forgotten
+                return cached, len(frames)
+            seg = engine.write_moshed(frames, media, engine._tmp(".avi"))
+            seg = self._clip_pixels(engine, clip, seg, len(frames))
+            return engine.seg_cache_put(key, seg), len(frames)
+
+    def _seg_lock_for(self, key: str) -> threading.Lock:
+        with self._seg_locks_mutex:
+            if len(self._seg_locks) > 512 and key not in self._seg_locks:
+                self._seg_locks.clear()            # bound the registry
+            return self._seg_locks.setdefault(key, threading.Lock())
+
+    def _parallel_segments(self, engine: MoshEngine, tasks, *, progress=None,
+                           steps=None, noun: str = "clip") -> List:
+        """Run per-clip segment builders and return their results in order.
+
+        The heavy stages are ffmpeg subprocesses (which release the GIL), so
+        with ``engine.seg_workers > 1`` the tasks fan out across a thread pool;
+        the engine's tmp counter, segment cache and motion-RGB cache are locked
+        for exactly this. Falls back to the serial loop for one worker/task.
+        The first failing task aborts the render (its exception propagates)."""
+        n = len(tasks)
+        total = steps if steps is not None else n + 1
+        workers = min(int(getattr(engine, "seg_workers", 1) or 1), n)
+        if workers <= 1:
+            out = []
+            for i, task in enumerate(tasks):
+                if progress:
+                    progress(i, total, f"Rendering {noun} {i + 1}/{n}…")
+                out.append(task())
+            return out
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        if progress:
+            progress(0, total, f"Rendering {n} {noun}s ({workers} workers)…")
+        results: List = [None] * n
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="moshit-seg") as ex:
+            futs = {ex.submit(task): i for i, task in enumerate(tasks)}
+            try:
+                for f in as_completed(futs):
+                    results[futs[f]] = f.result()
+                    done += 1
+                    if progress:
+                        progress(done, total, f"Rendered {noun} {done}/{n}…")
+            except BaseException:
+                for f in futs:                     # drop work that hasn't started
+                    f.cancel()
+                raise
+        return results
 
     def _alpha_matte_segment(self, engine: MoshEngine, clip: Clip, motion=None):
         """An aligned grayscale alpha-map segment for *clip*, or None.
@@ -1005,21 +1058,25 @@ class Project:
         # Codec-domain stage. On the finish path the mosh runs lazily inside
         # _clip_seg, so a segment-cache hit skips it entirely; the fast path
         # concatenates coded frames directly, so it always needs them.
-        segs: List = []                            # (clip, media, seg|frames, n)
-        template: Optional[AviVideo] = None
         steps = len(clips) + 1                     # per-clip work + assembly
-        for k, c in enumerate(clips):
-            if progress:
-                progress(k, steps, f"Rendering clip {k + 1}/{len(clips)}…")
-            media = self._parsed_media(c.media_id)
-            if template is None:
-                template = media
-            if needs_finish:
-                seg, n = self._clip_seg(
-                    engine, c, lambda c=c, media=media: moshed(c, media),
-                    media, media_state)
-                segs.append((c, media, seg, n))
-            else:
+        entries = [(c, self._parsed_media(c.media_id)) for c in clips]  # serial
+        template: Optional[AviVideo] = entries[0][1] if entries else None
+        if needs_finish:
+            # Segment building is dominated by ffmpeg subprocess work, so fan
+            # the clips out across the engine's worker threads (P17).
+            tasks = [
+                (lambda c=c, media=media: self._clip_seg(
+                    engine, c, lambda: moshed(c, media), media, media_state))
+                for c, media in entries]
+            results = self._parallel_segments(engine, tasks,
+                                              progress=progress, steps=steps)
+            segs = [(c, media, seg, n)                 # (clip, media, seg, n)
+                    for (c, media), (seg, n) in zip(entries, results)]
+        else:                                      # pure-Python concat: serial
+            segs = []
+            for k, (c, media) in enumerate(entries):
+                if progress:
+                    progress(k, steps, f"Rendering clip {k + 1}/{len(clips)}…")
                 frames = moshed(c, media)
                 segs.append((c, media, frames, len(frames)))
 
@@ -1069,40 +1126,45 @@ class Project:
         if total <= 0:
             raise ValueError("empty composition")
 
-        layers: List[Dict] = []
-        track_seqs: List[List] = []                # per enabled track: [(clip,start,length,trans)]
         motion = self._motion_frames()             # shared by every clip below
         media_state = self._media_state()
-        nclips = sum(len(lay) for lay in layouts.values())
-        steps, k = nclips + 1, 0                   # per-clip work + composite
-        for t in vtracks:                          # bottom -> top by index
-            seq: List = []
-            for clip, start, length, trans in layouts[t.id]:
-                if progress:
-                    progress(k, steps, f"Rendering layer {k + 1}/{nclips}…")
-                k += 1
-                seg, seglen = self._clip_segment(engine, clip, motion,
-                                                  media_state)
-                lm = clip.layer_mask
-                # a source-file alpha matte pulls in the clip's aligned alpha map
-                mask_input = (self._alpha_matte_segment(engine, clip, motion)
-                              if lm and lm.get("source") == "alpha" else None)
-                layers.append({"input": seg, "start": int(start),
-                               "length": seglen, "opacity": float(clip.opacity),
-                               "blend": clip.blend_mode, "head_fade": int(trans),
-                               "mask": lm,
-                               "mask_input": str(mask_input) if mask_input else None})
-                seq.append((clip, int(start), seglen, int(trans)))
-            if seq:
-                track_seqs.append(seq)
+        pairs = [(t, clip, int(start), length, int(trans))
+                 for t in vtracks                  # bottom -> top by index
+                 for clip, start, length, trans in layouts[t.id]]
+        steps = len(pairs) + 1                     # per-clip work + composite
+
+        def seg_task(clip):
+            """Segment + (optional) aligned alpha matte for one layer."""
+            seg, seglen = self._clip_segment(engine, clip, motion, media_state)
+            lm = clip.layer_mask
+            mask_input = (self._alpha_matte_segment(engine, clip, motion)
+                          if lm and lm.get("source") == "alpha" else None)
+            return seg, seglen, mask_input
+
+        results = self._parallel_segments(
+            engine, [(lambda clip=clip: seg_task(clip))
+                     for _t, clip, _s, _l, _tr in pairs],
+            progress=progress, steps=steps, noun="layer")
+
+        layers: List[Dict] = []
+        by_track: Dict[str, List] = {}             # track: [(clip,start,len,trans)]
+        for (t, clip, start, _length, trans), (seg, seglen, mask_input) \
+                in zip(pairs, results):
+            layers.append({"input": seg, "start": start,
+                           "length": seglen, "opacity": float(clip.opacity),
+                           "blend": clip.blend_mode, "head_fade": trans,
+                           "mask": clip.layer_mask,
+                           "mask_input": str(mask_input) if mask_input else None})
+            by_track.setdefault(t.id, []).append((clip, start, seglen, trans))
+        track_seqs = [by_track[t.id] for t in vtracks if t.id in by_track]
         if progress:
-            progress(nclips, steps, "Compositing layers…")
+            progress(len(pairs), steps, "Compositing layers…")
         out = engine.composite(layers, out_avi, total_frames=total)
         for lay in layers:                         # consumed
-            for k in ("input", "mask_input"):
-                if lay.get(k):
+            for key in ("input", "mask_input"):
+                if lay.get(key):
                     try:
-                        Path(lay[k]).unlink()
+                        Path(lay[key]).unlink()
                     except OSError:
                         pass
 

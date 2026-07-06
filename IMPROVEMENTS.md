@@ -107,8 +107,14 @@ misc) so commits can reference them. Tick items off as they land.
   media, computed once per render) + `_clip_media_deps()` (own media + flow source +
   `clip_ref`'d op sources; unknown modes fall back to depend-on-everything). Importing
   or touching unrelated media no longer busts other clips' cached segments.
-- [ ] P17: parallel per-clip segment rendering (first make `engine._tmp()` and the
-  seg-cache OrderedDict thread-safe).
+- [x] P17: parallel per-clip segment rendering — `_parallel_segments` fans clips out
+  over `engine.seg_workers` (≤4) threads; `engine._tmp`/seg-cache/motion-RGB-cache
+  locked; per-key in-flight locks in `_clip_seg` keep duplicate-clip dedupe; the
+  GIL-bound flow/raw numpy stage is serialised behind `_pixel_stage_lock` (measured
+  2× SLOWER when run concurrently, and it multiplies peak RAM); cancel now sets an
+  ffmpeg abort flag so queued workers can't spawn post-cancel processes. Measured:
+  parallel output is bit-identical; composite path ~4–8% faster (ffmpeg already
+  saturates cores internally, so process-level wins are modest); no path regressed.
 - [ ] P11: cache the folded finish output keyed on (ordered seg keys + layout).
 - [ ] P13: stream flow/raw stages instead of ~3× whole-clip RAM.
 - [ ] U5: cap preview QImage RAM / decode-on-demand.

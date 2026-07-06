@@ -207,3 +207,61 @@ def test_seg_key_unknown_mode_depends_on_everything(engine, project, make_clip):
     st = Path(m2.intermediate_path).stat()
     os.utime(m2.intermediate_path, (st.st_atime, st.st_mtime + 100))
     assert project._clip_seg_key(engine, clip) != k0   # any media change busts
+
+
+def test_parallel_segments_order_and_errors(project):
+    import time
+    from types import SimpleNamespace
+    eng = SimpleNamespace(seg_workers=4)
+
+    def slow(v, dt):
+        def task():
+            time.sleep(dt)
+            return v
+        return task
+
+    # results come back in submission order even when completion order differs
+    tasks = [slow("a", 0.05), slow("b", 0.0), slow("c", 0.02)]
+    assert project._parallel_segments(eng, tasks) == ["a", "b", "c"]
+
+    # serial fallback (workers=1) preserves behaviour
+    eng1 = SimpleNamespace(seg_workers=1)
+    assert project._parallel_segments(eng1, tasks) == ["a", "b", "c"]
+
+    # the first failing task propagates
+    def boom():
+        raise RuntimeError("segment failed")
+    with pytest.raises(RuntimeError, match="segment failed"):
+        project._parallel_segments(eng, [slow("x", 0.0), boom])
+
+
+def test_parallel_render_matches_serial(engine, project, make_clip, tmp_path):
+    m = project.import_media(engine, make_clip("par.mp4"))
+    for _ in range(3):
+        c = project.add_clip(m.id)
+        c.pixel_effects.append({"name": "rgb_shift", "params": {"amount": 6}})
+
+    engine.seg_workers = 3
+    project.render(engine, tmp_path / "par.avi")
+    engine._seg_cache.clear()                      # force full re-render
+    project._seg_n.clear()
+    engine.seg_workers = 1
+    project.render(engine, tmp_path / "ser.avi")
+
+    w, h = project.config.width, project.config.height
+    a = list(engine.ff.decode_rgb_raw(tmp_path / "par.avi", w, h))
+    b = list(engine.ff.decode_rgb_raw(tmp_path / "ser.avi", w, h))
+    assert len(a) == len(b) and len(a) > 0
+    assert all(x == y for x, y in zip(a, b))       # bit-identical pipeline
+
+
+def test_cancel_blocks_new_ffmpeg_until_reset(engine):
+    from moshit.ffmpeg import FFmpegError
+    ff = engine.ff
+    ff.terminate_active()                          # user hit Cancel
+    with pytest.raises(FFmpegError, match="aborted"):
+        ff._run(["-f", "lavfi", "-i", "color=c=red:s=64x48:d=0.1:r=12",
+                 "-f", "null", "-"], "post-cancel work")
+    ff.reset_abort()                               # next job starts fresh
+    ff._run(["-f", "lavfi", "-i", "color=c=red:s=64x48:d=0.1:r=12",
+             "-f", "null", "-"], "fresh job")

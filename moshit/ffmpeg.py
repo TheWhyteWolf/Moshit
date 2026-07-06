@@ -185,10 +185,16 @@ class FFmpeg:
         # Running ffmpeg subprocesses, so a long render/export can be cancelled.
         self._active_procs: set = set()
         self._proc_lock = threading.Lock()
+        # Once cancelled, refuse NEW subprocesses until the next job resets
+        # this -- parallel segment workers would otherwise keep spawning work
+        # after the kill and drag the cancel out.
+        self._abort = False
 
     # -- process helpers ---------------------------------------------------- #
 
     def _run(self, args: List[str], desc: str) -> str:
+        if self._abort:
+            raise FFmpegError(f"{desc} aborted (job cancelled)")
         proc = subprocess.Popen([self.ffmpeg, "-hide_banner", *args],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True)
@@ -205,7 +211,9 @@ class FFmpeg:
         return err
 
     def terminate_active(self) -> None:
-        """Kill any in-flight ffmpeg subprocess (used to cancel a render/export)."""
+        """Kill any in-flight ffmpeg subprocess (used to cancel a render/export).
+        Also blocks new subprocesses until :meth:`reset_abort` starts a new job."""
+        self._abort = True
         with self._proc_lock:
             procs = list(self._active_procs)
         for proc in procs:
@@ -213,6 +221,10 @@ class FFmpeg:
                 proc.kill()
             except Exception:
                 pass
+
+    def reset_abort(self) -> None:
+        """Clear the cancelled state at the start of a fresh job."""
+        self._abort = False
 
     # detailed, time-static texture so the encoder sees only the transform's
     # motion (a flat source would yield no motion vectors to transfer)

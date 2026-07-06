@@ -14,8 +14,10 @@ The engine is independent of any GUI and is fully exercisable from the CLI.
 from __future__ import annotations
 
 import collections
+import os
 import shutil
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -74,13 +76,25 @@ class MoshEngine:
             collections.OrderedDict()
         self._motion_rgb_bytes = 0
         self._motion_rgb_budget = 512 * 1024 * 1024   # ~512 MB of decoded drivers
+        # Per-clip segment rendering fans out across threads (the heavy stages
+        # are ffmpeg subprocesses, which release the GIL). These locks make the
+        # shared engine state safe to use from those workers.
+        self.seg_workers = max(1, min(4, (os.cpu_count() or 2) - 1))
+        self._tmp_lock = threading.Lock()
+        self._seg_lock = threading.Lock()
+        self._motion_rgb_lock = threading.Lock()
+        # The flow/raw pixel stage is GIL-bound numpy with whole-clip RGB in
+        # RAM: running several at once is *slower* (GIL thrash) and multiplies
+        # peak memory. One at a time; ffmpeg-only work overlaps around it.
+        self._pixel_stage_lock = threading.Lock()
         load_modes()               # ensure built-in + user modes are registered
 
     # -- workspace ---------------------------------------------------------- #
 
     def _tmp(self, suffix: str) -> Path:
-        self._n += 1
-        return self._work / f"_dm{self._n:04d}{suffix}"
+        with self._tmp_lock:
+            self._n += 1
+            return self._work / f"_dm{self._n:04d}{suffix}"
 
     def _pixel_geom(self) -> Tuple[int, int]:
         """Geometry for the pixel-domain stages: full project geometry, unless
@@ -109,35 +123,40 @@ class MoshEngine:
             key = (str(p), st.st_mtime_ns, st.st_size, int(w), int(h))
         except OSError:
             key = None
-        if key is not None:
-            hit = self._motion_rgb_cache.get(key)
-            if hit is not None:
-                self._motion_rgb_cache.move_to_end(key)
-                return hit
-        frames = list(self.ff.decode_rgb_raw(motion_src, w, h))
-        if key is None:
+        # One lock across lookup + decode: parallel segment workers typically
+        # share the same driver clip, so the first decode fills the cache and
+        # the rest wait for a hit instead of decoding the same clip N times.
+        with self._motion_rgb_lock:
+            if key is not None:
+                hit = self._motion_rgb_cache.get(key)
+                if hit is not None:
+                    self._motion_rgb_cache.move_to_end(key)
+                    return hit
+            frames = list(self.ff.decode_rgb_raw(motion_src, w, h))
+            if key is None:
+                return frames
+            self._motion_rgb_cache[key] = frames
+            self._motion_rgb_bytes += sum(len(f) for f in frames)
+            # Evict LRU while over budget, but always keep the just-inserted
+            # entry (an oversized single driver stays until displaced).
+            while (self._motion_rgb_bytes > self._motion_rgb_budget
+                   and len(self._motion_rgb_cache) > 1):
+                _k, old = self._motion_rgb_cache.popitem(last=False)
+                self._motion_rgb_bytes -= sum(len(f) for f in old)
             return frames
-        self._motion_rgb_cache[key] = frames
-        self._motion_rgb_bytes += sum(len(f) for f in frames)
-        # Evict LRU while over budget, but always keep the just-inserted entry
-        # (an oversized single driver stays until the next decode displaces it).
-        while (self._motion_rgb_bytes > self._motion_rgb_budget
-               and len(self._motion_rgb_cache) > 1):
-            _k, old = self._motion_rgb_cache.popitem(last=False)
-            self._motion_rgb_bytes -= sum(len(f) for f in old)
-        return frames
 
     # -- per-clip segment cache --------------------------------------------- #
 
     def seg_cache_get(self, key: str) -> Optional[Path]:
         """The cached segment AVI for *key*, or None. Refreshes its LRU position."""
-        p = self._seg_cache.get(key)
-        if p is not None and Path(p).exists():
-            self._seg_cache.move_to_end(key)
-            return p
-        if p is not None:                          # recorded but the file vanished
-            self._seg_cache.pop(key, None)
-        return None
+        with self._seg_lock:
+            p = self._seg_cache.get(key)
+            if p is not None and Path(p).exists():
+                self._seg_cache.move_to_end(key)
+                return p
+            if p is not None:                      # recorded but the file vanished
+                self._seg_cache.pop(key, None)
+            return None
 
     def seg_cache_put(self, key: str, seg) -> Path:
         """Move segment AVI *seg* into the cache under *key* and return its new
@@ -153,19 +172,21 @@ class MoshEngine:
                 src.replace(dst)                   # atomic move within the work dir
             except OSError:
                 shutil.copyfile(src, dst)
-        self._seg_cache[key] = dst
-        self._seg_cache.move_to_end(key)
+        with self._seg_lock:
+            self._seg_cache[key] = dst
+            self._seg_cache.move_to_end(key)
         return dst
 
     def seg_cache_trim(self) -> None:
         """Evict least-recently-used segments down to the limit. Safe only when no
         render is mid-fold, so the project calls it once a render completes."""
-        while len(self._seg_cache) > self._seg_cache_limit:
-            _old, old_path = self._seg_cache.popitem(last=False)
-            try:
-                Path(old_path).unlink()
-            except OSError:
-                pass
+        with self._seg_lock:
+            while len(self._seg_cache) > self._seg_cache_limit:
+                _old, old_path = self._seg_cache.popitem(last=False)
+                try:
+                    Path(old_path).unlink()
+                except OSError:
+                    pass
 
     def cleanup(self) -> None:
         """Remove the scratch work dir if the engine created it.
@@ -378,21 +399,29 @@ class MoshEngine:
         if not do_flow and not do_raw:
             return Path(seg)
         w, h = self._pixel_geom()
-        frames = list(self.ff.decode_rgb_raw(seg, w, h))
-        if do_flow:
-            motion = self._motion_rgb(motion_src, w, h)
-            frames = flow.transfer_raw(
-                frames, motion, w, h,
-                hold=flow_args.get("hold", True),
-                accumulate=flow_args.get("accumulate", True),
-                strength=float(flow_args.get("strength", 1.0)),
-                preset=self.flow_preset_override or flow_args.get("preset", "fast"),
-                out_len=flow_args.get("out_len"), region=flow_args.get("region"))
-        if do_raw:
-            frames = self._raw_frames(frames, usable, w, h, mask=mask)
-        return self.ff.encode_rgb_raw(frames, out_avi, width=w, height=h,
-                                      fps=self.config.fps,
-                                      qscale=self.config.qscale, gop=self.config.gop)
+        # Serialised across segment workers: the numpy core is GIL-bound (so
+        # concurrency only thrashes) and holds the whole decoded clip in RAM
+        # (so concurrency multiplies the peak). Decode is included to keep the
+        # memory profile identical to a serial render.
+        with self._pixel_stage_lock:
+            frames = list(self.ff.decode_rgb_raw(seg, w, h))
+            if do_flow:
+                motion = self._motion_rgb(motion_src, w, h)
+                frames = flow.transfer_raw(
+                    frames, motion, w, h,
+                    hold=flow_args.get("hold", True),
+                    accumulate=flow_args.get("accumulate", True),
+                    strength=float(flow_args.get("strength", 1.0)),
+                    preset=(self.flow_preset_override
+                            or flow_args.get("preset", "fast")),
+                    out_len=flow_args.get("out_len"),
+                    region=flow_args.get("region"))
+            if do_raw:
+                frames = self._raw_frames(frames, usable, w, h, mask=mask)
+            return self.ff.encode_rgb_raw(frames, out_avi, width=w, height=h,
+                                          fps=self.config.fps,
+                                          qscale=self.config.qscale,
+                                          gop=self.config.gop)
 
     def finish_clips(self, segments, meta, dst):
         """Pixel-domain finish pass: apply per-clip speed/reverse/fade/pixel-FX
