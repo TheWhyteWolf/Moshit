@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import List
 
 from ..avi import Frame
+from ._gop import split_gops
 from .base import MoshContext, MoshMode, Param
 
 
@@ -34,23 +35,11 @@ class PframeReverse(MoshMode):
                 out[pos] = fr
             return out
 
-        # group into [I, P, P, ...] runs and reverse the P-tail of each
-        groups: List[List[Frame]] = []
-        current: List[Frame] = []
-        for f in frames:
-            if f.is_iframe and current:
-                groups.append(current)
-                current = [f]
-            else:
-                current.append(f)
-        if current:
-            groups.append(current)
-
-        out: List[Frame] = []
-        for g in groups:
-            if g and g[0].is_iframe:
-                out.append(g[0])
-                out.extend(reversed(g[1:]))
-            else:
-                out.extend(reversed(g))
+        # per GOP: keep each keyframe as an anchor and reverse only its P-tail;
+        # any lead-in before the first keyframe is reversed as its own run.
+        lead, blocks = split_gops(frames)
+        out: List[Frame] = list(reversed(lead))
+        for block in blocks:
+            out.append(block[0])                     # the keyframe anchor
+            out.extend(reversed(block[1:]))
         return out

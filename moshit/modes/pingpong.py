@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import List
 
 from ..avi import Frame
+from ._gop import map_pframe_runs
 from .base import MoshContext, MoshMode, Param
 
 
@@ -42,16 +43,5 @@ class Pingpong(MoshMode):
             prun = [f for f in frames if f.is_pframe]
             return anchor + self._bounce(prun, tail_only)
 
-        out: List[Frame] = []
-        run: List[Frame] = []
-        for f in frames:
-            if f.is_pframe:
-                run.append(f)
-                continue
-            if run:
-                out.extend(self._bounce(run, tail_only))
-                run = []
-            out.append(f)
-        if run:
-            out.extend(self._bounce(run, tail_only))
-        return out
+        return map_pframe_runs(
+            frames, lambda run, _p, _i: self._bounce(run, tail_only))

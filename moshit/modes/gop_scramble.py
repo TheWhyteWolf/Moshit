@@ -12,6 +12,7 @@ import random
 from typing import List
 
 from ..avi import Frame
+from ._gop import split_gops
 from .base import MoshContext, MoshMode, Param
 
 
@@ -32,15 +33,7 @@ class GopScramble(MoshMode):
 
         # Split into blocks that each begin with an I-frame. Anything before the
         # first keyframe is a lead-in that stays put.
-        lead: List[Frame] = []
-        blocks: List[List[Frame]] = []
-        for f in frames:
-            if f.is_iframe:
-                blocks.append([f])
-            elif blocks:
-                blocks[-1].append(f)
-            else:
-                lead.append(f)
+        lead, blocks = split_gops(frames)
 
         if len(blocks) < 2:
             return list(frames)                      # nothing meaningful to shuffle

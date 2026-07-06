@@ -8,9 +8,10 @@ and back). I-frames stay put as anchors so the clip still decodes.
 """
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List
 
 from ..avi import Frame
+from ._gop import map_pframe_runs
 from .base import MoshContext, MoshMode, Param
 
 
@@ -55,31 +56,17 @@ class PframeStutter(MoshMode):
         length = max(1, int(length))
         start = max(0, int(start))
 
-        def flush(run: List[Tuple[Frame, int, int]]) -> List[Frame]:
+        def stutter_run(run: List[Frame], p_start: int, i_start: int) -> List[Frame]:
+            # A run is contiguous, so the j-th frame's P-index is p_start + j and
+            # its input index (for automation) is i_start + j.
             res: List[Frame] = []
-            for i in range(0, len(run), length):
-                chunk = run[i:i + length]
-                block = [f for f, _p, _fi in chunk]
-                p0, fi0 = chunk[0][1], chunk[0][2]
-                if p0 < start:                 # before the start cursor: passthrough
+            for j in range(0, len(run), length):
+                block = run[j:j + length]
+                if p_start + j < start:        # before the start cursor: passthrough
                     res.extend(block)
                     continue
-                rep = max(1, int(round(ctx.auto("repeats", fi0, repeats))))
+                rep = max(1, int(round(ctx.auto("repeats", i_start + j, repeats))))
                 res.extend(self._emit(block, rep, direction))
             return res
 
-        out: List[Frame] = []
-        run: List[Tuple[Frame, int, int]] = []     # (frame, p_index, input_index)
-        p_seen = 0
-        for fi, f in enumerate(frames):
-            if f.is_pframe:
-                run.append((f, p_seen, fi))
-                p_seen += 1
-                continue
-            if run:
-                out.extend(flush(run))
-                run = []
-            out.append(f)
-        if run:
-            out.extend(flush(run))
-        return out
+        return map_pframe_runs(frames, stutter_run)
