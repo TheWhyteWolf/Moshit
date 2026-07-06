@@ -12,6 +12,7 @@ third-party ones dropped into a plugin directory -- with no GUI changes.
 """
 from __future__ import annotations
 
+import random as _random
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -80,6 +81,30 @@ def _build_evaluator(spec: Dict) -> Callable[[float], float]:
         return keys[-1][1]
 
     return ev
+
+
+def random_params(mode: "MoshMode", current: Optional[Dict[str, Any]] = None,
+                  rng=_random) -> Dict[str, Any]:
+    """A randomised value for each of *mode*'s parameters that has a range or
+    choices; params without one (and ``clip_ref``s) keep their current/default
+    value. *rng* is injectable so callers can seed it for reproducibility.
+
+    Shared by the GUI's per-effect 'randomise' button and the effect dialog."""
+    values = dict(mode.defaults())
+    if current:
+        values.update({k: v for k, v in current.items() if k in values})
+    for p in mode.params:
+        has_range = p.lo is not None and p.hi is not None
+        if p.kind == "int" and has_range:
+            values[p.name] = rng.randint(int(p.lo), int(p.hi))
+        elif p.kind == "float" and has_range:
+            values[p.name] = round(rng.uniform(float(p.lo), float(p.hi)), 2)
+        elif p.kind == "bool":
+            values[p.name] = rng.random() < 0.5
+        elif p.kind == "choice" and p.choices:
+            values[p.name] = rng.choice(list(p.choices))
+        # clip_ref / range-less numeric params keep their current value
+    return values
 
 
 def is_automation(value: Any) -> bool:

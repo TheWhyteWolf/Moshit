@@ -32,6 +32,14 @@ def video_paths_from_mime(mime) -> List[str]:
             if u.isLocalFile() and Path(u.toLocalFile()).suffix.lower()
             in VIDEO_EXTS]
 
+
+def _fit_list_height(lw: QListWidget, *, min_rows: int = 3, max_rows: int) -> None:
+    """Size a list to its contents (bounded), so short stacks don't leave a big
+    empty box and long ones grow instead of scrolling in a tiny fixed pane."""
+    row = lw.sizeHintForRow(0) if lw.count() else 20
+    rows = max(min_rows, min(lw.count(), max_rows))
+    lw.setFixedHeight(rows * max(row, 16) + 2 * lw.frameWidth() + 4)
+
 try:
     from PySide6.QtCore import QUrl
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -247,6 +255,7 @@ class AutoParamWidget(QWidget):
         self.curve_btn.clicked.connect(self._edit_curve)
         self.beats_btn = QPushButton("♪")
         self.beats_btn.setMaximumWidth(26)
+        self.beats_btn.setAccessibleName("Pulse on beats")
         self.beats_btn.setToolTip("Pulse this value on the audio beats")
         self.beats_btn.clicked.connect(self.beatsRequested)
         for w in (self.auto_chk, self.value, self.curve_btn, self.beats_btn):
@@ -598,23 +607,22 @@ class EffectParamDialog(QDialog):
         self.accept()
 
     def _randomise(self) -> None:
-        import random
-        for p in _mode_for(self._kind, self.mode_name).params:
+        from ..modes.base import random_params
+        mode = _mode_for(self._kind, self.mode_name)
+        values = random_params(mode, self.result_params())
+        for p in mode.params:
             w = self._param_widgets.get(p.name)
-            has_range = p.lo is not None and p.hi is not None
-            num = (random.randint(int(p.lo), int(p.hi)) if p.kind == "int"
-                   else round(random.uniform(float(p.lo), float(p.hi)), 2)
-                   ) if has_range else None
+            val = values.get(p.name)
             if isinstance(w, AutoParamWidget):
-                if has_range:
-                    w.set_value(num)
+                if p.lo is not None and p.hi is not None:
+                    w.set_value(val)
             elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
-                if has_range:
-                    w.setValue(num)
+                if p.lo is not None and p.hi is not None:
+                    w.setValue(val)
             elif isinstance(w, QCheckBox):
-                w.setChecked(random.random() < 0.5)
+                w.setChecked(bool(val))
             elif isinstance(w, QComboBox) and p.kind == "choice" and p.choices:
-                w.setCurrentText(str(random.choice(p.choices)))
+                w.setCurrentText(str(val))
 
     def _fill_beats(self, widget) -> None:
         from .. import beats
@@ -638,6 +646,9 @@ class EffectParamDialog(QDialog):
 class MediaLibrary(QWidget):
     importRequested = Signal()                # import one video (role-neutral)
     addToTrackRequested = Signal(str, str)    # media_id, track ("main"|"motion")
+    relinkRequested = Signal()                # relink offline media
+
+    _OFFLINE_ROLE = Qt.ItemDataRole.UserRole + 1
 
     def __init__(self):
         super().__init__()
@@ -647,6 +658,8 @@ class MediaLibrary(QWidget):
         self.list = _MediaList("Import videos — or drop files here")
         self.list.itemDoubleClicked.connect(
             lambda _: self._emit_add("main"))     # double-click → main track
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._show_menu)
         layout.addWidget(self.list, 1)
 
         btn_import = QPushButton("Import video…")
@@ -669,17 +682,41 @@ class MediaLibrary(QWidget):
         if mid:
             self.addToTrackRequested.emit(mid, track)
 
+    def _menu_for(self, item) -> QMenu:
+        """The right-click menu for a library *item* (placement + relink). The
+        actions are wired to their handlers, so tests can trigger them without
+        driving ``exec``."""
+        menu = QMenu(self)
+        self._act_main = menu.addAction("Add to main track")
+        self._act_main.triggered.connect(lambda: self._emit_add("main"))
+        self._act_motion = menu.addAction("Add to motion track")
+        self._act_motion.triggered.connect(lambda: self._emit_add("motion"))
+        self._act_relink = None
+        if item.data(self._OFFLINE_ROLE):
+            menu.addSeparator()
+            self._act_relink = menu.addAction("Relink offline media…")
+            self._act_relink.triggered.connect(self.relinkRequested.emit)
+        return menu
+
+    def _show_menu(self, pos) -> None:
+        item = self.list.itemAt(pos)
+        if item is None:
+            return
+        self.list.setCurrentItem(item)
+        self._menu_for(item).exec(self.list.viewport().mapToGlobal(pos))
+
     def add_media(self, item, offline: bool = False) -> None:
         text = f"{item.label}  ·  {item.nb_frames}f"
         if offline:
             text += "   ⚠ offline"
         entry = QListWidgetItem(text)
         entry.setData(Qt.ItemDataRole.UserRole, item.id)
+        entry.setData(self._OFFLINE_ROLE, bool(offline))
         if offline:
             entry.setForeground(QColor("#e07a5f"))
             entry.setToolTip("Missing cached video:\n"
                              f"{item.intermediate_path}\n"
-                             "Use File → Relink offline media… to restore it.")
+                             "Right-click → Relink, or File → Relink offline media…")
         self.list.addItem(entry)
         self.list.setCurrentItem(entry)
 
@@ -1701,6 +1738,7 @@ class PreviewWidget(QWidget):
         def _tbtn(text: str, tip: str, slot) -> QPushButton:
             b = QPushButton(text)
             b.setToolTip(tip)
+            b.setAccessibleName(tip.split(" (")[0])    # icon glyphs need a name
             b.setMaximumWidth(34)
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # keep keyboard shortcuts working
             b.setEnabled(False)
@@ -1724,6 +1762,7 @@ class PreviewWidget(QWidget):
 
         self.src_btn = QPushButton("Source")
         self.src_btn.setToolTip("Hold to see the clean source frame (A/B)")
+        self.src_btn.setAccessibleName("Hold to compare source")
         self.src_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.src_btn.setEnabled(False)
         self.src_btn.pressed.connect(self.sourceHoldStarted.emit)
@@ -1732,12 +1771,14 @@ class PreviewWidget(QWidget):
         self.fit_btn = QPushButton("Fit")
         self.fit_btn.setToolTip("Fit the frame to the pane "
                                 "(Ctrl+wheel zooms, drag pans when zoomed)")
+        self.fit_btn.setAccessibleName("Fit preview to pane")
         self.fit_btn.setMaximumWidth(34)
         self.fit_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.fit_btn.setEnabled(False)
         self.fit_btn.clicked.connect(lambda: self._scroll.set_zoom(None))
         self.one_btn = QPushButton("1:1")
         self.one_btn.setToolTip("Show at 100% (preview resolution)")
+        self.one_btn.setAccessibleName("Preview at 100%")
         self.one_btn.setMaximumWidth(34)
         self.one_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.one_btn.setEnabled(False)
@@ -1746,6 +1787,7 @@ class PreviewWidget(QWidget):
         self.mute_btn = QPushButton("🔊")
         self.mute_btn.setMaximumWidth(34)
         self.mute_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mute_btn.setAccessibleName("Toggle preview audio")
         self.mute_btn.setToolTip("Preview audio on/off")
         self.mute_btn.clicked.connect(self._toggle_mute)
         self.mute_btn.setVisible(_HAVE_QT_AUDIO)
@@ -2197,7 +2239,8 @@ class InspectorPanel(QWidget):
     effectMoveRequested = Signal(str, int)         # op_id, delta (-1 up / +1 down)
     effectEnabledChanged = Signal(str, bool)       # op_id, enabled
     presetSaveRequested = Signal()                 # save the current stack
-    presetApplyRequested = Signal(str)             # preset name
+    presetApplyRequested = Signal(str, bool)       # preset name, replace?
+    effectRandomiseRequested = Signal(str)         # op_id
     presetDeleteRequested = Signal(str)            # preset name
     pixelFxAddBegin = Signal(str)                  # name -> host appends + opens editor
     pixelFxEditBegin = Signal(int)                 # index -> open a live edit session
@@ -2273,7 +2316,6 @@ class InspectorPanel(QWidget):
         v.setSpacing(3)
 
         self.effect_list = _HintListWidget("No effects yet — use “+ Add ▾”")
-        self.effect_list.setMaximumHeight(140)
         self.effect_list.setToolTip("This clip's effect stack, applied top to "
                                     "bottom. Double-click an effect to edit it; "
                                     "toggle the checkbox to enable/disable.")
@@ -2289,13 +2331,21 @@ class InspectorPanel(QWidget):
         self.add_btn.clicked.connect(self._show_add_menu)
         self.remove_btn = QPushButton("− Remove")
         self.remove_btn.clicked.connect(self._emit_remove)
+        self.dice_btn = QPushButton("🎲")
+        self.dice_btn.setMaximumWidth(32)
+        self.dice_btn.setAccessibleName("Randomise effect")
+        self.dice_btn.setToolTip("Randomise the selected effect's parameters")
+        self.dice_btn.clicked.connect(self._emit_randomise)
         self.up_btn = QPushButton("↑")
         self.up_btn.setMaximumWidth(32)
+        self.up_btn.setAccessibleName("Move effect up")
         self.up_btn.clicked.connect(lambda: self._emit_move(-1))
         self.down_btn = QPushButton("↓")
         self.down_btn.setMaximumWidth(32)
+        self.down_btn.setAccessibleName("Move effect down")
         self.down_btn.clicked.connect(lambda: self._emit_move(1))
-        for b in (self.add_btn, self.remove_btn, self.up_btn, self.down_btn):
+        for b in (self.add_btn, self.remove_btn, self.dice_btn,
+                  self.up_btn, self.down_btn):
             stack_btns.addWidget(b)
         v.addLayout(stack_btns)
 
@@ -2305,11 +2355,20 @@ class InspectorPanel(QWidget):
         self.preset_save_btn = QPushButton("Save…")
         self.preset_save_btn.setToolTip("Save this clip's effect stack as a preset")
         self.preset_save_btn.clicked.connect(lambda: self.presetSaveRequested.emit())
-        self.preset_apply_btn = QPushButton("Apply")
-        self.preset_apply_btn.setToolTip("Replace this clip's stack with the preset")
-        self.preset_apply_btn.clicked.connect(self._emit_apply_preset)
+        self.preset_apply_btn = QPushButton("Apply ▾")
+        self.preset_apply_btn.setToolTip("Apply the preset — replace this clip's "
+                                         "stack, or append to it")
+        apply_menu = QMenu(self.preset_apply_btn)
+        self._apply_replace_act = apply_menu.addAction("Replace stack")
+        self._apply_replace_act.triggered.connect(
+            lambda: self._emit_apply_preset(replace=True))
+        self._apply_append_act = apply_menu.addAction("Append to stack")
+        self._apply_append_act.triggered.connect(
+            lambda: self._emit_apply_preset(replace=False))
+        self.preset_apply_btn.setMenu(apply_menu)
         self.preset_del_btn = QPushButton("✕")
         self.preset_del_btn.setMaximumWidth(30)
+        self.preset_del_btn.setAccessibleName("Delete preset")
         self.preset_del_btn.setToolTip("Delete the selected preset")
         self.preset_del_btn.clicked.connect(self._emit_delete_preset)
         preset_row.addWidget(QLabel("Preset"))
@@ -2437,7 +2496,6 @@ class InspectorPanel(QWidget):
         v.setSpacing(3)
 
         self.pixel_list = _HintListWidget("No pixel FX")
-        self.pixel_list.setMaximumHeight(72)
         self.pixel_list.setToolTip("Pixel filters, applied after the mosh stack "
                                    "and the speed/fade finishing. Double-click to "
                                    "edit one.")
@@ -2466,6 +2524,7 @@ class InspectorPanel(QWidget):
         for pe in self._pixel_fx:
             self.pixel_list.addItem(pe.get("name", ""))
         self._populating = False
+        _fit_list_height(self.pixel_list, max_rows=8)
         row = (prev if 0 <= prev < len(self._pixel_fx)
                else (len(self._pixel_fx) - 1 if self._pixel_fx else -1))
         if row >= 0:
@@ -2524,7 +2583,6 @@ class InspectorPanel(QWidget):
         v.setSpacing(3)
 
         self.raw_list = _HintListWidget("No raw FX")
-        self.raw_list.setMaximumHeight(72)
         self.raw_list.setToolTip("Per-pixel effects applied to decoded frames "
                                  "(needs numpy); run before the FFmpeg pixel FX. "
                                  "Double-click to edit one.")
@@ -2554,6 +2612,7 @@ class InspectorPanel(QWidget):
         for re in self._raw_fx:
             self.raw_list.addItem(re.get("name", ""))
         self._populating = False
+        _fit_list_height(self.raw_list, max_rows=8)
         row = (prev if 0 <= prev < len(self._raw_fx)
                else (len(self._raw_fx) - 1 if self._raw_fx else -1))
         if row >= 0:
@@ -2903,6 +2962,7 @@ class InspectorPanel(QWidget):
             if not enabled:
                 item.setForeground(QColor("#6a7280"))
             self.effect_list.addItem(item)
+        _fit_list_height(self.effect_list, max_rows=12)
         row = next((i for i, e in enumerate(self._effects) if e["id"] == prev), -1)
         if row < 0 and self._effects:
             row = len(self._effects) - 1          # default to the newest
@@ -2984,6 +3044,7 @@ class InspectorPanel(QWidget):
         has_sel = self._selected_op is not None and has_clip
         self.add_btn.setEnabled(has_clip)
         self.remove_btn.setEnabled(has_sel)
+        self.dice_btn.setEnabled(has_sel)
         idx = next((i for i, e in enumerate(self._effects)
                     if e["id"] == self._selected_op), -1)
         self.up_btn.setEnabled(has_sel and idx > 0)
@@ -3005,10 +3066,10 @@ class InspectorPanel(QWidget):
             self.preset_combo.setCurrentText(cur)
         self.preset_combo.blockSignals(False)
 
-    def _emit_apply_preset(self) -> None:
+    def _emit_apply_preset(self, *, replace: bool = True) -> None:
         name = self.preset_combo.currentText()
         if name:
-            self.presetApplyRequested.emit(name)
+            self.presetApplyRequested.emit(name, replace)
 
     def _emit_delete_preset(self) -> None:
         name = self.preset_combo.currentText()
@@ -3018,6 +3079,10 @@ class InspectorPanel(QWidget):
     def _emit_remove(self) -> None:
         if self._selected_op:
             self.effectRemoveRequested.emit(self._selected_op)
+
+    def _emit_randomise(self) -> None:
+        if self._selected_op:
+            self.effectRandomiseRequested.emit(self._selected_op)
 
     def _emit_move(self, delta: int) -> None:
         if self._selected_op:

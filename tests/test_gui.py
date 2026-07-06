@@ -1282,6 +1282,120 @@ def test_presets_save_and_apply(win):
     assert [e["mode"] for e in ctl.clip_effects("c2")] == ["bitrot"]
 
 
+def test_random_params_respects_schema():
+    import random
+    from moshit.modes import get_mode, load_modes
+    load_modes()
+    from moshit.modes.base import random_params
+    mode = get_mode("iframe_removal")               # bool + int-range params
+    rng = random.Random(123)
+    vals = random_params(mode, rng=rng)
+    assert set(vals) == {p.name for p in mode.params}
+    assert isinstance(vals["keep_first"], bool)
+    assert 0 <= vals["keep_every"] <= 240           # its declared range
+    # a clip_ref-style param without a range keeps the current value
+    from moshit.modes.base import Param, MoshMode
+
+    class _Ref(MoshMode):
+        name = "_t_ref_mode"
+        params = [Param("source", "clip_ref", "keep-me"),
+                  Param("amt", "float", 0.0, lo=0.0, hi=1.0)]
+
+        def apply(self, frames, ctx, **p):
+            return frames
+    got = random_params(get_mode("_t_ref_mode"), {"source": "keep-me"})
+    assert got["source"] == "keep-me" and 0.0 <= got["amt"] <= 1.0
+    # seeded determinism
+    assert random_params(mode, rng=random.Random(7)) == \
+        random_params(mode, rng=random.Random(7))
+
+
+def test_randomise_effect_updates_and_undoes(ctl):
+    _seed_clip(ctl, "c")
+    op = ctl.add_effect("c", "iframe_removal",
+                        {"keep_first": True, "keep_every": 0})
+    op.region_start, op.region_end = 2, 5
+    depth = len(ctl._undo)
+    ctl.randomise_effect(op.id)
+    params = ctl.clip_effects("c")[0]["params"]
+    assert 0 <= params["keep_every"] <= 240
+    assert (op.region_start, op.region_end) == (2, 5)   # region preserved
+    assert len(ctl._undo) == depth + 1                  # one undo step
+    ctl.undo()
+    assert ctl.clip_effects("c")[0]["params"] == {"keep_first": True,
+                                                  "keep_every": 0}
+
+
+def test_preset_apply_menu_replace_and_append(win):
+    ctl = win.controller
+    _seed_clip(ctl, "c1")
+    ctl.add_effect("c1", "bitrot", {"intensity": 0.4})
+    assert ctl.save_stack_as_preset("c1", "p")
+    win.inspector.set_presets(ctl.preset_names())
+    _seed_clip(ctl, "c2")
+    win._selected_clip = "c2"
+    ctl.add_effect("c2", "pframe_drop", {})
+    win.inspector.preset_combo.setCurrentText("p")
+    win.inspector._apply_append_act.trigger()            # append: keep + add
+    assert [e["mode"] for e in ctl.clip_effects("c2")] == ["pframe_drop", "bitrot"]
+    win.inspector._apply_replace_act.trigger()           # replace: just the preset
+    assert [e["mode"] for e in ctl.clip_effects("c2")] == ["bitrot"]
+
+
+def test_effect_list_grows_with_content(qapp):
+    from moshit.gui.widgets import InspectorPanel
+    insp = InspectorPanel()
+    insp.set_enabled_for_clip("c", "clip", effects=[])
+    empty_h = insp.effect_list.height()
+    one = [{"id": "o0", "mode": "bitrot", "params": {}, "enabled": True,
+            "region": None}]
+    insp.set_clip_effects(one)
+    small_h = insp.effect_list.height()
+    def rows(n):
+        insp.set_clip_effects(
+            [{"id": f"o{i}", "mode": "bitrot", "params": {}, "enabled": True,
+              "region": None} for i in range(n)])
+        return insp.effect_list.height()
+    grown_h = rows(9)
+    assert empty_h > 0 and grown_h > small_h            # grows with content
+    assert rows(20) == rows(30)                         # capped at max_rows (12)
+    assert rows(30) < grown_h * 3                        # bounded, not 30 rows tall
+
+
+def test_library_context_menu_actions(qapp):
+    from moshit.gui.widgets import MediaLibrary
+    from moshit.project import MediaItem
+    lib = MediaLibrary()                                # bare: no modal relink dialog
+    lib.add_media(MediaItem(id="on1", source_path="x", label="online",
+                            role="main", intermediate_path="x", nb_frames=5))
+    menu = lib._menu_for(lib.list.item(0))
+    labels = [a.text() for a in menu.actions() if a.text()]
+    assert labels == ["Add to main track", "Add to motion track"]
+    assert lib._act_relink is None                      # online: no relink
+    placed = []
+    lib.addToTrackRequested.connect(lambda mid, tr: placed.append((mid, tr)))
+    lib._act_main.trigger()
+    assert placed == [("on1", "main")]                  # menu action -> signal
+    lib.add_media(MediaItem(id="off1", source_path="x", label="gone",
+                            role="main", intermediate_path="/no/where.avi",
+                            nb_frames=5), offline=True)
+    menu2 = lib._menu_for(lib.list.item(1))
+    assert any(a.text() == "Relink offline media…" for a in menu2.actions())
+    got = []
+    lib.relinkRequested.connect(lambda: got.append(1))
+    lib._act_relink.trigger()
+    assert got == [1]
+
+
+def test_icon_buttons_have_accessible_names(win):
+    pv = win.preview
+    insp = win.inspector
+    for b in (pv.mute_btn, pv.src_btn, pv.fit_btn, pv.one_btn,
+              pv.start_btn, pv.prev_btn, pv.next_btn, pv.end_btn,
+              insp.dice_btn, insp.up_btn, insp.down_btn, insp.preset_del_btn):
+        assert b.accessibleName(), f"{b.objectName() or b.text()} has no a11y name"
+
+
 def test_live_effect_edit_coalesces_undo(ctl):
     # A drag fires many live updates; they must fold into ONE undo entry.
     _seed_clip(ctl, "c")

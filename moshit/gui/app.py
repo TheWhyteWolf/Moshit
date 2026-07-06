@@ -499,12 +499,15 @@ class MainWindow(QMainWindow):
         h.addWidget(QLabel("Zoom:"))
         btn_zo = QPushButton("−")
         btn_zo.setToolTip("Zoom out (-)")
+        btn_zo.setAccessibleName("Zoom timeline out")
         btn_zo.clicked.connect(self.timeline_pane.zoom_out)
         btn_zi = QPushButton("+")
         btn_zi.setToolTip("Zoom in (=)  ·  Ctrl+wheel zooms at the cursor")
+        btn_zi.setAccessibleName("Zoom timeline in")
         btn_zi.clicked.connect(self.timeline_pane.zoom_in)
         btn_fit = QPushButton("Fit")
         btn_fit.setToolTip("Fit the whole sequence to the pane (0)")
+        btn_fit.setAccessibleName("Fit timeline to pane")
         btn_fit.clicked.connect(self.timeline_pane.zoom_fit)
         self.zoom_label = QLabel("1.0×")
         self.zoom_label.setMinimumWidth(38)
@@ -543,6 +546,7 @@ class MainWindow(QMainWindow):
         c = self.controller
         self.library.importRequested.connect(self._import)
         self.library.addToTrackRequested.connect(self._add_to_timeline)
+        self.library.relinkRequested.connect(self._relink_offline_media)
 
         c.media_added.connect(self.library.add_media)
         c.media_relinked.connect(lambda _items: self._reload_library())
@@ -590,6 +594,7 @@ class MainWindow(QMainWindow):
         self.inspector.effectEditEnd.connect(self._on_effect_edit_end)
         self.inspector.effectRemoveRequested.connect(self.controller.remove_effect)
         self.inspector.effectMoveRequested.connect(self.controller.move_effect)
+        self.inspector.effectRandomiseRequested.connect(self._on_effect_randomise)
         self.inspector.effectEnabledChanged.connect(self.controller.set_effect_enabled)
         self.inspector.presetSaveRequested.connect(self._on_preset_save)
         self.inspector.presetApplyRequested.connect(self._on_preset_apply)
@@ -743,11 +748,17 @@ class MainWindow(QMainWindow):
             if self.controller.save_stack_as_preset(self._selected_clip, name.strip()):
                 self.inspector.set_presets(self.controller.preset_names())
 
-    def _on_preset_apply(self, name: str) -> None:
+    def _on_preset_apply(self, name: str, replace: bool = True) -> None:
         if not self._selected_clip:
             self.statusBar().showMessage("Select a clip to apply the preset to.")
             return
-        self.controller.apply_preset(self._selected_clip, name)
+        self.controller.apply_preset(self._selected_clip, name, replace=replace)
+        self._schedule_auto_refresh(immediate=True)
+
+    def _on_effect_randomise(self, op_id: str) -> None:
+        self.controller.randomise_effect(op_id)
+        if self._selected_clip:                    # refresh the inspector body
+            self._on_clip_selected(self._selected_clip)
         self._schedule_auto_refresh(immediate=True)
 
     def _on_preset_delete(self, name: str) -> None:

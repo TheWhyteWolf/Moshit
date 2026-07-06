@@ -1154,6 +1154,21 @@ class AppController(QObject):
         self.project_changed.emit()
         self.status.emit("Removed effect")
 
+    def randomise_effect(self, op_id: str) -> None:
+        """Randomise a mosh op's parameters (one undo step). Values come from the
+        mode's Param schema, so they stay in range and honour choices/bools."""
+        from ..modes import get_mode
+        from ..modes.base import random_params
+        try:
+            op = self.project.op(op_id)
+            mode = get_mode(op.mode)
+        except KeyError:
+            return
+        params = random_params(mode, op.params)
+        region = ((op.region_start, op.region_end)
+                  if (op.region_start or op.region_end is not None) else None)
+        self.update_effect(op_id, op.mode, params, region)   # one undo step
+
     def move_effect(self, op_id: str, delta: int) -> None:
         snap = self._snapshot()
         if not self.project.move_mosh(op_id, delta):

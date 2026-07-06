@@ -88,13 +88,19 @@ through the preview (it also tracks playback). Two tools sit in a strip directly
 under the timeline:
 
 - **Pointer** — drag a clip's body to move it in time (free positioning; gaps
-  and overlaps allowed), or drag either edge to trim its start or end.
+  and overlaps allowed), or drag either edge to trim its start or end. Dragging
+  **snaps** to nearby clip edges, the playhead and the start (hold **Alt** to
+  place freely), and a ghost shows exactly where the clip will land.
 - **Cut** — click a clip to split it at that frame into two clips.
 
-You can also **split at the playhead** (`S`, or Edit → Split at playhead) and
-**duplicate** a clip with its effect (`Ctrl+D`, or right-click → Duplicate);
-right-click a clip for those plus Remove. Delete (or right-click → Remove) takes
-a clip off the timeline. **Undo** and **Redo** (Ctrl+Z / Ctrl+Shift+Z, under the
+Bring footage in by **dropping video files** anywhere on the window (they import
+as one batch), and **drag a clip from the media library straight onto a track**
+to place it at that point — with the same snapping, so clips butt cleanly.
+Clips carrying mosh effects show an **≋N** badge, and a melting Easy-mode cut
+shows an orange notch on its left edge. You can also **split at the playhead**
+(`S`, or Edit → Split at playhead) and **duplicate** a clip with its effect
+(`Ctrl+D`, or right-click → Duplicate); right-click a clip for those plus
+Remove. Delete (or right-click → Remove) takes a clip off the timeline. **Undo** and **Redo** (Ctrl+Z / Ctrl+Shift+Z, under the
 Edit menu) cover timeline and effect edits — add, move, trim, cut, duplicate,
 remove, and effect changes. Baking is a commit point: it starts a fresh undo
 history, and is separately reversible with **Revert bake**. Edits re-render the
@@ -124,8 +130,13 @@ jump-to-start/end (`Home` / `End`), a **Loop** toggle, a timecode readout
 (`frame / frame · mm:ss:ff`), and a **🔊** toggle that plays the assembled
 **audio** in sync with playback (built lazily and cached, so most edits don't
 rebuild it; needs PySide6's QtMultimedia, otherwise the toggle is hidden).
-**File → Save frame as image…** (`Ctrl+Shift+S`) writes the current frame as a
-full-resolution PNG.
+Press **I** / **O** to mark a **loop sub-range** at the playhead (looping then
+repeats just that span; **Shift+I** clears it), and it shows as a band on the
+scrub bar. Hold **Source** to flash the clean, un-moshed frame under the
+playhead for an **A/B** comparison. The frame **fits** the pane by default;
+**Ctrl+wheel** zooms (**1:1** and **Fit** buttons reset it) and you drag to pan
+when zoomed in. **File → Save frame as image…** (`Ctrl+Shift+F`) writes the
+current frame as a full-resolution PNG.
 
 **Sequence settings.** Every clip is normalised to one resolution and frame rate
 on import, so you pick them up front: **New project** (`Ctrl+N`) opens a settings
@@ -148,10 +159,12 @@ dissolve — the same region the renderer blends.
 glitches compound (e.g. `pframe_duplicate` → `bitrot` → `pframe_shuffle`). The
 inspector lists the stack: **+ Add** appends the effect configured below, **↑/↓**
 reorder it (order changes the look), the per-row checkbox enables/disables an
-effect without removing it, and **− Remove** deletes it. Select a row to edit that
-effect's mode and parameters, then **Apply to selected effect**. **Bake stack**
-freezes the whole chain into one clip (reversible), leaving the clip's finishing
-editable.
+effect without removing it, **🎲** re-rolls the selected effect's parameters
+(within each parameter's range) for quick happy accidents, and **− Remove**
+deletes it. Select a row to edit that effect's mode and parameters. Saved
+**presets** can be applied to a clip either way — **Apply ▾** offers *Replace
+stack* or *Append to stack*. **Bake stack** freezes the whole chain into one clip
+(reversible), leaving the clip's finishing editable.
 
 **Parameter automation.** Numeric parameters that an effect marks *automatable*
 get an **A** toggle in the inspector. Switch it on and **Curve…** opens a keyframe

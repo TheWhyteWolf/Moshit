@@ -135,9 +135,28 @@ misc) so commits can reference them. Tick items off as they land.
   borrowed `AviVideo` references stay valid.
 
 ### Wave 5 — polish backlog (pick opportunistically)
-- [ ] U27: A/B compare (moshed vs original) in preview.
-- [ ] U28/U29: preview zoom/1:1/pan; sub-range loop.
-- [ ] U11/U12/U13: multi-select, snapping, copy/paste of clips + effect stacks.
+- [x] U27: A/B compare — hold "Source" flashes the clean source frame under the
+  playhead (`controller.source_frame_for` maps preview→source through the base
+  track layout, trim/speed/reverse aware; `fetch_source_frame` decodes one frame
+  on a dedicated FFmpeg, LRU-cached). Playback pauses while held.
+- [x] U28/U29: preview zoom/1:1/pan (`_PreviewView` scroll area; Ctrl+wheel 0.25–8×,
+  drag-pan, Fit/1:1 buttons; busy badge pinned to the viewport) + sub-range loop
+  (I/O markers drawn on a `_LoopSlider`; `_advance` wraps the range; stale range
+  cleared on a shorter re-render).
+- [~] U11/U12/U13: **U12 snapping done** — drag/trim snap to clip edges/playhead/0
+  (`_snap_adjust`, 12px, Alt bypasses) with a ghost + snap-line, reused by the
+  library→timeline drop. Still open: multi-select (U11), copy/paste (U13).
+- [x] **Drag & drop + timeline legibility** (new): drop video files anywhere to
+  batch-import (`controller.import_media_batch`); drag library media onto a lane
+  to place at a snapped frame (`place_clip_at`, Easy-mode aware, one undo step);
+  clips show an ≋N mosh-op badge and an orange melt-junction notch.
+  Follow-up (B3): OS file dropped *onto a lane* imports but doesn't auto-place
+  (needs async import→place chaining); import-anywhere already works.
+- [x] U21/U22/U31/U32/U17: preset **Apply ▾** (Replace/Append; `apply_preset` already
+  took `replace=`); per-effect **🎲** randomise (`random_params` in modes/base.py +
+  `controller.randomise_effect`, one undo step); effect/pixel/raw lists grow to fit
+  (`_fit_list_height`); library empty-state hint + right-click menu (add/relink);
+  `setAccessibleName` on the icon-only buttons.
 - [ ] U15: undo survives bake/flow; undo labels.
 - [ ] U1/U3/U4: beat detection off the UI thread; queue edits during renders; stop
   greying the whole inspector.
