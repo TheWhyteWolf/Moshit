@@ -1333,7 +1333,7 @@ class PreviewWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._frames: List[QImage] = []
+        self._frames: List[bytes] = []        # JPEG-encoded preview frames
         self._fps = 30.0
         self._idx = 0
         self._restore_frac: Optional[float] = None
@@ -1533,9 +1533,14 @@ class PreviewWidget(QWidget):
         return self._idx
 
     def current_image(self) -> Optional[QImage]:
-        return self._frames[self._idx] if self._frames else None
+        return self._image(self._idx) if self._frames else None
 
-    def set_frames(self, frames: List[QImage], fps: float) -> None:
+    def _image(self, idx: int) -> QImage:
+        """Decode one frame on demand — frames are stored as JPEG bytes
+        (~7-10× smaller than QImages), so a long preview stays in budget."""
+        return QImage.fromData(self._frames[idx], "JPG")
+
+    def set_frames(self, frames: List[bytes], fps: float) -> None:
         """Replace all frames at once, keeping the scrub position if possible."""
         frac = self._current_fraction()
         self.timer.stop()
@@ -1569,7 +1574,7 @@ class PreviewWidget(QWidget):
         self.slider.setEnabled(False)
         self._set_transport_enabled(False)
 
-    def append_frames(self, frames: List[QImage]) -> None:
+    def append_frames(self, frames: List[bytes]) -> None:
         if not frames:
             return
         was_empty = not self._frames
@@ -1617,7 +1622,7 @@ class PreviewWidget(QWidget):
             return
         idx = max(0, min(idx, len(self._frames) - 1))
         self._idx = idx
-        pix = QPixmap.fromImage(self._frames[idx])
+        pix = QPixmap.fromImage(self._image(idx))
         self.view.setPixmap(pix.scaled(
             self.view.size(), Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation))

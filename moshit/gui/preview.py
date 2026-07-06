@@ -1,10 +1,13 @@
 """Preview frame decoding for the GUI.
 
-Decodes a moshed AVI into QImages by piping raw RGB frames out of ffmpeg, scaled
-to a preview width to keep memory reasonable. This avoids a PyAV dependency --
-ffmpeg is already required by the engine. Decoding is linear (a moshed stream has
-no reliable keyframes to seek to), and frames are streamed out in batches so the
-UI can show the preview building up instead of blocking until it is complete.
+Decodes a moshed AVI by piping raw RGB frames out of ffmpeg, scaled to a
+preview width. Frames are handed out as JPEG-encoded bytes (~7-10x smaller
+than raw QImages, compressed here on the worker thread at <1ms/frame) so a
+long preview no longer pins hundreds of MB of RAM; the preview widget decodes
+the frame under the playhead on demand (~1ms). This avoids a PyAV dependency --
+ffmpeg is already required by the engine. Decoding is linear (a moshed stream
+has no reliable keyframes to seek to), and frames are streamed out in batches
+so the UI can show the preview building up instead of blocking until complete.
 """
 from __future__ import annotations
 
@@ -12,9 +15,23 @@ import subprocess
 from pathlib import Path
 from typing import Callable, List, Tuple
 
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QImage
 
 from ..avi import parse_avi
+
+JPEG_QUALITY = 88
+
+
+def encode_preview_frame(rgb: bytes, w: int, h: int) -> bytes:
+    """Compress one raw RGB24 frame to JPEG bytes (worker-thread cheap)."""
+    img = QImage(rgb, w, h, w * 3, QImage.Format.Format_RGB888)
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "JPG", JPEG_QUALITY)
+    buf.close()
+    return bytes(ba)
 
 
 class PreviewDecoder:
@@ -46,9 +63,9 @@ class PreviewDecoder:
         return w, h, fps, total
 
     def decode(self, avi_path, max_width: int = 720
-               ) -> Tuple[List[QImage], float, Tuple[int, int]]:
+               ) -> Tuple[List[bytes], float, Tuple[int, int]]:
         """Decode the whole clip at once. Used for tests/synchronous callers."""
-        frames: List[QImage] = []
+        frames: List[bytes] = []
         w = h = 0
         fps = 30.0
 
@@ -62,13 +79,14 @@ class PreviewDecoder:
         return frames, fps, (w, h)
 
     def decode_stream(self, avi_path, emit_begin: Callable[[int, float], None],
-                      emit_batch: Callable[[List[QImage]], None],
+                      emit_batch: Callable[[List[bytes]], None],
                       max_width: int = 720, batch: int = 8) -> None:
         """Stream-decode *avi_path*.
 
         Calls ``emit_begin(total_frames, fps)`` once, then ``emit_batch(frames)``
-        repeatedly as frames are decoded. Safe to call on a worker thread; the
-        emit callbacks are expected to marshal to the UI thread.
+        repeatedly with JPEG-encoded frames as they are decoded. Safe to call on
+        a worker thread; the emit callbacks are expected to marshal to the UI
+        thread.
         """
         w, h, fps, total = self._dims(avi_path, max_width)
         emit_begin(total, fps)
@@ -84,7 +102,7 @@ class PreviewDecoder:
         self._proc = proc
         try:
             buf = b""
-            pending: List[QImage] = []
+            pending: List[bytes] = []
             read_size = frame_bytes * batch
             while True:
                 data = proc.stdout.read(read_size)
@@ -93,9 +111,7 @@ class PreviewDecoder:
                 buf += data
                 while len(buf) >= frame_bytes:
                     chunk, buf = buf[:frame_bytes], buf[frame_bytes:]
-                    img = QImage(chunk, w, h, w * 3,
-                                 QImage.Format.Format_RGB888).copy()
-                    pending.append(img)
+                    pending.append(encode_preview_frame(chunk, w, h))
                 if pending:
                     emit_batch(pending)
                     pending = []

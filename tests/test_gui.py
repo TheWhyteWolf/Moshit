@@ -483,6 +483,28 @@ def test_progress_bar_and_rendering_badge(win, qapp):
     win.hide()
 
 
+def test_preview_frames_stored_compressed(qapp, tmp_path):
+    import subprocess
+    from moshit.gui.preview import PreviewDecoder
+    from moshit.gui.widgets import PreviewWidget
+    src = tmp_path / "t.avi"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "testsrc=size=160x120:rate=12:duration=1",
+                    "-c:v", "mpeg4", "-y", str(src)], check=True)
+    dec = PreviewDecoder()
+    frames, fps, (w, h) = dec.decode(src, max_width=160)
+    assert frames and all(isinstance(f, bytes) for f in frames)
+    assert all(f[:2] == b"\xff\xd8" for f in frames)       # JPEG magic
+    raw_total = w * h * 3 * len(frames)
+    assert sum(len(f) for f in frames) < 0.6 * raw_total   # actually smaller
+
+    pv = PreviewWidget()                                   # decodes on demand
+    pv.set_frames(frames, fps)
+    img = pv.current_image()
+    assert img is not None and (img.width(), img.height()) == (w, h)
+    assert pv.frame_count() == len(frames)
+
+
 def test_effect_stack_region_and_pixel_fx(win):
     ctl = win.controller
     _seed_clip(ctl, "c")

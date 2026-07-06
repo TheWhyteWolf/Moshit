@@ -122,7 +122,10 @@ misc) so commits can reference them. Tick items off as they land.
   keys + meta), so an unchanged re-render (undo/redo hop, audio-only edit, manual
   refresh) copies the AVI instead of re-encoding (0.34s → ~0s).
 - [ ] P13: stream flow/raw stages instead of ~3× whole-clip RAM.
-- [ ] U5: cap preview QImage RAM / decode-on-demand.
+- [x] U5: preview frames are now held as JPEG bytes (encoded on the decoder worker
+  thread at ~0.8 ms/frame, ~7–10× smaller than QImages) and decoded on demand at
+  display time (~1.1 ms — trivial against a 42 ms frame budget). A 60 s 720p preview
+  drops from ~1.3 GB of QImages to ~150 MB.
 - [x] P12: `Project._parsed` is now a byte-budgeted LRU (~1 GB of coded frames,
   lock-guarded for the parallel workers); evicted media re-parse transparently and
   borrowed `AviVideo` references stay valid.
