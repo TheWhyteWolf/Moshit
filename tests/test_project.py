@@ -307,3 +307,18 @@ def test_composite_move_skips_per_clip_finish(engine, project, make_clip,
     c2.start = 12                                  # position-only edit
     project.render(engine, tmp_path / "two.avi")
     assert calls == []                             # both finishes reused
+
+
+def test_parsed_media_cache_bounded(engine, project, make_clip):
+    m1 = project.import_media(engine, make_clip("p1.mp4"))
+    m2 = project.import_media(engine, make_clip("p2.mp4", color="red"))
+    assert m1.id in project._parsed and m2.id in project._parsed
+
+    project._parsed_budget = 1                     # force eviction from now on
+    m3 = project.import_media(engine, make_clip("p3.mp4", color="blue"))
+    assert list(project._parsed) == [m3.id]        # only the newest survives
+    assert project._parsed_total == sum(project._parsed_bytes.values())
+
+    av = project._parsed_media(m1.id)              # evicted → re-parses cleanly
+    assert len(av.frames) == m1.nb_frames
+    assert list(project._parsed) == [m1.id]        # newest again, m3 evicted

@@ -123,7 +123,9 @@ misc) so commits can reference them. Tick items off as they land.
   refresh) copies the AVI instead of re-encoding (0.34s → ~0s).
 - [ ] P13: stream flow/raw stages instead of ~3× whole-clip RAM.
 - [ ] U5: cap preview QImage RAM / decode-on-demand.
-- [ ] P12: bound `Project._parsed`.
+- [x] P12: `Project._parsed` is now a byte-budgeted LRU (~1 GB of coded frames,
+  lock-guarded for the parallel workers); evicted media re-parse transparently and
+  borrowed `AviVideo` references stay valid.
 
 ### Wave 5 — polish backlog (pick opportunistically)
 - [ ] U27: A/B compare (moshed vs original) in preview.

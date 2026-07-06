@@ -19,6 +19,7 @@ undone:
 """
 from __future__ import annotations
 
+import collections
 import json
 import shutil
 import threading
@@ -215,7 +216,15 @@ class Project:
         self.sequences: List[Sequence] = []
         self.tracks: List[Track] = []
         self.root_seq_id = ROOT_SEQ_ID
-        self._parsed: Dict[str, AviVideo] = {}     # media_id -> AviVideo (cache)
+        # Parsed-media LRU: coded frames in RAM, bounded by total bytes so a
+        # long session with many media doesn't pin them all forever (P12).
+        # Evicted entries simply re-parse on next use.
+        self._parsed: "collections.OrderedDict[str, AviVideo]" = \
+            collections.OrderedDict()
+        self._parsed_bytes: Dict[str, int] = {}
+        self._parsed_total = 0
+        self._parsed_budget = 1 * 1024 ** 3        # ~1 GB of coded frames
+        self._parsed_lock = threading.Lock()
         self._seg_n: Dict[str, int] = {}           # seg-cache key -> frame count
         self._tmp_assets: Optional[Path] = None    # precomp cache when no assets_dir
         self._seg_locks: Dict[str, threading.Lock] = {}   # per-key in-flight locks
@@ -276,9 +285,34 @@ class Project:
                       key=lambda c: c.start)
 
     def _parsed_media(self, media_id: str) -> AviVideo:
-        if media_id not in self._parsed:
-            self._parsed[media_id] = avi.parse_avi(self.media[media_id].intermediate_path)
-        return self._parsed[media_id]
+        with self._parsed_lock:
+            av = self._parsed.get(media_id)
+            if av is not None:
+                self._parsed.move_to_end(media_id)
+                return av
+        av = avi.parse_avi(self.media[media_id].intermediate_path)
+        self._cache_parsed(media_id, av)
+        return av
+
+    def _cache_parsed(self, media_id: str, av: AviVideo) -> None:
+        """Insert/refresh a parse-cache entry; evicts LRU over the byte budget
+        (never the entry just inserted). Borrowed AviVideo references stay
+        valid after eviction -- only the cache's own reference is dropped."""
+        size = sum(f.size for f in av.frames)
+        with self._parsed_lock:
+            self._parsed_total += size - self._parsed_bytes.get(media_id, 0)
+            self._parsed[media_id] = av
+            self._parsed.move_to_end(media_id)
+            self._parsed_bytes[media_id] = size
+            while (self._parsed_total > self._parsed_budget
+                   and len(self._parsed) > 1):
+                old_id, _old = self._parsed.popitem(last=False)
+                self._parsed_total -= self._parsed_bytes.pop(old_id, 0)
+
+    def _uncache_parsed(self, media_id: str) -> None:
+        with self._parsed_lock:
+            if self._parsed.pop(media_id, None) is not None:
+                self._parsed_total -= self._parsed_bytes.pop(media_id, 0)
 
     def _ops_for_clip(self, clip_id: str) -> List[MoshOp]:
         return [o for o in self.mosh_ops
@@ -593,7 +627,7 @@ class Project:
             except Exception:
                 item.alpha_path = None          # alpha matte falls back to opaque
         self.media[media_id] = item
-        self._parsed[media_id] = avi.parse_avi(item.intermediate_path)
+        self._cache_parsed(media_id, avi.parse_avi(item.intermediate_path))
         return item
 
     def relink_media(self, engine: MoshEngine, media_id: str,
@@ -622,7 +656,7 @@ class Project:
                 m.alpha_path = str(amap)
             except Exception:
                 m.alpha_path = None                # falls back to opaque
-        self._parsed[media_id] = avi.parse_avi(m.intermediate_path)
+        self._cache_parsed(media_id, avi.parse_avi(m.intermediate_path))
         return m
 
     def add_clip(self, media_id: str, track: str = "main", *,
@@ -965,7 +999,7 @@ class Project:
         media.height = media.height or self.config.height
         media.fps = media.fps or self.config.fps
         media.digest = digest
-        self._parsed[media.id] = av                # refresh the parse cache
+        self._cache_parsed(media.id, av)           # refresh the parse cache
 
     def _audio_seg(self, clip: Clip, mlen: int, prev_len: int, idx: int,
                    fps: float):
@@ -1256,7 +1290,7 @@ class Project:
             height=baked_clip_av.height, fps=baked_clip_av.fps,
             nb_frames=len(baked_clip_av.frames), derived=True)
         self.media[baked_id] = baked_media
-        self._parsed[baked_id] = baked_clip_av
+        self._cache_parsed(baked_id, baked_clip_av)
 
         new_clip = Clip(id=_new_id("clip"), media_id=baked_id, track="main",
                         start=target.start, in_point=0,
@@ -1306,7 +1340,7 @@ class Project:
             height=baked_av.height, fps=baked_av.fps,
             nb_frames=len(baked_av.frames), derived=True)
         self.media[baked_id] = baked_media
-        self._parsed[baked_id] = baked_av
+        self._cache_parsed(baked_id, baked_av)
 
         new_clip = Clip(id=_new_id("clip"), media_id=baked_id, track="main",
                         start=target.start, in_point=0,
@@ -1359,7 +1393,7 @@ class Project:
             height=warped_av.height, fps=warped_av.fps,
             nb_frames=len(warped_av.frames), derived=True)
         self.media[warped_id] = derived
-        self._parsed[warped_id] = warped_av
+        self._cache_parsed(warped_id, warped_av)
 
         new_clip = Clip(id=_new_id("clip"), media_id=warped_id, track="main",
                         start=target.start, in_point=0,
@@ -1399,7 +1433,7 @@ class Project:
 
         self.clips = [c for c in self.clips if c.id != rec.baked_clip_id]
         baked = self.media.pop(rec.baked_media_id, None)
-        self._parsed.pop(rec.baked_media_id, None)
+        self._uncache_parsed(rec.baked_media_id)
         if baked and baked.derived:
             p = Path(baked.intermediate_path)
             if self.assets_dir and p.exists() and p.parent == self.assets_dir:
