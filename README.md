@@ -227,7 +227,13 @@ skipped rather than failing. The sort is fully vectorised (a single `lexsort`
 per frame), so it's cheap despite working per-pixel. A second raw effect,
 **`rgb_recurse`**, rolls the colour channels apart and permutes them and feeds
 the result back into itself over `iterations` passes (cross-faded by `decay`),
-so chromatic fringing compounds into deep, recursive colour trails.
+so chromatic fringing compounds into deep, recursive colour trails. A third,
+**`rgb_iterative_shift`**, is a faithful numpy port of the Processing
+"ChannelShiftGlitch": each of `iterations` passes copies one random RGB channel
+into another at a random wrapped `shift_horizontal`/`shift_vertical` offset,
+tearing the planes into drifting ghost registrations — `recursive` feeds each
+pass back in so shifts compound, `seed` makes it repeatable, and `animate`
+re-rolls the pattern per frame for a shimmering version.
 
 **Codec motion & stutter.** Two codec-domain mosh modes (the same class as
 `pframe_duplicate`) give finer control over coded motion. **`motion_gain`** is a
@@ -256,10 +262,15 @@ frequency), `cdp_distort_repeat`/`interpolate` (stutter / smear groups of
 wavesets), `cdp_distort_telescope` (collapse runs into one), `cdp_distort_reverse`
 (granular backwards), and `cdp_distort_omit` (rhythmic silence dropouts). They
 live in the **Raw FX** panel under a *RAW DATA - AUDIO* group, alongside the other
-raw effects. CDP binaries are discovered at runtime (`$MOSHIT_CDP_DIR`, else a
-bundled `CDP8/NewRelease`); without them the group simply doesn't appear. Adding
-a CDP program is one descriptor entry — its controls are generated from the
-parameter schema, no GUI changes.
+raw effects. CDP is **not bundled** — it's a large third-party toolkit you
+install yourself (free from composersdesktop.com). Moshit discovers its binaries
+at runtime from `$MOSHIT_CDP_DIR`, or failing that a `CDP8/NewRelease` folder
+beside the repo (git-ignored, so you drop your own copy there); without them the
+whole group simply doesn't appear, and any individual CDP failure is a clean
+no-op. The prebuilt binaries are Linux; on other platforms, point
+`$MOSHIT_CDP_DIR` at a native CDP install or the group stays hidden. Adding a CDP
+program is one descriptor entry — its controls are generated from the parameter
+schema, no GUI changes.
 
 **Masks (mattes).** Any clip can carry two mattes, both keyed by **luminance**,
 **alpha**, **motion** (frame-to-frame difference) or **chroma** (a green-screen
@@ -382,9 +393,14 @@ Each effect lives in its own file under `moshit/modes/`:
 | `gop_scramble`     | shuffle whole keyframe-anchored GOP blocks for jump-cuts |
 | `pingpong`         | replay P-frame runs forward then reversed (boomerang) |
 | `pframe_echo`      | re-apply P-frames as delayed echoes (motion trails) |
+| `pframe_stutter`   | chop P-frame runs into blocks and replay each N times (stutter) |
 | `momentum`         | retime the P-frames to ease the motion in or out |
+| `motion_gain`      | one knob: >1 re-applies P-frame motion (bloom), <1 thins toward a freeze |
 | `iframe_pulse`     | re-inject the keyframe on a beat for a strobing pulse |
 | `surge`            | randomly repeat P-frames in clusters for lurching surges |
+
+(The pixel-domain **Pixel FX** and numpy **Raw FX** are separate classes,
+described above and listed under their own headings by `moshit modes`.)
 
 List every effect and parameter at any time:
 
