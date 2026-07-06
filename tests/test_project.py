@@ -265,3 +265,45 @@ def test_cancel_blocks_new_ffmpeg_until_reset(engine):
     ff.reset_abort()                               # next job starts fresh
     ff._run(["-f", "lavfi", "-i", "color=c=red:s=64x48:d=0.1:r=12",
              "-f", "null", "-"], "fresh job")
+
+
+def test_flat_fold_cached_across_renders(engine, project, make_clip,
+                                         tmp_path, monkeypatch):
+    m = project.import_media(engine, make_clip("f.mp4"))
+    for i in range(2):
+        c = project.add_clip(m.id)
+        c.speed = 1.25
+        c.pixel_effects.append({"name": "rgb_shift", "params": {"amount": 4 + i}})
+    calls = []
+    orig = engine.finish_clips
+    monkeypatch.setattr(engine, "finish_clips",
+                        lambda *a, **k: (calls.append(1), orig(*a, **k))[1])
+    project.render(engine, tmp_path / "one.avi")
+    assert calls                                   # cold render runs the fold
+    calls.clear()
+    project.render(engine, tmp_path / "two.avi")
+    assert calls == []                             # unchanged: cached copy
+    w, h = project.config.width, project.config.height
+    a = list(engine.ff.decode_rgb_raw(tmp_path / "one.avi", w, h))
+    b = list(engine.ff.decode_rgb_raw(tmp_path / "two.avi", w, h))
+    assert a == b and len(a) > 0
+
+
+def test_composite_move_skips_per_clip_finish(engine, project, make_clip,
+                                              tmp_path, monkeypatch):
+    m = project.import_media(engine, make_clip("c.mp4"))
+    t2 = project.add_track()
+    c1 = project.add_clip(m.id)
+    c1.speed = 1.5
+    c2 = project.add_clip(m.id, track=t2.id)
+    c2.opacity, c2.start, c2.in_point = 0.6, 5, 1
+    calls = []
+    orig = engine.finish_clips
+    monkeypatch.setattr(engine, "finish_clips",
+                        lambda *a, **k: (calls.append(1), orig(*a, **k))[1])
+    project.render(engine, tmp_path / "one.avi")
+    assert len(calls) == 2                         # one finish per layer, cold
+    calls.clear()
+    c2.start = 12                                  # position-only edit
+    project.render(engine, tmp_path / "two.avi")
+    assert calls == []                             # both finishes reused

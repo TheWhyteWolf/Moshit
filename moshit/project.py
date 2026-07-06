@@ -1031,11 +1031,28 @@ class Project:
                  "transition_in": 0,
                  "pixel": self._pixel_filters(clip, nframes=n),
                  "fx_mask": clip.fx_mask}]
-        finished = engine.finish_clips([seg], meta, engine._tmp(".avi"))
-        # seg is cache-owned (LRU-evicted); leave it for reuse.
+        # The finished (post-speed/fade/pixel-filter) segment is cached too, so
+        # a composite re-render only re-runs the finish for clips whose state
+        # actually changed -- repositioning/opacity/blend edits skip it (P11).
+        fin_key = "fin_" + self._blob_key(
+            {"seg": self._clip_seg_key(engine, clip, media_state), "meta": meta,
+             "geom": engine._pixel_geom(),
+             "enc": [self.config.fps, self.config.gop, self.config.qscale]})
+        with self._seg_lock_for(fin_key):
+            finished = engine.seg_cache_get(fin_key)
+            if finished is None:
+                finished = engine.finish_clips([seg], meta, engine._tmp(".avi"))
+                finished = engine.seg_cache_put(fin_key, finished)
+        # seg + finished are cache-owned (LRU-evicted); leave them for reuse.
         length = (max(1, round(n / clip.speed))
                   if (clip.speed and clip.speed != 1.0) else n)
         return finished, length
+
+    @staticmethod
+    def _blob_key(payload) -> str:
+        import hashlib
+        blob = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha1(blob.encode()).hexdigest()
 
     def _render_flat(self, engine: MoshEngine, out_avi, clips, *,
                      profile=None, export_path=None, audio=False,
@@ -1103,7 +1120,25 @@ class Project:
                      "pixel": self._pixel_filters(c, nframes=n),
                      "fx_mask": c.fx_mask}
                     for c, _, _, n in segs]
-            out = engine.finish_clips([s for _, _, s, _ in segs], meta, out_avi)
+            # The whole fold is cached on (ordered seg keys + finish meta):
+            # a render whose video is unchanged (undo/redo hop, audio-only
+            # edit, manual refresh) copies the cached AVI instead of
+            # re-encoding the sequence (P11).
+            fold_key = "fold_" + self._blob_key(
+                {"segs": [self._clip_seg_key(engine, c, media_state)
+                          for c, _, _, _ in segs],
+                 "meta": meta, "geom": engine._pixel_geom(),
+                 "enc": [self.config.fps, self.config.gop, self.config.qscale]})
+            cached = engine.seg_cache_get(fold_key)
+            if cached is not None:
+                shutil.copyfile(cached, out_avi)
+                out = Path(out_avi)
+            else:
+                out = engine.finish_clips([s for _, _, s, _ in segs], meta,
+                                          out_avi)
+                # cache a copy -- the caller owns (and later rewrites) out_avi
+                engine.seg_cache_put(fold_key,
+                                     shutil.copy2(out, engine._tmp(".avi")))
             # segments are cache-owned (LRU-evicted); leave them for reuse.
         else:                                      # fast path: concat coded chunks
             sequence: List[Frame] = []
@@ -1160,13 +1195,14 @@ class Project:
         if progress:
             progress(len(pairs), steps, "Compositing layers…")
         out = engine.composite(layers, out_avi, total_frames=total)
-        for lay in layers:                         # consumed
-            for key in ("input", "mask_input"):
-                if lay.get(key):
-                    try:
-                        Path(lay[key]).unlink()
-                    except OSError:
-                        pass
+        # layer inputs are cache-owned finished segments (LRU-evicted between
+        # renders); only the per-render alpha mattes are consumed here
+        for lay in layers:
+            if lay.get("mask_input"):
+                try:
+                    Path(lay["mask_input"]).unlink()
+                except OSError:
+                    pass
 
         # Audio: every enabled video track becomes a full-length plan (clips at
         # their absolute positions, gap silence, crossfade head-trims); the

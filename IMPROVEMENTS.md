@@ -115,7 +115,12 @@ misc) so commits can reference them. Tick items off as they land.
   ffmpeg abort flag so queued workers can't spawn post-cancel processes. Measured:
   parallel output is bit-identical; composite path ~4–8% faster (ffmpeg already
   saturates cores internally, so process-level wins are modest); no path regressed.
-- [ ] P11: cache the folded finish output keyed on (ordered seg keys + layout).
+- [x] P11: finish-output caching, two layers — (1) composite per-clip *finished*
+  segments cached on (seg key + finish meta + geom + enc), so repositioning /
+  opacity/blend edits skip every unchanged layer's finish ffmpeg (move-only
+  composite re-render: 0.91s → 0.52s); (2) the flat fold cached on (ordered seg
+  keys + meta), so an unchanged re-render (undo/redo hop, audio-only edit, manual
+  refresh) copies the AVI instead of re-encoding (0.34s → ~0s).
 - [ ] P13: stream flow/raw stages instead of ~3× whole-clip RAM.
 - [ ] U5: cap preview QImage RAM / decode-on-demand.
 - [ ] P12: bound `Project._parsed`.
