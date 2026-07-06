@@ -566,17 +566,19 @@ class AppController(QObject):
                   done, "Saving frame…")
 
     def bake(self, op_id: str) -> None:
+        pre = self._snapshot()                 # pre-bake state, committed on success
         def done(_rec):
-            self._clear_undo()
+            self._commit_undo(pre, "Bake")
             self.project_changed.emit()
-            self.status.emit("Baked (revertible).")
+            self.status.emit("Baked (undoable).")
         self._run(lambda: self._do_bake(op_id), done, "Baking…")
 
     def bake_clip(self, clip_id: str) -> None:
+        pre = self._snapshot()
         def done(_rec):
-            self._clear_undo()
+            self._commit_undo(pre, "Bake stack")
             self.project_changed.emit()
-            self.status.emit("Baked effect stack (revertible).")
+            self.status.emit("Baked effect stack (undoable).")
         self._run(lambda: self.project.bake_clip(self.engine, clip_id), done,
                   "Baking…")
 
@@ -606,7 +608,7 @@ class AppController(QObject):
             self.error.emit("Optical-flow needs OpenCV + numpy: "
                             "pip install 'moshit[flow]'")
             return
-        self._push_undo()
+        self._push_undo("Flow FX")
         c.flow_transfer = dict(flow_transfer) if flow_transfer else None
         self.project_changed.emit()
         self.status.emit("Flow FX updated." if flow_transfer else "Flow FX removed.")
@@ -618,34 +620,41 @@ class AppController(QObject):
                             "pip install 'moshit[flow]'")
             return
 
+        pre = self._snapshot()                 # committed on success (undoable)
+
         def work():
             return self.project.apply_optical_flow(
                 self.engine, base_clip_id, motion_media_id, **params)
 
         def done(_rec):
-            self._clear_undo()
+            self._commit_undo(pre, "Optical flow")
             self.project_changed.emit()
             self.status.emit(f"Optical-flow transfer applied "
-                             f"({self.flow_backend()}); revertible.")
+                             f"({self.flow_backend()}); undoable.")
         self._run(work, done, "Optical-flow transfer…")
 
     # -- undo / redo (snapshots of the editable timeline state) ------------- #
 
     def _snapshot(self):
+        # media + bake_records ride along so a bake/flow (which add derived media
+        # and a record) can be undone; imported source media are preserved on
+        # restore (see _restore), so undo never deletes footage you brought in.
         return (copy.deepcopy(self.project.clips),
                 copy.deepcopy(self.project.mosh_ops),
                 copy.deepcopy(self.project.tracks),
-                copy.deepcopy(self.project.sequences))
+                copy.deepcopy(self.project.sequences),
+                copy.deepcopy(self.project.media),
+                copy.deepcopy(self.project.bake_records))
 
-    def _commit_undo(self, snap) -> None:
-        self._undo.append(snap)
+    def _commit_undo(self, snap, label: str = "") -> None:
+        self._undo.append((label, snap))
         if len(self._undo) > self._undo_limit:
             self._undo.pop(0)
         self._redo.clear()
 
-    def _push_undo(self) -> None:
+    def _push_undo(self, label: str = "") -> None:
         """Record current state so the edit about to happen can be undone."""
-        self._commit_undo(self._snapshot())
+        self._commit_undo(self._snapshot(), label)
 
     def _restore(self, snap) -> None:
         self.project.clips = copy.deepcopy(snap[0])
@@ -653,6 +662,15 @@ class AppController(QObject):
         if len(snap) > 2:                      # tracks + sequences (compositing)
             self.project.tracks = copy.deepcopy(snap[2])
             self.project.sequences = copy.deepcopy(snap[3])
+        if len(snap) > 5:                      # media + bake records (bake/flow)
+            media = copy.deepcopy(snap[4])
+            # keep any *imported* (non-derived) media added since the snapshot —
+            # undoing a later edit must not remove footage the user imported.
+            for mid, item in self.project.media.items():
+                if mid not in media and not getattr(item, "derived", False):
+                    media[mid] = copy.deepcopy(item)
+            self.project.media = media
+            self.project.bake_records = copy.deepcopy(snap[5])
         if not any(s.id == self.current_seq_id for s in self.project.sequences):
             self.current_seq_id = self.project.root_seq_id   # undid into a gone seq
 
@@ -668,21 +686,31 @@ class AppController(QObject):
     def can_redo(self) -> bool:
         return bool(self._redo)
 
+    @property
+    def undo_label(self) -> str:
+        return self._undo[-1][0] if self._undo else ""
+
+    @property
+    def redo_label(self) -> str:
+        return self._redo[-1][0] if self._redo else ""
+
     def undo(self) -> None:
         if not self._undo:
             return
-        self._redo.append(self._snapshot())
-        self._restore(self._undo.pop())
+        label, snap = self._undo.pop()
+        self._redo.append((label, self._snapshot()))
+        self._restore(snap)
         self.project_changed.emit()
-        self.status.emit("Undo")
+        self.status.emit(f"Undo {label}".strip())
 
     def redo(self) -> None:
         if not self._redo:
             return
-        self._undo.append(self._snapshot())
-        self._restore(self._redo.pop())
+        label, snap = self._redo.pop()
+        self._undo.append((label, self._snapshot()))
+        self._restore(snap)
         self.project_changed.emit()
-        self.status.emit("Redo")
+        self.status.emit(f"Redo {label}".strip())
 
     # -- instant model edits ------------------------------------------------ #
 
@@ -713,7 +741,7 @@ class AppController(QObject):
         # clip on a track keeps its clean opening.
         melt = (self.easy_mode and self.project.track(track).role == "video"
                 and bool(self.project.clips_for_track(track)))
-        self._push_undo()
+        self._push_undo("Add clip")
         clip = self.project.add_clip(media_id, track)
         if melt:
             self._add_melt_op(clip.id)
@@ -740,7 +768,7 @@ class AppController(QObject):
         if track.role != "video":              # motion pool plays in order
             return self.add_clip_for_media(media_id, track_id)
         melt = self.easy_mode and bool(self.project.clips_for_track(track_id))
-        self._push_undo()
+        self._push_undo("Place clip")
         clip = self.project.add_clip(media_id, track_id,
                                      start=max(0, int(start)))
         if melt:
@@ -754,7 +782,7 @@ class AppController(QObject):
     # -- tracks (compositing) ----------------------------------------------- #
 
     def add_video_track(self, seq_id: Optional[str] = None):
-        self._push_undo()
+        self._push_undo("Add track")
         t = self.project.add_track(seq_id or self.current_seq_id, role="video")
         self.project_changed.emit()
         self.status.emit(f"Added {t.name}")
@@ -770,7 +798,7 @@ class AppController(QObject):
         if len(self.project.video_tracks(t.seq_id)) <= 1:
             self.error.emit("Can't remove the only video track.")
             return
-        self._push_undo()
+        self._push_undo("Remove track")
         cids = {c.id for c in self.project.clips if c.track == track_id}
         self.project.tracks = [x for x in self.project.tracks if x.id != track_id]
         self.project.clips = [c for c in self.project.clips if c.track != track_id]
@@ -789,7 +817,7 @@ class AppController(QObject):
         new = idx + int(delta)
         if not 0 <= new < len(sibs):
             return
-        self._push_undo()
+        self._push_undo("Reorder track")
         other = sibs[new]
         t.index, other.index = other.index, t.index
         self.project_changed.emit()
@@ -801,7 +829,7 @@ class AppController(QObject):
             return
         if t.role != "video" or t.enabled == bool(enabled):
             return
-        self._push_undo()
+        self._push_undo("Toggle track")
         t.enabled = bool(enabled)
         self.project_changed.emit()
 
@@ -832,7 +860,7 @@ class AppController(QObject):
             return None
         host_track = valid[0].track
         insert_start = min(c.start for c in valid)
-        self._push_undo()
+        self._push_undo("Precompose")
         seq = self.project.add_sequence(name)
         vt = self.project.video_tracks(seq.id)[0]
         cursor = 0
@@ -861,7 +889,7 @@ class AppController(QObject):
             mode = get_pixel_mode(name)
         except KeyError:
             return None
-        self._push_undo()
+        self._push_undo("Add pixel FX")
         c.pixel_effects.append({"name": name,
                                 "params": dict(params) if params else mode.defaults()})
         self.project_changed.emit()
@@ -875,7 +903,7 @@ class AppController(QObject):
             return
         if not (0 <= index < len(c.pixel_effects)):
             return
-        self._push_undo()
+        self._push_undo("Remove pixel FX")
         c.pixel_effects.pop(index)
         self.project_changed.emit()
         self.status.emit("Removed pixel FX")
@@ -889,7 +917,7 @@ class AppController(QObject):
             return
         if c.pixel_effects[index].get("params") == params:
             return
-        self._push_undo()
+        self._push_undo("Edit pixel FX")
         c.pixel_effects[index]["params"] = dict(params)
         self.project_changed.emit()
 
@@ -908,7 +936,7 @@ class AppController(QObject):
             mode = get_raw_mode(name)
         except KeyError:
             return None
-        self._push_undo()
+        self._push_undo("Add raw FX")
         c.raw_effects.append({"name": name,
                               "params": dict(params) if params else mode.defaults()})
         self.project_changed.emit()
@@ -922,7 +950,7 @@ class AppController(QObject):
             return
         if not (0 <= index < len(c.raw_effects)):
             return
-        self._push_undo()
+        self._push_undo("Remove raw FX")
         c.raw_effects.pop(index)
         self.project_changed.emit()
         self.status.emit("Removed raw FX")
@@ -936,7 +964,7 @@ class AppController(QObject):
             return
         if c.raw_effects[index].get("params") == params:
             return
-        self._push_undo()
+        self._push_undo("Edit raw FX")
         c.raw_effects[index]["params"] = dict(params)
         self.project_changed.emit()
 
@@ -952,7 +980,7 @@ class AppController(QObject):
         spec = dict(spec) if spec else None
         if getattr(c, attr) == spec:
             return
-        self._push_undo()
+        self._push_undo("Matte")
         setattr(c, attr, spec)
         self.project_changed.emit()
         self.status.emit(f"{'Layer' if kind == 'layer' else 'FX'} matte updated.")
@@ -978,7 +1006,7 @@ class AppController(QObject):
         return out
 
     def add_effect(self, clip_id: str, mode: str, params: dict, region=None):
-        self._push_undo()
+        self._push_undo("Add effect")
         op = self.project.add_mosh(mode, params, clip_id)
         op.region_start, op.region_end = self._region_tuple(region)
         self.project_changed.emit()
@@ -994,7 +1022,7 @@ class AppController(QObject):
         if (op.mode == mode and op.params == params
                 and (op.region_start, op.region_end) == new_region):
             return op
-        self._push_undo()
+        self._push_undo("Edit effect")
         op.mode = mode
         op.params = dict(params)
         op.region_start, op.region_end = new_region
@@ -1012,7 +1040,7 @@ class AppController(QObject):
     # leaves no trace. One generic core serves the mosh stack, the pixel FX and
     # the raw FX; each identifies its session by a ``key`` tuple.
 
-    def _begin_live(self, key, *, created: bool, pre=None) -> None:
+    def _begin_live(self, key, *, created: bool, pre=None, label: str = "") -> None:
         """Open a live session identified by *key*. A no-op if one for the same
         key is already open -- the live add flow opens the editor (which signals
         begin) over the session the add just created, whose pre-snapshot must
@@ -1020,12 +1048,12 @@ class AppController(QObject):
         if self._live and self._live.get("key") == key:
             return
         self._live = {"key": key, "pre": pre if pre is not None else self._snapshot(),
-                      "created": created, "committed": False}
+                      "created": created, "committed": False, "label": label}
 
     def _live_commit_point(self) -> None:
         """Record the session's single undo entry on the first real change."""
         if self._live and not self._live["committed"]:
-            self._commit_undo(self._live["pre"])
+            self._commit_undo(self._live["pre"], self._live.get("label", ""))
             self._live["committed"] = True
 
     def _end_live(self, key, *, commit: bool) -> None:
@@ -1036,10 +1064,10 @@ class AppController(QObject):
         self._live = None
         if commit:
             if live["created"] and not live["committed"]:
-                self._commit_undo(live["pre"])     # a bare add is one undo step
+                self._commit_undo(live["pre"], live.get("label", ""))  # bare add
             return
         # cancel: undo the session entirely
-        if live["committed"] and self._undo and self._undo[-1] is live["pre"]:
+        if live["committed"] and self._undo and self._undo[-1][1] is live["pre"]:
             self._undo.pop()
         self._restore(live["pre"])
         self.project_changed.emit()
@@ -1054,17 +1082,18 @@ class AppController(QObject):
         pre = self._snapshot()
         op = self.project.add_mosh(mode, params or {}, clip_id)
         op.region_start, op.region_end = self._region_tuple(region)
-        self._begin_live(("mosh", op.id), created=True, pre=pre)
+        self._begin_live(("mosh", op.id), created=True, pre=pre,
+                         label=f"Add {mode}")
         self.project_changed.emit()
         return op
 
     def begin_effect_edit(self, op_id: str) -> None:
         """Open a live session over an existing effect, snapshotting its state."""
         try:
-            self.project.op(op_id)
+            op = self.project.op(op_id)
         except KeyError:
             return
-        self._begin_live(("mosh", op_id), created=False)
+        self._begin_live(("mosh", op_id), created=False, label=f"Edit {op.mode}")
 
     def live_update_effect(self, op_id: str, mode: str, params: dict,
                            region=None):
@@ -1111,7 +1140,8 @@ class AppController(QObject):
             return None
         fx.append({"name": name, "params": mode.defaults()})
         index = len(fx) - 1
-        self._begin_live((kind, clip_id, index), created=True, pre=pre)
+        self._begin_live((kind, clip_id, index), created=True, pre=pre,
+                         label=f"Add {name}")
         self.project_changed.emit()
         self.status.emit(f"Added {kind} FX: {name}")
         return index
@@ -1122,7 +1152,9 @@ class AppController(QObject):
         except KeyError:
             return
         if 0 <= index < len(fx):
-            self._begin_live((kind, clip_id, index), created=False)
+            name = fx[index].get("name", f"{kind} FX")
+            self._begin_live((kind, clip_id, index), created=False,
+                             label=f"Edit {name}")
 
     def live_update_fx(self, kind: str, clip_id: str, index: int, params: dict):
         """Apply a pixel/raw FX value during a live session (atomic fallback if no
@@ -1147,7 +1179,7 @@ class AppController(QObject):
         self._end_live((kind, clip_id, index), commit=commit)
 
     def remove_effect(self, op_id: str) -> None:
-        self._push_undo()
+        self._push_undo("Remove effect")
         if not self.project.remove_mosh(op_id):
             self._undo.pop()                       # nothing removed; drop the snapshot
             return
@@ -1173,7 +1205,7 @@ class AppController(QObject):
         snap = self._snapshot()
         if not self.project.move_mosh(op_id, delta):
             return
-        self._commit_undo(snap)
+        self._commit_undo(snap, "Reorder effect")
         self.project_changed.emit()
 
     def set_effect_enabled(self, op_id: str, on: bool) -> None:
@@ -1183,7 +1215,7 @@ class AppController(QObject):
             return
         if op.enabled == on:
             return
-        self._push_undo()
+        self._push_undo("Toggle effect")
         op.enabled = on
         self.project_changed.emit()
         self.status.emit(("Enabled " if on else "Disabled ") + op.mode)
@@ -1216,7 +1248,7 @@ class AppController(QObject):
         if not effects:
             self.error.emit(f"Preset '{name}' is missing or empty.")
             return
-        self._push_undo()
+        self._push_undo("Apply preset")
         if replace:
             self.project.mosh_ops = [o for o in self.project.mosh_ops
                                      if o.target_clip_id != clip_id or o.archived]
@@ -1255,7 +1287,7 @@ class AppController(QObject):
                 c.speed, c.reverse, c.fade_in, c.fade_out, c.transition_in,
                 c.opacity, c.blend_mode, c.gain):
             return c
-        self._push_undo()
+        self._push_undo("Clip settings")
         c.speed, c.reverse = speed, reverse
         c.fade_in, c.fade_out, c.transition_in = fade_in, fade_out, trans
         c.opacity, c.blend_mode, c.gain = opacity, blend, gain
@@ -1277,7 +1309,7 @@ class AppController(QObject):
     def trim_clip(self, clip_id: str, in_point=None, out_point=None) -> None:
         c = self.project.clip(clip_id)
         media = self.project.media[c.media_id]
-        self._push_undo()
+        self._push_undo("Trim clip")
         cur_out = c.out_point if c.out_point is not None else media.nb_frames
         if in_point is not None:
             c.in_point = max(0, min(int(in_point), cur_out - 1))
@@ -1295,7 +1327,7 @@ class AppController(QObject):
         new_start = max(0, int(new_start))
         if c.start == new_start and not c.transition_in:
             return
-        self._push_undo()
+        self._push_undo("Move clip")
         c.start = new_start
         c.transition_in = 0                # overlap (if any) now comes from position
         self.project_changed.emit()
@@ -1307,7 +1339,7 @@ class AppController(QObject):
             return
         if c.archived:                 # archived clips are bake history; leave them
             return
-        self._push_undo()
+        self._push_undo("Remove clip")
         self.project.clips = [x for x in self.project.clips if x.id != clip_id]
         self.project.mosh_ops = [o for o in self.project.mosh_ops
                                  if o.target_clip_id != clip_id]
@@ -1318,7 +1350,7 @@ class AppController(QObject):
         new = self.project.split_clip(clip_id, offset)
         if new is None:
             return
-        self._commit_undo(snap)
+        self._commit_undo(snap, "Split clip")
         self.project_changed.emit()
         self.status.emit("Split clip.")
 
@@ -1329,7 +1361,7 @@ class AppController(QObject):
             return None
         if c.archived:
             return None
-        self._push_undo()
+        self._push_undo("Duplicate clip")
         new = self.project.duplicate_clip(clip_id)
         self.project_changed.emit()
         self.status.emit("Duplicated clip.")

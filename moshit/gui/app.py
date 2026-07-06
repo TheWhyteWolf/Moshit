@@ -353,6 +353,7 @@ class MainWindow(QMainWindow):
         self.act_redo.triggered.connect(self.controller.redo)
         self.act_undo.setEnabled(False)
         self.act_redo.setEnabled(False)
+        self._update_undo_labels()
         edit.addSeparator()
         a_dup = edit.addAction("&Duplicate clip")
         a_dup.setShortcut("Ctrl+D")
@@ -675,11 +676,18 @@ class MainWindow(QMainWindow):
         self.inspector.set_flow_sources(self.controller.media_choices())
         self.act_undo.setEnabled(self.controller.can_undo)
         self.act_redo.setEnabled(self.controller.can_redo)
+        self._update_undo_labels()
         # keep inspector in sync with the selected clip's current op -- but not
         # while a live param editor is open, or every drag tick would tear down
         # and rebuild the inspector body (and the effect list) underneath it.
         if self._selected_clip and not self._live_editing:
             self._on_clip_selected(self._selected_clip)
+
+    def _update_undo_labels(self) -> None:
+        """Name the Edit → Undo/Redo items after the action they'll reverse."""
+        u, r = self.controller.undo_label, self.controller.redo_label
+        self.act_undo.setText(f"&Undo {u}".rstrip())
+        self.act_redo.setText(f"&Redo {r}".rstrip())
 
     def _on_clip_selected(self, clip_id: str) -> None:
         self._selected_clip = clip_id

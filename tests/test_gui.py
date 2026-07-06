@@ -1098,6 +1098,73 @@ def test_undo_redo_round_trips(win):
     assert [e["mode"] for e in ctl.clip_effects("c")] == ["bitrot"]
 
 
+def test_undo_labels_name_the_action(win):
+    ctl = win.controller
+    _seed_clip(ctl, "c")
+    ctl.add_effect("c", "bitrot", {"intensity": 0.4})
+    assert ctl.undo_label == "Add effect"
+    win._update_undo_labels()
+    assert win.act_undo.text() == "&Undo Add effect"
+    ctl.move_clip("c", 5)
+    assert ctl.undo_label == "Move clip"
+    ctl.undo()                                          # move rolled back
+    assert ctl.redo_label == "Move clip" and ctl.undo_label == "Add effect"
+    win._update_undo_labels()
+    assert win.act_redo.text() == "&Redo Move clip"
+    ctl.undo()                                          # effect rolled back
+    assert not ctl.can_undo
+    win._update_undo_labels()
+    assert win.act_undo.text() == "&Undo"               # nothing to undo
+
+
+def test_undo_survives_bake(qapp, tmp_path, monkeypatch, make_clip):
+    # Baking used to wipe undo history; now it's a normal (undoable) step.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from moshit.gui.controller import AppController
+    from moshit.engine import EngineConfig
+    c = AppController(config=EngineConfig(width=64, height=48, fps=24.0, gop=8))
+    try:
+        item = c._do_import(make_clip("b.mp4"), "main")
+        clip = c.add_clip_for_media(item.id, "main")
+        op = c.add_effect(clip.id, "pframe_duplicate", {"factor": 2})
+        # mirror controller.bake(): snapshot pre-bake, bake, commit the entry
+        pre = c._snapshot()
+        c.project.bake_op(c.engine, op.id)               # synchronous bake path
+        c._commit_undo(pre, "Bake")
+        assert c.project.clip(clip.id).archived          # original archived
+        assert any(m.derived for m in c.project.media.values())   # baked media added
+        assert c.undo_label == "Bake"
+
+        c.undo()                                         # undo the bake
+        assert not c.project.clip(clip.id).archived      # original restored
+        assert not c.project.op(op.id).archived          # its op restored
+        assert not any(m.derived for m in c.project.media.values())
+        assert c.project.bake_records == []
+        assert item.id in c.project.media                # imported footage kept
+
+        c.redo()                                         # redo re-bakes
+        assert c.project.clip(clip.id).archived
+        assert any(m.derived for m in c.project.media.values())
+    finally:
+        c.cleanup()
+
+
+def test_undo_preserves_media_imported_afterwards(ctl):
+    from moshit.project import MediaItem
+    ctl.project.media["m0"] = MediaItem(
+        id="m0", source_path="x", label="m0", role="main",
+        intermediate_path="x", nb_frames=20)
+    clip = ctl.add_clip_for_media("m0", "main")          # snapshot captures {m0}
+    # an import lands after that edit (imports aren't undoable)
+    ctl.project.media["m1"] = MediaItem(
+        id="m1", source_path="y", label="m1", role="main",
+        intermediate_path="y", nb_frames=20)
+    ctl.undo()                                           # roll back the add_clip
+    assert all(x.id != clip.id for x in ctl.project.clips)
+    assert "m0" in ctl.project.media                     # snapshot media restored
+    assert "m1" in ctl.project.media                     # later import NOT dropped
+
+
 def test_split_clip_at_playhead(win):
     ctl = win.controller
     _seed_clip(ctl, "c")                                     # media nb_frames=20
