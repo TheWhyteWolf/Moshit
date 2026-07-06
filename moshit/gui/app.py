@@ -526,6 +526,10 @@ class MainWindow(QMainWindow):
             (".", lambda: self.preview.step(1)),
             ("Home", self.preview.go_start),
             ("End", self.preview.go_end),
+            ("I", self.preview.set_loop_in),          # loop sub-range
+            ("O", self.preview.set_loop_out),
+            ("Shift+I", self.preview.clear_loop),
+            ("Shift+O", self.preview.clear_loop),
             ("=", self.timeline_pane.zoom_in),        # timeline zoom
             ("+", self.timeline_pane.zoom_in),
             ("-", self.timeline_pane.zoom_out),
@@ -555,6 +559,8 @@ class MainWindow(QMainWindow):
         c.preview_audio.connect(self.preview.set_audio)
         c.preview_waveform.connect(self.timeline.set_waveform)
         self.preview.muteToggled.connect(self.controller.set_preview_muted)
+        self.preview.sourceHoldStarted.connect(self._on_source_hold)
+        self.preview.sourceHoldEnded.connect(self.preview.clear_override)
         c.busy.connect(self._on_busy)
         c.error.connect(self._on_error)
         c.status.connect(self.statusBar().showMessage)
@@ -876,6 +882,15 @@ class MainWindow(QMainWindow):
         """Preview position → timeline playhead (proportional)."""
         n = self.preview.frame_count()
         self.timeline.set_play_fraction(idx / (n - 1) if n > 1 else 0.0)
+
+    def _on_source_hold(self) -> None:
+        """Hold-to-compare: show the clean source frame under the playhead."""
+        hit = self.controller.source_frame_for(self.preview.current_index())
+        img = self.controller.fetch_source_frame(*hit) if hit else None
+        if img is not None and not img.isNull():
+            self.preview.show_override(img)
+        else:
+            self.statusBar().showMessage("No source frame here.")
 
     def _on_remove(self, clip_id: str) -> None:
         if self._selected_clip == clip_id:

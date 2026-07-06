@@ -12,6 +12,7 @@ the whole pipeline testable without a running event loop.
 from __future__ import annotations
 
 import atexit
+import collections
 import copy
 import dataclasses
 import os
@@ -144,6 +145,10 @@ class AppController(QObject):
         self._audio_path_cache = None
         self._preview_audio = None
         self._preview_waveform = None          # peak envelope for the timeline
+        # A/B compare: its own FFmpeg (cancel() kills self.ff's processes and
+        # must not take a hold-to-compare fetch with it) + a small frame cache.
+        self._ab_ff = FFmpeg(ffmpeg=ffmpeg_bin, ffprobe=ffprobe_bin)
+        self._ab_cache: "collections.OrderedDict" = collections.OrderedDict()
         self._cleaned = False
         self.current_seq_id = ROOT_SEQ_ID      # sequence the timeline is showing
         self.easy_mode = False                 # added clips melt into the previous one
@@ -441,6 +446,63 @@ class AppController(QObject):
         self._preview_muted = bool(muted)
         if not muted:
             self.refresh_preview()             # build the audio now
+
+    # -- A/B compare: the clean source frame for a preview position ---------- #
+
+    def source_frame_for(self, preview_idx: int):
+        """Map a preview frame to ``(media_id, source_frame)`` on the current
+        sequence's base video track, or None if nothing is there.
+
+        Documented approximations: within a crossfade overlap the incoming
+        (later) clip wins; keyframe-snapped trims are ignored, so a trimmed
+        clip can be off by up to one GOP; derived (baked) media maps to its
+        own intermediate — still the pre-effects picture, which is the point.
+        """
+        idx = max(0, int(preview_idx))
+        tracks = self.project.video_tracks(self.current_seq_id)
+        hit = None
+        if tracks:                             # base (bottom) track only
+            for entry in self.project.track_layout(tracks[0].id):
+                clip, start, length, _trans = entry
+                if start <= idx < start + length:
+                    hit = (clip, start)
+        if hit is None:
+            return None
+        clip, start = hit
+        media = self.project.media.get(clip.media_id)
+        if media is None or media.nb_frames <= 0:
+            return None
+        out = clip.out_point if clip.out_point is not None else media.nb_frames
+        src_len = max(1, out - clip.in_point)
+        off = int((idx - start) * (clip.speed or 1.0))
+        off = max(0, min(off, src_len - 1))
+        frame = (out - 1 - off) if clip.reverse else clip.in_point + off
+        return media.id, max(0, min(frame, media.nb_frames - 1))
+
+    def fetch_source_frame(self, media_id: str, frame: int):
+        """One clean frame decoded from the media's normalised intermediate,
+        as a QImage (blocking, ~100 ms; LRU-cached). None if unavailable."""
+        from PySide6.QtGui import QImage
+        key = (media_id, int(frame))
+        img = self._ab_cache.get(key)
+        if img is not None:
+            self._ab_cache.move_to_end(key)
+            return img
+        media = self.project.media.get(media_id)
+        if media is None or not Path(media.intermediate_path).exists():
+            return None
+        png = self._dir / "ab_frame.png"
+        try:
+            self._ab_ff.snapshot(media.intermediate_path, png, int(frame))
+            img = QImage(str(png))
+        except Exception:                      # fetch is best-effort
+            return None
+        if img.isNull():
+            return None
+        self._ab_cache[key] = img
+        while len(self._ab_cache) > 32:
+            self._ab_cache.popitem(last=False)
+        return img
 
     def beat_positions(self, clip_id: str) -> List[float]:
         """Onsets in the preview audio that fall within *clip_id*'s span, as

@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QMimeData, QPoint, QRect, QTimer, Signal
+from PySide6.QtCore import Qt, QMimeData, QPoint, QRect, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -1544,9 +1544,116 @@ class TimelinePane(QScrollArea):
 # Preview + transport
 # --------------------------------------------------------------------------- #
 
+class _LoopSlider(QSlider):
+    """The preview scrub slider, able to mark a loop sub-range on its groove."""
+
+    def __init__(self):
+        super().__init__(Qt.Orientation.Horizontal)
+        self._range: Optional[Tuple[int, int]] = None
+
+    def set_loop_range(self, rng) -> None:
+        self._range = tuple(rng) if rng else None
+        self.update()
+
+    def _x_for(self, value: int) -> int:
+        from PySide6.QtWidgets import QStyle
+        handle = 12                                # matches the stylesheet handle
+        span = max(1, self.width() - handle)
+        return handle // 2 + QStyle.sliderPositionFromValue(
+            self.minimum(), self.maximum(), int(value), span)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self._range or self.maximum() <= self.minimum():
+            return
+        x1, x2 = self._x_for(self._range[0]), self._x_for(self._range[1])
+        p = QPainter(self)
+        p.fillRect(QRect(min(x1, x2), self.height() // 2 - 3,
+                         max(2, abs(x2 - x1)), 6), QColor(255, 209, 102, 90))
+        p.setPen(QColor("#ffd166"))
+        for x in (x1, x2):
+            p.drawLine(x, 2, x, self.height() - 3)
+        p.end()
+
+
+class _PreviewView(QScrollArea):
+    """Hosts the preview image label: Fit by default, Ctrl+wheel zooms
+    (0.25–8×) around the current effective scale, drag pans when zoomed."""
+
+    zoomChanged = Signal(object)                   # float, or None for Fit
+
+    def __init__(self, label: QLabel):
+        super().__init__()
+        self.zoom: Optional[float] = None          # None = fit the viewport
+        self.last_native = QSize(0, 0)             # frame size before scaling
+        self._label = label
+        self._pan_from: Optional[QPoint] = None
+        self.setWidget(label)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.viewport().setStyleSheet("background:#0d0f12;")
+
+    def _fit_zoom(self) -> float:
+        n = self.last_native
+        if n.width() <= 0 or n.height() <= 0:
+            return 1.0
+        vp = self.viewport().size()
+        return min(vp.width() / n.width(), vp.height() / n.height())
+
+    def set_zoom(self, zoom: Optional[float]) -> None:
+        self.zoom = (None if zoom is None
+                     else max(0.25, min(8.0, float(zoom))))
+        if self.zoom is None:                       # fit: label fills the viewport
+            self._label.setMinimumSize(360, 240)
+            self._label.setMaximumSize(16777215, 16777215)
+            self.setWidgetResizable(True)
+        else:                                       # zoomed: label = pixmap size
+            self.setWidgetResizable(False)
+            self._label.setMinimumSize(1, 1)
+        self.zoomChanged.emit(self.zoom)
+
+    def wheelEvent(self, event) -> None:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            steps = (event.angleDelta().y() or event.angleDelta().x()) / 120.0
+            if steps:
+                base = self.zoom if self.zoom is not None else self._fit_zoom()
+                self.set_zoom(base * (1.25 ** steps))
+            event.accept()
+            return
+        super().wheelEvent(event)                   # plain wheel: scrollbars
+
+    def mousePressEvent(self, event) -> None:
+        if self.zoom is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._pan_from = event.position().toPoint()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._pan_from is not None:
+            d = event.position().toPoint() - self._pan_from
+            self._pan_from = event.position().toPoint()
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - d.x())
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - d.y())
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._pan_from is not None:
+            self._pan_from = None
+            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        super().mouseReleaseEvent(event)
+
+
 class PreviewWidget(QWidget):
     frameChanged = Signal(int)
     muteToggled = Signal(bool)
+    sourceHoldStarted = Signal()                   # "Source" held: show the clean frame
+    sourceHoldEnded = Signal()
 
     def __init__(self):
         super().__init__()
@@ -1556,6 +1663,9 @@ class PreviewWidget(QWidget):
         self._restore_frac: Optional[float] = None
         self._streaming = False
         self._loop = False
+        self._loop_in: Optional[int] = None   # loop sub-range markers (I/O keys)
+        self._loop_out: Optional[int] = None
+        self._override: Optional[QImage] = None    # held A/B source frame
         self._audio_path: Optional[str] = None
         self._muted = False
         self._advancing = False               # distinguish auto-advance from scrubs
@@ -1576,9 +1686,11 @@ class PreviewWidget(QWidget):
             "background:#0d0f12; color:#6a7280; border-radius:4px;")
         self.view.setSizePolicy(QSizePolicy.Policy.Expanding,
                                 QSizePolicy.Policy.Expanding)
-        layout.addWidget(self.view, 1)
+        self._scroll = _PreviewView(self.view)
+        self._scroll.zoomChanged.connect(self._on_zoom_changed)
+        layout.addWidget(self._scroll, 1)
 
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider = _LoopSlider()
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._on_slider)
         layout.addWidget(self.slider)
@@ -1606,8 +1718,30 @@ class PreviewWidget(QWidget):
         self.end_btn = _tbtn("⏭", "Jump to end (End)", self.go_end)
 
         self.loop_chk = QCheckBox("Loop")
-        self.loop_chk.setToolTip("Repeat playback from the start")
+        self.loop_chk.setToolTip("Repeat playback (press I/O to set a loop "
+                                 "range, Shift+I to clear it)")
         self.loop_chk.toggled.connect(self._set_loop)
+
+        self.src_btn = QPushButton("Source")
+        self.src_btn.setToolTip("Hold to see the clean source frame (A/B)")
+        self.src_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.src_btn.setEnabled(False)
+        self.src_btn.pressed.connect(self.sourceHoldStarted.emit)
+        self.src_btn.released.connect(self.sourceHoldEnded.emit)
+
+        self.fit_btn = QPushButton("Fit")
+        self.fit_btn.setToolTip("Fit the frame to the pane "
+                                "(Ctrl+wheel zooms, drag pans when zoomed)")
+        self.fit_btn.setMaximumWidth(34)
+        self.fit_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.fit_btn.setEnabled(False)
+        self.fit_btn.clicked.connect(lambda: self._scroll.set_zoom(None))
+        self.one_btn = QPushButton("1:1")
+        self.one_btn.setToolTip("Show at 100% (preview resolution)")
+        self.one_btn.setMaximumWidth(34)
+        self.one_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.one_btn.setEnabled(False)
+        self.one_btn.clicked.connect(lambda: self._scroll.set_zoom(1.0))
 
         self.mute_btn = QPushButton("🔊")
         self.mute_btn.setMaximumWidth(34)
@@ -1622,6 +1756,9 @@ class PreviewWidget(QWidget):
             controls.addWidget(w)
         controls.addSpacing(8)
         controls.addWidget(self.loop_chk)
+        controls.addWidget(self.src_btn)
+        controls.addWidget(self.fit_btn)
+        controls.addWidget(self.one_btn)
         controls.addWidget(self.mute_btn)
         controls.addStretch(1)
         controls.addWidget(self.frame_lbl)
@@ -1631,8 +1768,10 @@ class PreviewWidget(QWidget):
         self.timer.timeout.connect(self._advance)
 
         # busy badge over the image: the preview keeps showing the previous
-        # (stale) frames while a re-render runs, so say that it's updating
-        self._busy_badge = QLabel("Rendering…", self.view)
+        # (stale) frames while a re-render runs, so say that it's updating.
+        # Parented to the scroll viewport (not the label), so it stays put
+        # when the label grows past the viewport at high zoom.
+        self._busy_badge = QLabel("Rendering…", self._scroll.viewport())
         self._busy_badge.setStyleSheet(
             "background: rgba(13, 15, 18, 190); color: #ffd166;"
             "padding: 4px 10px; border-radius: 4px; font-weight: bold;")
@@ -1650,7 +1789,7 @@ class PreviewWidget(QWidget):
 
     def _place_badge(self) -> None:
         self._busy_badge.move(
-            self.view.width() - self._busy_badge.width() - 10, 10)
+            self._scroll.viewport().width() - self._busy_badge.width() - 10, 10)
 
     def _current_fraction(self) -> Optional[float]:
         n = len(self._frames)
@@ -1658,11 +1797,57 @@ class PreviewWidget(QWidget):
 
     def _set_transport_enabled(self, on: bool) -> None:
         for b in (self.start_btn, self.prev_btn, self.play_btn,
-                  self.next_btn, self.end_btn):
+                  self.next_btn, self.end_btn, self.src_btn,
+                  self.fit_btn, self.one_btn):
             b.setEnabled(on)
 
     def _set_loop(self, on: bool) -> None:
         self._loop = bool(on)
+
+    # -- loop sub-range (I/O markers on the scrub slider) -------------------- #
+
+    def loop_range(self) -> Optional[Tuple[int, int]]:
+        """The active loop sub-range as (lo, hi) frame indices, or None."""
+        if self._loop_in is None or self._loop_out is None or not self._frames:
+            return None
+        lo, hi = sorted((self._loop_in, self._loop_out))
+        return (lo, hi) if lo < hi else None
+
+    def set_loop_in(self) -> None:
+        """Mark the current frame as the loop start (I); open end = clip end."""
+        if not self._frames:
+            return
+        self._loop_in = self._idx
+        if self._loop_out is None:
+            self._loop_out = len(self._frames) - 1
+        self._after_loop_edit()
+
+    def set_loop_out(self) -> None:
+        """Mark the current frame as the loop end (O); open start = frame 0."""
+        if not self._frames:
+            return
+        self._loop_out = self._idx
+        if self._loop_in is None:
+            self._loop_in = 0
+        self._after_loop_edit()
+
+    def clear_loop(self) -> None:
+        self._loop_in = self._loop_out = None
+        self.slider.set_loop_range(None)
+
+    def _after_loop_edit(self) -> None:
+        rng = self.loop_range()
+        self.slider.set_loop_range(rng)
+        if rng:                                   # setting a range implies looping
+            self.loop_chk.setChecked(True)
+
+    def _validate_loop(self) -> None:
+        """Drop a loop range that no longer fits the (re-rendered) frames."""
+        rng = self.loop_range()
+        if rng and rng[1] >= len(self._frames):
+            self._loop_in = self._loop_out = None
+            rng = None
+        self.slider.set_loop_range(rng)
 
     # -- audio (synced to the frame stepper) -------------------------------- #
 
@@ -1757,6 +1942,46 @@ class PreviewWidget(QWidget):
         (~7-10× smaller than QImages), so a long preview stays in budget."""
         return QImage.fromData(self._frames[idx], "JPG")
 
+    # -- A/B compare: hold to show the clean source frame -------------------- #
+
+    def show_override(self, img: QImage) -> None:
+        """Display *img* in place of the current frame until cleared."""
+        if img is None or img.isNull():
+            return
+        if self.timer.isActive():                 # comparing is a still act
+            self.toggle()
+        self._override = img
+        self._render_pixmap(img)
+
+    def clear_override(self) -> None:
+        if self._override is None:
+            return
+        self._override = None
+        if self._frames:
+            self._show(self._idx)
+
+    def _render_pixmap(self, img: QImage) -> None:
+        """Scale *img* per the view's zoom (Fit, or an explicit factor)."""
+        z = self._scroll.zoom
+        self._scroll.last_native = img.size()
+        smooth = Qt.TransformationMode.SmoothTransformation
+        if z is None:                             # fit: label == viewport
+            pix = QPixmap.fromImage(img).scaled(
+                self.view.size(), Qt.AspectRatioMode.KeepAspectRatio, smooth)
+        else:
+            mode = (Qt.TransformationMode.FastTransformation
+                    if self.timer.isActive() else smooth)
+            pix = QPixmap.fromImage(img).scaled(
+                img.size() * z, Qt.AspectRatioMode.KeepAspectRatio, mode)
+            self.view.resize(pix.size())          # scrollbars track the zoom
+        self.view.setPixmap(pix)
+
+    def _on_zoom_changed(self, _zoom) -> None:
+        if self._override is not None:
+            self._render_pixmap(self._override)
+        elif self._frames:
+            self._show(self._idx)
+
     def set_frames(self, frames: List[bytes], fps: float) -> None:
         """Replace all frames at once, keeping the scrub position if possible."""
         frac = self._current_fraction()
@@ -1770,6 +1995,7 @@ class PreviewWidget(QWidget):
         self.slider.blockSignals(True)
         self.slider.setRange(0, max(0, len(frames) - 1))
         self.slider.blockSignals(False)
+        self._validate_loop()                    # a shorter render drops the range
         if has:
             tgt = round(frac * (len(frames) - 1)) if frac is not None else 0
             self._idx = max(0, min(tgt, len(frames) - 1))
@@ -1815,6 +2041,7 @@ class PreviewWidget(QWidget):
 
     def end_stream(self) -> None:
         self._streaming = False
+        self._validate_loop()                    # a shorter render drops the range
         if not self._frames:
             self.slider.setEnabled(False)
             self._set_transport_enabled(False)
@@ -1839,10 +2066,8 @@ class PreviewWidget(QWidget):
             return
         idx = max(0, min(idx, len(self._frames) - 1))
         self._idx = idx
-        pix = QPixmap.fromImage(self._image(idx))
-        self.view.setPixmap(pix.scaled(
-            self.view.size(), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation))
+        if self._override is None:                   # a held Source frame wins
+            self._render_pixmap(self._image(idx))
         self._update_frame_label()
         self.frameChanged.emit(idx)
 
@@ -1854,6 +2079,13 @@ class PreviewWidget(QWidget):
 
     def _advance(self) -> None:
         if not self._frames:
+            return
+        rng = self.loop_range()
+        if self._loop and rng and self._idx + 1 > rng[1]:   # loop the sub-range
+            self._advancing = True
+            self.slider.setValue(rng[0])
+            self._advancing = False
+            self._audio_resync()
             return
         if self._idx + 1 >= len(self._frames):       # reached the end
             if self._loop:
@@ -1872,7 +2104,9 @@ class PreviewWidget(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._frames:
+        if self._override is not None:
+            self._render_pixmap(self._override)
+        elif self._frames:
             self._show(self._idx)
         if self._busy_badge.isVisible():
             self._place_badge()

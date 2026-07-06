@@ -774,6 +774,149 @@ def test_preview_frames_stored_compressed(qapp, tmp_path):
     assert pv.frame_count() == len(frames)
 
 
+def _preview_with_frames(n=10, w=8, h=8, fps=24.0):
+    from moshit.gui.preview import encode_preview_frame
+    from moshit.gui.widgets import PreviewWidget
+    pv = PreviewWidget()
+    pv.set_frames([encode_preview_frame(bytes([i * 20]) * (w * h * 3), w, h)
+                   for i in range(n)], fps)
+    return pv
+
+
+def test_preview_loop_range_wraps(qapp):
+    from PySide6.QtGui import QPixmap
+    pv = _preview_with_frames(10)
+    pv.seek_to(2)
+    pv.set_loop_in()                                # I at frame 2 (open end)
+    pv.seek_to(5)
+    pv.set_loop_out()                               # O at frame 5
+    assert pv.loop_range() == (2, 5)
+    assert pv.loop_chk.isChecked()                  # a range implies looping
+    pv.slider.resize(200, 20)                       # band paint path
+    pv.slider.render(QPixmap(pv.slider.size()))
+    pv.seek_to(5)
+    pv._advance()
+    assert pv.current_index() == 2                  # wrapped inside the range
+    pv.loop_chk.setChecked(False)
+    pv.seek_to(5)
+    pv._advance()
+    assert pv.current_index() == 6                  # loop off: plays through
+    pv.loop_chk.setChecked(True)
+    pv.clear_loop()
+    pv.seek_to(9)
+    pv._advance()
+    assert pv.current_index() == 0                  # whole-clip wrap fallback
+    pv.seek_to(8)
+    pv.set_loop_in()                                # reversed marks normalize
+    pv.seek_to(3)
+    pv.set_loop_out()
+    assert pv.loop_range() == (3, 8)
+    pv.set_frames(pv._frames[:5], 24.0)             # shorter re-render
+    assert pv.loop_range() is None                  # stale range dropped
+
+
+def test_preview_loop_keys(win, qapp):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from moshit.gui.preview import encode_preview_frame
+    win.show()                                     # window shortcuts need focus
+    win.activateWindow()
+    qapp.processEvents()
+    frames = [encode_preview_frame(bytes(8 * 8 * 3), 8, 8) for _ in range(6)]
+    win.preview.set_frames(frames, 24.0)
+    win.preview.seek_to(1)
+    QTest.keyClick(win, Qt.Key.Key_I)
+    win.preview.seek_to(4)
+    QTest.keyClick(win, Qt.Key.Key_O)
+    assert win.preview.loop_range() == (1, 4)
+    QTest.keyClick(win, Qt.Key.Key_I, Qt.KeyboardModifier.ShiftModifier)
+    assert win.preview.loop_range() is None
+
+
+def test_source_frame_mapping(ctl):
+    from moshit.project import Clip, MediaItem
+    assert ctl.source_frame_for(0) is None          # empty timeline
+    ctl.project.media["m"] = MediaItem(id="m", source_path="x", label="m",
+                                       role="main", intermediate_path="x",
+                                       nb_frames=100)
+    b = Clip(id="b", media_id="m", track="main", start=100,
+             in_point=10, out_point=60)
+    ctl.project.clips += [Clip(id="a", media_id="m", track="main"), b]
+    assert ctl.source_frame_for(0) == ("m", 0)
+    assert ctl.source_frame_for(99) == ("m", 99)
+    assert ctl.source_frame_for(105) == ("m", 15)   # trim offsets the source
+    b.speed = 2.0
+    assert ctl.source_frame_for(110) == ("m", 30)   # 10 + 10×2
+    b.speed, b.reverse = 1.0, True
+    assert ctl.source_frame_for(105) == ("m", 54)   # 60-1-5
+    b.reverse = False
+    c = Clip(id="c", media_id="m", track="main", start=140)
+    ctl.project.clips.append(c)
+    assert ctl.source_frame_for(145) == ("m", 5)    # overlap: incoming clip wins
+    assert ctl.source_frame_for(500) is None        # past the end
+
+
+def test_fetch_source_frame_caches(qapp, ctl, make_clip):
+    item = ctl._do_import(make_clip("src.mp4"), "main")
+    calls = []
+    orig = ctl._ab_ff.snapshot
+    ctl._ab_ff.snapshot = lambda *a, **k: (calls.append(1), orig(*a, **k))[1]
+    img1 = ctl.fetch_source_frame(item.id, 3)
+    img2 = ctl.fetch_source_frame(item.id, 3)
+    assert img1 is not None and not img1.isNull()
+    assert img2 is img1 and calls == [1]            # second hit from the cache
+    assert (img1.width(), img1.height()) == (64, 48)
+    assert ctl.fetch_source_frame("nope", 0) is None
+
+
+def test_preview_source_override(qapp):
+    from PySide6.QtGui import QImage
+    pv = _preview_with_frames(6)
+    pv.resize(400, 300)
+    pv.toggle()                                     # playing
+    assert pv.timer.isActive()
+    img = QImage(16, 16, QImage.Format.Format_RGB32)
+    img.fill(0xFFFF0000)
+    pv.show_override(img)
+    assert not pv.timer.isActive()                  # comparing pauses playback
+    before = pv.view.pixmap().cacheKey()
+    pv._show(3)                                     # frame updates don't stomp it
+    assert pv.view.pixmap().cacheKey() == before
+    pv.clear_override()
+    assert pv.view.pixmap().cacheKey() != before    # back to the moshed render
+
+
+def test_preview_zoom_and_badge(qapp):
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    pv = _preview_with_frames(4, w=32, h=24)
+    pv.resize(500, 400)
+    pv.show()
+    qapp.processEvents()
+    assert pv._scroll.zoom is None                  # fit by default
+    pv.one_btn.click()                              # 1:1
+    qapp.processEvents()
+    assert pv._scroll.zoom == 1.0
+    assert pv.view.width() == 32                    # label at native size
+    pv._scroll.set_zoom(4.0)
+    qapp.processEvents()
+    assert pv.view.width() == 128
+    ev = QWheelEvent(QPointF(50, 50), QPointF(50, 50), QPoint(0, 0),
+                     QPoint(0, 120), Qt.MouseButton.NoButton,
+                     Qt.KeyboardModifier.ControlModifier,
+                     Qt.ScrollPhase.NoScrollPhase, False)
+    pv._scroll.wheelEvent(ev)                       # Ctrl+wheel zooms in
+    assert pv._scroll.zoom == 5.0                   # 4.0 × 1.25
+    pv.set_rendering(True)                          # badge pinned to the viewport
+    vp = pv._scroll.viewport()
+    g = pv._busy_badge.geometry()
+    assert pv._busy_badge.isVisible()
+    assert g.right() <= vp.width() and g.top() >= 0
+    pv.fit_btn.click()
+    assert pv._scroll.zoom is None
+    pv.hide()
+
+
 def test_effect_stack_region_and_pixel_fx(win):
     ctl = win.controller
     _seed_clip(ctl, "c")
