@@ -61,31 +61,55 @@ def transfer_raw(base_frames: List[bytes], motion_frames: List[bytes],
                  out_len=None, region=None) -> List[bytes]:
     """Warp *base_frames* by the optical flow of *motion_frames*.
 
+    List-in/list-out wrapper over :func:`transfer_raw_iter` (kept for callers
+    that need the whole clip, e.g. when raw FX follow)."""
+    return list(transfer_raw_iter(base_frames, motion_frames, width, height,
+                                  hold=hold, accumulate=accumulate,
+                                  strength=strength, preset=preset,
+                                  use_opencl=use_opencl, out_len=out_len,
+                                  region=region))
+
+
+def transfer_raw_iter(base_frames, motion_frames: List[bytes],
+                      width: int, height: int, *, hold: bool = True,
+                      accumulate: bool = True, strength: float = 1.0,
+                      preset: str = "fast", use_opencl: bool = True,
+                      out_len=None, region=None):
+    """Warp *base_frames* by the optical flow of *motion_frames*, streaming.
+
     Frames are RGB24 bytes (``width*height*3`` each). Frame 0 is the unwarped
     base; frame ``i`` is the base warped by the flow accumulated through motion
     frame ``min(i, last)`` (the flow holds once the motion ends).
+
+    *base_frames* may be any iterable (e.g. a live ffmpeg decode) -- it is
+    consumed in lockstep, so only the current base frame, the motion frames
+    and the flow accumulator are held in RAM, not the whole warped clip (P13).
 
     * ``hold`` -- warp the base's first frame throughout (the held "melt", like
       motion_splice holding its keyframe); else warp the i-th base frame.
     * ``accumulate`` -- sum flow over time (drifting smear) vs. instantaneous.
     * ``strength`` -- scale the displacement.
     * ``out_len`` -- number of output frames (default ``len(motion)``). Pass
-      ``len(base)`` to use it as a *length-preserving clip effect*.
+      the base length to use it as a *length-preserving clip effect*.
     * ``region`` -- ``(start, end)`` output frames to warp; outside it the base
       passes through unchanged.
     """
     import cv2
     import numpy as np
 
-    if not base_frames or not motion_frames:
-        return list(base_frames)
-
     h, w = int(height), int(width)
+    base_it = iter(base_frames)
+    first = next(base_it, None)
+    if first is None:                        # empty base: nothing to emit
+        return
+    if not motion_frames:                    # no driver: base passes through
+        yield first
+        yield from base_it
+        return
 
     def to_arr(b: bytes):
         return np.frombuffer(b, np.uint8).reshape(h, w, 3)
 
-    base = [to_arr(b) for b in base_frames]
     motion = [to_arr(b) for b in motion_frames]
     n_out = int(out_len) if out_len else len(motion)
     r0, r1 = region if region else (0, n_out)
@@ -104,7 +128,7 @@ def transfer_raw(base_frames: List[bytes], motion_frames: List[bytes],
     acc = np.zeros((h, w, 2), np.float32)
     prev_gray = cv2.cvtColor(motion[0], cv2.COLOR_RGB2GRAY)
 
-    out = []
+    cur_bytes = first                        # advances with i unless holding
     mi = 0                                   # how far motion has accumulated
     for i in range(n_out):
         target = min(i, len(motion) - 1)
@@ -116,15 +140,17 @@ def transfer_raw(base_frames: List[bytes], motion_frames: List[bytes],
                 fl = cv2.resize(fl, (w, h))
             acc = acc + fl * float(strength) if accumulate else fl * float(strength)
             prev_gray = gray
-        src = base[0] if hold else base[min(i, len(base) - 1)]
+        if not hold and i > 0:               # i-th base frame, sticking at last
+            nxt = next(base_it, None)
+            if nxt is not None:
+                cur_bytes = nxt
         if not (r0 <= i < r1) or not acc.any():
-            out.append(np.ascontiguousarray(src, np.uint8))   # passthrough
+            yield cur_bytes                  # passthrough, no copies
             continue
-        warped = get(cv2.remap(um(src), um(gx + acc[..., 0]), um(gy + acc[..., 1]),
+        warped = get(cv2.remap(um(to_arr(cur_bytes)),
+                               um(gx + acc[..., 0]), um(gy + acc[..., 1]),
                                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT))
-        out.append(np.ascontiguousarray(warped, np.uint8))
-
-    return [f.tobytes() for f in out]
+        yield np.ascontiguousarray(warped, np.uint8).tobytes()
 
 
 def magnify_raw(frames: List[bytes], width: int, height: int, *,

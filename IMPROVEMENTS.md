@@ -121,7 +121,11 @@ misc) so commits can reference them. Tick items off as they land.
   composite re-render: 0.91s → 0.52s); (2) the flat fold cached on (ordered seg
   keys + meta), so an unchanged re-render (undo/redo hop, audio-only edit, manual
   refresh) copies the AVI instead of re-encoding (0.34s → ~0s).
-- [ ] P13: stream flow/raw stages instead of ~3× whole-clip RAM.
+- [x] P13 (flow): flow-only clips now stream end-to-end — `transfer_raw_iter`
+  consumes the live ffmpeg decode in lockstep and yields warped frames straight
+  into the encoder, holding one frame + the motion driver instead of ~3 whole
+  clips. Raw FX stay whole-clip *by contract* (CDP audio-bend modes treat the clip
+  as one buffer; feedback modes carry temporal state) — documented, not streamable.
 - [x] U5: preview frames are now held as JPEG bytes (encoded on the decoder worker
   thread at ~0.8 ms/frame, ~7–10× smaller than QImages) and decoded on demand at
   display time (~1.1 ms — trivial against a 42 ms frame budget). A 60 s 720p preview

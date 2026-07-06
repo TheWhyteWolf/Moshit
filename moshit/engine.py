@@ -400,15 +400,15 @@ class MoshEngine:
             return Path(seg)
         w, h = self._pixel_geom()
         # Serialised across segment workers: the numpy core is GIL-bound (so
-        # concurrency only thrashes) and holds the whole decoded clip in RAM
+        # concurrency only thrashes) and can hold whole decoded clips in RAM
         # (so concurrency multiplies the peak). Decode is included to keep the
         # memory profile identical to a serial render.
         with self._pixel_stage_lock:
-            frames = list(self.ff.decode_rgb_raw(seg, w, h))
+            base = self.ff.decode_rgb_raw(seg, w, h)   # lazy frame iterator
             if do_flow:
                 motion = self._motion_rgb(motion_src, w, h)
-                frames = flow.transfer_raw(
-                    frames, motion, w, h,
+                base = flow.transfer_raw_iter(
+                    base, motion, w, h,
                     hold=flow_args.get("hold", True),
                     accumulate=flow_args.get("accumulate", True),
                     strength=float(flow_args.get("strength", 1.0)),
@@ -417,8 +417,13 @@ class MoshEngine:
                     out_len=flow_args.get("out_len"),
                     region=flow_args.get("region"))
             if do_raw:
-                frames = self._raw_frames(frames, usable, w, h, mask=mask)
-            return self.ff.encode_rgb_raw(frames, out_avi, width=w, height=h,
+                # raw FX are whole-clip by contract (the CDP audio-bend modes
+                # treat the clip as one buffer; feedback modes carry temporal
+                # state), so this branch materialises the frames.
+                base = self._raw_frames(list(base), usable, w, h, mask=mask)
+            # flow-only clips stream end-to-end: decode → warp → encode holds
+            # one frame + the motion driver instead of ~3 whole clips (P13).
+            return self.ff.encode_rgb_raw(base, out_avi, width=w, height=h,
                                           fps=self.config.fps,
                                           qscale=self.config.qscale,
                                           gop=self.config.gop)

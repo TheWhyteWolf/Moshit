@@ -193,3 +193,37 @@ def test_flow_dialog_values():
     media_id, params = dlg.values()
     assert media_id == "media_2"
     assert params["strength"] == 2.0 and params["hold"] is False
+
+
+def _synth_clips(w=64, h=48, n_base=6, n_motion=8):
+    rng = np.random.default_rng(7)
+    base = [rng.integers(0, 255, (h, w, 3), np.uint8).tobytes()
+            for _ in range(n_base)]
+    motion = []
+    for k in range(n_motion):
+        m = np.zeros((h, w, 3), np.uint8)
+        m[10:34, 4 + k * 4:20 + k * 4, 2] = 255
+        motion.append(m.tobytes())
+    return base, motion
+
+
+@pytest.mark.parametrize("hold", [True, False])
+def test_transfer_iter_matches_list_form(hold):
+    w, h = 64, 48
+    base, motion = _synth_clips(w=w, h=h)
+    kw = dict(hold=hold, strength=1.5, use_opencl=False,
+              out_len=len(base), region=(1, 4))
+    ref = flow.transfer_raw(base, motion, w, h, **kw)
+    # generator INPUT (a live decode) and generator output, consumed lazily
+    streamed = list(flow.transfer_raw_iter(iter(base), motion, w, h, **kw))
+    assert streamed == ref
+    assert len(streamed) == len(base)                # length-preserving
+
+
+def test_transfer_iter_degenerate_inputs():
+    w, h = 64, 48
+    base, motion = _synth_clips(w=w, h=h, n_base=3)
+    # no motion driver: base passes through untouched
+    assert list(flow.transfer_raw_iter(iter(base), [], w, h)) == base
+    # empty base: nothing to emit
+    assert list(flow.transfer_raw_iter(iter([]), motion, w, h)) == []
