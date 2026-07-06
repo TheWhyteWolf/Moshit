@@ -361,9 +361,23 @@ class _FakeEngine:
     the project's non-destructive bookkeeping can be tested without transcoding.
     """
 
+    seg_workers = 1                            # render fans out serially in selftest
+
     def __init__(self):
         self._dir = Path(tempfile.mkdtemp(prefix="dm_selftest_"))
         self._n = 0
+
+    def __getattr__(self, name):
+        # Normal lookup finds the stubs above; anything else lands here. If the
+        # code under test reaches for a real MoshEngine method we haven't
+        # stubbed, fail loudly with the name instead of a bare AttributeError,
+        # so selftest drift is actionable rather than mysterious.
+        from .engine import MoshEngine
+        if callable(getattr(MoshEngine, name, None)):
+            raise NotImplementedError(
+                f"selftest _FakeEngine is out of date: MoshEngine.{name}() is "
+                f"exercised by the code under test but has no fake stub — add one.")
+        raise AttributeError(name)
 
     def _tmp(self, suffix: str) -> Path:
         self._n += 1
@@ -418,6 +432,23 @@ class _FakeEngine:
             frames.extend(parse_avi(s).frames)
         write_avi(dst, frames, parse_avi(seg_avis[0]))
         return Path(dst)
+
+    def composite(self, layers, dst, *, total_frames):
+        # No ffmpeg pixel compositing; write the bottom layer's frames so the
+        # composite render() path runs end to end and its layer/audio
+        # bookkeeping (computed around this call) can be asserted.
+        base = parse_avi(layers[0]["input"])
+        write_avi(dst, base.frames, base)
+        return Path(dst)
+
+    def mix_audio(self, plans, dst, *, fps=None):
+        # No ffmpeg mux; report an artefact only when some track carries real
+        # audio, so the summing path's "is there anything to mix" logic is hit.
+        if any(seg.get("source") and not seg.get("silent")
+               for plan in plans for seg in plan):
+            Path(dst).write_bytes(b"")
+            return Path(dst)
+        return None
 
 
 def _check(cond: bool, msg: str, failures: List[str]) -> None:
@@ -1031,6 +1062,22 @@ def cmd_selftest(args) -> int:
     _check([t.id for t in lrel.video_tracks(lrel.root_seq_id)]
            == [MAIN_TRACK_ID, v2.id],
            "tracks survive JSON round-trip in compositing order", failures)
+
+    # Actually drive the composite render path (two stacked video tracks force
+    # it off the flat fast path): this exercises engine.composite + the
+    # per-track audio plans that a single-track render never reaches.
+    lr = lproj.render(fake, tmp / "l_render.avi")
+    _check(lr["clips_rendered"] == 2,
+           "composite render emits one layer per stacked clip", failures)
+    _check(len(lr["audio_plans"]) == 2,
+           "composite render builds one audio plan per video track", failures)
+    _check(lr["frames"] == 6, "composite render length spans both layers (6f)",
+           failures)
+    top_plan = lr["audio_plans"][1]                 # the v2 (top) track
+    _check(bool(top_plan) and abs(top_plan[0]["gain"] - 0.25) < 1e-9,
+           "the top track's audio plan carries its per-clip gain", failures)
+    _check(fake.mix_audio(lr["audio_plans"], tmp / "l_mix.wav") is not None,
+           "a composite's audio plans sum to a real mix (non-silent)", failures)
 
     seq = lproj.add_sequence("inner")              # a precomp
     svt = lproj.video_tracks(seq.id)[0]
