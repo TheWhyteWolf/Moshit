@@ -787,6 +787,68 @@ def test_move_clip_free_positioning(ctl):
     assert ctl.project.clip(second.id).transition_in == 0
 
 
+def test_easy_mode_adds_melt_junction_ops(ctl):
+    from moshit.project import MediaItem
+    for mid in ("m1", "m2", "m3"):
+        ctl.project.media[mid] = MediaItem(
+            id=mid, source_path="x", label=mid, role="main",
+            intermediate_path="x", nb_frames=20)
+    ctl.set_easy_mode(True)
+    first = ctl.add_clip_for_media("m1", "main")
+    assert ctl.project.clip_ops(first.id) == []       # nothing before it to melt from
+    second = ctl.add_clip_for_media("m2", "main")
+    ops = ctl.project.clip_ops(second.id)
+    assert [(o.mode, o.params) for o in ops] == [
+        ("iframe_removal", {"keep_first": False, "keep_every": 0})]
+    assert (ops[0].region_start, ops[0].region_end) == (0, 1)   # just the cut
+    third = ctl.add_clip_for_media("m3", "main")      # a row of three: every cut melts
+    assert [o.mode for o in ctl.project.clip_ops(third.id)] == ["iframe_removal"]
+
+    ctl.undo()                                        # clip + its op = one undo step
+    assert all(c.id != third.id for c in ctl.project.clips)
+    assert ctl.project.clip_ops(third.id) == []
+
+    motion = ctl.add_clip_for_media("m1", "motion")   # motion sources never melt
+    assert ctl.project.clip_ops(motion.id) == []
+    ctl.set_easy_mode(False)                          # off: plain cuts again
+    plain = ctl.add_clip_for_media("m1", "main")
+    assert ctl.project.clip_ops(plain.id) == []
+
+
+def test_easy_mode_render_melts_the_cut(ctl, make_clip, tmp_path):
+    from moshit import avi
+    ctl.set_easy_mode(True)
+    a = ctl._do_import(make_clip("a.mp4", color="red"), "main")
+    b = ctl._do_import(make_clip("b.mp4"), "main")
+    ctl.add_clip_for_media(a.id, "main")
+    ctl.add_clip_for_media(b.id, "main")
+    out = tmp_path / "easy.avi"
+    ctl.project.render(ctl.engine, out)
+    parsed = avi.parse_avi(str(out))
+    assert len(parsed.frames) == a.nb_frames + b.nb_frames - 1  # one keyframe gone
+    assert parsed.frames[0].is_iframe                # the head still opens clean
+    assert parsed.frames[a.nb_frames].is_pframe      # the cut lost its keyframe
+    # only the junction keyframe is deleted: B's later ones survive (re-bloom)
+    assert any(f.is_iframe for f in parsed.frames[a.nb_frames:])
+
+
+def test_easy_mode_toolbar_persists(qapp, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from moshit.gui.app import MainWindow
+    w1 = MainWindow()
+    try:
+        assert not w1.controller.easy_mode           # off by default
+        w1.act_easy.trigger()                        # toolbar toggle → controller
+        assert w1.act_easy.isChecked() and w1.controller.easy_mode
+    finally:
+        w1.controller.cleanup()
+    w2 = MainWindow()                                # next session: remembered
+    try:
+        assert w2.act_easy.isChecked() and w2.controller.easy_mode
+    finally:
+        w2.controller.cleanup()
+
+
 def test_cannot_remove_only_video_track(ctl):
     _seed_clip(ctl, "c")
     from moshit.project import MAIN_TRACK_ID

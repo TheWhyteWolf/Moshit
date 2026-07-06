@@ -382,10 +382,23 @@ class MainWindow(QMainWindow):
         self.act_auto.setChecked(True)
         self.act_auto.setToolTip("Re-render the preview automatically after edits")
         self.act_auto.toggled.connect(self._set_auto_refresh)
+        self.act_easy = QAction("Easy mode", self)
+        self.act_easy.setCheckable(True)
+        self.act_easy.setToolTip(
+            "Datamosh as you edit: every clip added after another one starts "
+            "with the keyframe at its cut deleted, so the picture melts across "
+            "the cut. Chain as many clips as you like; all the usual editing "
+            "tools stay available, and each transition shows in the clip's "
+            "effect stack (iframe_removal) where it can be tweaked or removed.")
+        self.act_easy.setChecked(
+            bool(self._settings.value("edit/easy_mode", False, type=bool)))
+        self.controller.set_easy_mode(self.act_easy.isChecked())
+        self.act_easy.toggled.connect(self._set_easy_mode)
         self.act_export = QAction("Export…", self)
         self.act_export.triggered.connect(self._export)
 
-        for act in (self.act_import, self.act_preview, self.act_auto, self.act_export):
+        for act in (self.act_import, self.act_preview, self.act_auto,
+                    self.act_easy, self.act_export):
             tb.addAction(act)
 
     def _build_status_widgets(self) -> None:
@@ -794,6 +807,10 @@ class MainWindow(QMainWindow):
             self._schedule_auto_refresh()
         else:
             self._refresh_timer.stop()
+
+    def _set_easy_mode(self, on: bool) -> None:
+        self._settings.setValue("edit/easy_mode", bool(on))
+        self.controller.set_easy_mode(on)
 
     def _schedule_auto_refresh(self, *, immediate: bool = False) -> None:
         """Coalesce edit-driven and explicit preview renders onto one timer."""

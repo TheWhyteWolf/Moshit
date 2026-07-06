@@ -146,6 +146,7 @@ class AppController(QObject):
         self._preview_waveform = None          # peak envelope for the timeline
         self._cleaned = False
         self.current_seq_id = ROOT_SEQ_ID      # sequence the timeline is showing
+        self.easy_mode = False                 # added clips melt into the previous one
         self._undo: List = []                 # snapshots (clips, ops, tracks, seqs)
         self._redo: List = []
         self._undo_limit = 64
@@ -586,14 +587,36 @@ class AppController(QObject):
 
     # -- instant model edits ------------------------------------------------ #
 
+    def set_easy_mode(self, on: bool) -> None:
+        """Toggle Easy mode: every clip added after another one gets the
+        keyframe at its cut deleted (see :meth:`add_clip_for_media`)."""
+        on = bool(on)
+        if on == self.easy_mode:
+            return
+        self.easy_mode = on
+        self.status.emit("Easy mode on — added clips melt into the previous one "
+                         "(keyframe deleted at the cut)." if on
+                         else "Easy mode off — added clips cut normally.")
+
     def add_clip_for_media(self, media_id: str, track: str = "main"):
         media = self.project.media[media_id]
         if track not in {t.id for t in self.project.tracks}:
             track = "motion" if track == "motion" else "main"   # legacy fallback
+        # Easy mode: a clip placed after another one melts into it — an ordinary
+        # iframe_removal op (region = the clip's first frame) deletes the
+        # keyframe at the cut, so it stays visible, tweakable and removable in
+        # the effect stack. The first clip on a track keeps its clean opening.
+        melt = (self.easy_mode and self.project.track(track).role == "video"
+                and bool(self.project.clips_for_track(track)))
         self._push_undo()
         clip = self.project.add_clip(media_id, track)
+        if melt:
+            op = self.project.add_mosh(
+                "iframe_removal", {"keep_first": False, "keep_every": 0}, clip.id)
+            op.region_end = 1                  # just the keyframe at the cut
         self.project_changed.emit()
-        self.status.emit(f"Added {media.label} to {self.project.track(track).name}")
+        self.status.emit(f"Added {media.label} to {self.project.track(track).name}"
+                         + (" — the cut melts (Easy mode)" if melt else ""))
         return clip
 
     # -- tracks (compositing) ----------------------------------------------- #

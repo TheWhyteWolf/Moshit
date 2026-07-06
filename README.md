@@ -103,6 +103,18 @@ toolbar to render only on demand with **Refresh preview** (useful on large
 projects). A **waveform strip** under the ruler shows the assembled audio, so you
 can line edits up to the sound at a glance.
 
+**Easy mode.** The classic datamosh cut — one shot's pixels carried along by the
+next shot's motion — with zero setup: toggle **Easy mode** in the toolbar and
+just add clips end to end. Every clip added after another one gets the keyframe
+at its cut deleted automatically, so each cut melts into the next clip, and any
+number of clips chain into one continuous smear sequence. The transition is an
+ordinary `iframe_removal` op on the new clip (region limited to the cut), so it
+shows in the inspector's effect stack where it can be tweaked, disabled or
+removed per clip — and every other editing tool keeps working as usual. The
+first clip on a track is left intact so the sequence still opens on a clean
+image; the melt re-blooms at the next natural keyframe unless you widen the
+effect's region.
+
 **Preview.** Frames are decoded with FFmpeg, so the GUI needs nothing beyond
 PySide6 — no extra media libraries. The preview streams in as it decodes (you see
 it build rather than waiting on a frozen window), and your scrub position is kept
