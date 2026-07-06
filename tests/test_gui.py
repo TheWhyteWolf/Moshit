@@ -286,6 +286,156 @@ def test_timeline_melt_marker_and_fx_badge_scan(qapp):
     tl.render(QPixmap(tl.size()))                  # badge + zigzag paint path
 
 
+def _drain(qapp, c, timeout_s=90):
+    """Pump the event loop until the controller's background job finishes."""
+    import time
+    t0 = time.time()
+    while c.is_busy and time.time() - t0 < timeout_s:
+        qapp.processEvents()
+        time.sleep(0.01)
+    qapp.processEvents()
+
+
+def test_import_media_batch_two_files(qapp, ctl, make_clip):
+    a, b = make_clip("a.mp4", color="red"), make_clip("b.mp4", color="blue")
+    added, changed = [], []
+    ctl.media_added.connect(added.append)
+    ctl.project_changed.connect(lambda: changed.append(1))
+    ctl.import_media_batch([a, b])
+    _drain(qapp, ctl)
+    assert [m.label for m in added] == ["a", "b"]
+    assert len(ctl.project.media) == 2
+    assert len(changed) == 1                       # one refresh for the batch
+
+
+def test_import_media_batch_collects_errors(qapp, ctl, make_clip, tmp_path):
+    good = make_clip("good.mp4", color="red")
+    errors, added = [], []
+    ctl.error.connect(errors.append)
+    ctl.media_added.connect(added.append)
+    ctl.import_media_batch([good, tmp_path / "missing.mp4"])
+    _drain(qapp, ctl)
+    assert [m.label for m in added] == ["good"]    # the good file still lands
+    assert len(errors) == 1 and "missing.mp4" in errors[0]
+    assert not ctl.is_busy                         # the job completed cleanly
+
+
+def test_place_clip_at_video_track_and_undo(ctl):
+    from moshit.project import MediaItem
+    for mid in ("m1", "m2"):
+        ctl.project.media[mid] = MediaItem(
+            id=mid, source_path="x", label=mid, role="main",
+            intermediate_path="x", nb_frames=20)
+    first = ctl.add_clip_for_media("m1", "main")
+    ctl.set_easy_mode(True)
+    placed = ctl.place_clip_at("m2", "main", 37)
+    assert placed.start == 37
+    ops = ctl.project.clip_ops(placed.id)          # occupied track: melt op
+    assert [o.mode for o in ops] == ["iframe_removal"]
+    assert (ops[0].region_start, ops[0].region_end) == (0, 1)
+    ctl.undo()                                     # clip + op = one undo step
+    assert all(c.id != placed.id for c in ctl.project.clips)
+    assert ctl.project.clip_ops(placed.id) == []
+    assert any(c.id == first.id for c in ctl.project.clips)
+    m = ctl.place_clip_at("m1", "motion", 55)      # motion pool: append, no melt
+    assert m is not None and ctl.project.clip_ops(m.id) == []
+    assert ctl.place_clip_at("m1", "no_such_track", 0) is None
+
+
+def test_media_list_mime_payload(qapp):
+    from moshit.gui.widgets import MEDIA_MIME, MediaLibrary
+    from moshit.project import MediaItem
+    lib = MediaLibrary()
+    lib.add_media(MediaItem(id="med_1", source_path="x", label="clip",
+                            role="main", intermediate_path="x", nb_frames=9))
+    mime = lib.list.mimeData([lib.list.item(0)])
+    assert bytes(mime.data(MEDIA_MIME)).decode() == "med_1"
+
+
+def _media_drag_events(x, y):
+    """(mime, enter, move, drop) carrying media id 'm' at widget pos (x, y).
+    The caller must keep *mime* alive — the events only borrow it."""
+    from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt
+    from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
+    from moshit.gui.widgets import MEDIA_MIME
+    mime = QMimeData()
+    mime.setData(MEDIA_MIME, b"m")
+    args = (Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier)
+    return (mime,
+            QDragEnterEvent(QPoint(int(x), int(y)), *args),
+            QDragMoveEvent(QPoint(int(x), int(y)), *args),
+            QDropEvent(QPointF(x, y), *args))
+
+
+def test_timeline_drop_places_at_snapped_frame(qapp):
+    from PySide6.QtGui import QPixmap
+    tl = _snap_timeline()
+    x0, _ = tl._track_x()
+    ppf = tl._ppf()
+    y = tl._lane_y(tl._lane_index("main")) + 20
+    x = x0 + 99 * ppf                              # 1f short of a's end
+    mime, enter, move, drop = _media_drag_events(x, y)
+    got = []
+    tl.mediaDroppedOnTrack.connect(lambda m, t, f: got.append((m, t, f)))
+    tl.dragEnterEvent(enter)
+    assert enter.isAccepted()
+    tl.dragMoveEvent(move)
+    assert tl._drop_hover == ("main", 100, 100)    # snapped onto the junction
+    assert tl._snap_frame == 100
+    tl.render(QPixmap(tl.size()))                  # insertion-ghost paint path
+    tl.dropEvent(drop)
+    assert got == [("m", "main", 100)]
+    assert tl._drop_hover is None and tl._snap_frame is None
+    # hovering off every lane clears the ghost and rejects the position
+    mime2, _enter2, move2, _drop2 = _media_drag_events(x, 2)   # in the ruler
+    tl.dragMoveEvent(move2)
+    assert tl._drop_hover is None and not move2.isAccepted()
+
+
+def test_timeline_url_drag_accepts_and_emits_files(qapp, tmp_path):
+    from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
+    from PySide6.QtGui import QDragEnterEvent, QDropEvent
+    tl = _snap_timeline()
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(tmp_path / "x.mp4")),
+                  QUrl.fromLocalFile(str(tmp_path / "notes.txt"))])
+    args = (Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier)
+    got = []
+    tl.filesDropped.connect(got.append)
+    enter = QDragEnterEvent(QPoint(100, 60), *args)
+    tl.dragEnterEvent(enter)
+    assert enter.isAccepted()                      # video files import from here
+    tl.dropEvent(QDropEvent(QPointF(100, 60), *args))
+    assert got == [[str(tmp_path / "x.mp4")]]      # non-video filtered out
+
+
+def test_window_drop_imports_videos(win, monkeypatch, tmp_path):
+    from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
+    from PySide6.QtGui import QDragEnterEvent, QDropEvent
+    calls = []
+    monkeypatch.setattr(win.controller, "import_media_batch",
+                        lambda paths, role="any": calls.append(list(paths)))
+    vids = QMimeData()
+    vids.setUrls([QUrl.fromLocalFile(str(tmp_path / "a.mp4")),
+                  QUrl.fromLocalFile(str(tmp_path / "b.txt"))])
+    args = (Qt.DropAction.CopyAction, vids, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier)
+    enter = QDragEnterEvent(QPoint(50, 50), *args)
+    win.dragEnterEvent(enter)
+    assert enter.isAccepted()
+    win.dropEvent(QDropEvent(QPointF(50, 50), *args))
+    assert calls == [[str(tmp_path / "a.mp4")]]
+    txt = QMimeData()
+    txt.setUrls([QUrl.fromLocalFile(str(tmp_path / "b.txt"))])
+    enter2 = QDragEnterEvent(QPoint(50, 50), Qt.DropAction.CopyAction, txt,
+                             Qt.MouseButton.LeftButton,
+                             Qt.KeyboardModifier.NoModifier)
+    win.dragEnterEvent(enter2)
+    assert not enter2.isAccepted()                 # nothing importable
+
+
 def _timeline_in_pane(qapp, nb_frames=40):
     """A TimelineWidget with one clip, hosted in a shown TimelinePane."""
     from moshit.gui.widgets import TimelineWidget, TimelinePane

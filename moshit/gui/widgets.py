@@ -6,16 +6,31 @@ third-party plugin -- gets a usable UI with no changes here.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QPoint, QRect, QTimer, Signal
+from PySide6.QtCore import Qt, QMimeData, QPoint, QRect, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea,
+    QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
+
+# Drag payload for library media (the media id), and the source-file kinds an
+# OS drag may drop anywhere to import (mirrors the import dialog's filter).
+MEDIA_MIME = "application/x-moshit-media"
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".gif"}
+
+
+def video_paths_from_mime(mime) -> List[str]:
+    """Local video-file paths carried by an OS file drag (empty if none)."""
+    if not mime.hasUrls():
+        return []
+    return [u.toLocalFile() for u in mime.urls()
+            if u.isLocalFile() and Path(u.toLocalFile()).suffix.lower()
+            in VIDEO_EXTS]
 
 try:
     from PySide6.QtCore import QUrl
@@ -629,7 +644,7 @@ class MediaLibrary(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(_heading("Media"))
 
-        self.list = QListWidget()
+        self.list = _MediaList("Import videos — or drop files here")
         self.list.itemDoubleClicked.connect(
             lambda _: self._emit_add("main"))     # double-click → main track
         layout.addWidget(self.list, 1)
@@ -700,6 +715,8 @@ class TimelineWidget(QWidget):
     reorderTrackRequested = Signal(str, int)       # track_id, delta (-1 up/+1 down)
     trackEnabledToggled = Signal(str, bool)        # track_id, enabled
     addClipToTrackRequested = Signal(str)          # track_id (uses library selection)
+    mediaDroppedOnTrack = Signal(str, str, int)    # media_id, track_id, frame (-1=append)
+    filesDropped = Signal(list)                    # OS video files dropped here
     enterSequenceRequested = Signal(str)           # seq_id (double-clicked a precomp)
     zoomStepRequested = Signal(float, int)         # wheel steps, anchor x (widget px)
     zoomFitRequested = Signal()
@@ -720,6 +737,7 @@ class TimelineWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)                   # library media + OS files
         self._project = None
         self._play_frac = 0.0                       # playhead as 0..1 of the preview
         self._total = 1
@@ -734,6 +752,7 @@ class TimelineWidget(QWidget):
         self._snap_frame: Optional[int] = None      # engaged snap target (frames)
         self._fx_count: Dict[str, int] = {}         # clip_id -> live mosh-op count
         self._melt_heads: set = set()               # clips whose opening cut melts
+        self._drop_hover: Optional[Tuple[str, int, int]] = None  # track, frame, len
 
     def set_project(self, project) -> None:
         self._project = project
@@ -969,6 +988,23 @@ class TimelineWidget(QWidget):
             p.setPen(QColor("#ffd166"))
             p.drawLine(self._cursor_x, self.RULER_H, self._cursor_x,
                        self.height() - 2)
+
+        # library-drag hover: insertion ghost where a drop would land the clip
+        if self._drop_hover:
+            tid, frame, length = self._drop_hover
+            gy = self._lane_y(self._lane_index(tid))
+            p.setPen(QColor("#4ecdc4"))
+            if frame >= 0:
+                grect = QRect(int(x0 + frame * ppf), gy,
+                              max(2, int(length * ppf) - 2), self.LANE_H)
+                p.fillRect(grect, QColor(78, 205, 196, 40))
+                p.drawRect(grect.adjusted(0, 0, -1, -1))
+                if self._snap_frame is not None:
+                    sx = int(x0 + self._snap_frame * ppf)
+                    p.drawLine(sx, self.RULER_H, sx, self.height() - 2)
+            else:                                   # motion pool: appends
+                p.drawRect(QRect(x0, gy, track_w, self.LANE_H)
+                           .adjusted(0, 0, -1, -1))
 
         # playhead (proportional to the preview position) + scrub handle
         px = int(x0 + self._play_frac * track_w)
@@ -1280,6 +1316,80 @@ class TimelineWidget(QWidget):
         else:
             self.panRequested.emit(-(delta.x() or delta.y()), 0)
         event.accept()
+
+    # -- drag & drop: library media placement + OS-file import --------------- #
+
+    @staticmethod
+    def _drag_media_id(mime) -> Optional[str]:
+        if mime.hasFormat(MEDIA_MIME):
+            return bytes(mime.data(MEDIA_MIME)).decode() or None
+        return None
+
+    def dragEnterEvent(self, event) -> None:       # noqa: N802 (Qt signature)
+        if self._project and (self._drag_media_id(event.mimeData())
+                              or video_paths_from_mime(event.mimeData())):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:        # noqa: N802 (Qt signature)
+        mid = self._drag_media_id(event.mimeData())
+        if mid is None:                             # OS files: import, no placement
+            event.acceptProposedAction()
+            return
+        pos = event.position().toPoint()
+        t = self._lane_at(pos.y())
+        if t is None:
+            self._drop_hover = None
+            self._snap_frame = None
+            self.update()
+            event.ignore()
+            return
+        media = self._project.media.get(mid)
+        length = media.nb_frames if media else 0
+        if t.role == "video":
+            x0, _x1 = self._track_x()
+            frame = max(0, round((pos.x() - x0) / self._ppf()))
+            # magnetic drop: both would-be edges snap like a clip drag's
+            d = {"mode": "move", "track": t.id, "id": None, "ppf": self._ppf(),
+                 "start": 0, "length": length}
+            adj, tgt = self._snap_adjust(frame, d, event.modifiers())
+            frame, self._snap_frame = max(0, adj), tgt
+        else:                                       # motion pool plays in order
+            frame, self._snap_frame = -1, None
+        self._drop_hover = (t.id, frame, length)
+        self.update()
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, _event) -> None:      # noqa: N802 (Qt signature)
+        self._drop_hover = None
+        self._snap_frame = None
+        self.update()
+
+    def dropEvent(self, event) -> None:            # noqa: N802 (Qt signature)
+        hover, self._drop_hover = self._drop_hover, None
+        self._snap_frame = None
+        mid = self._drag_media_id(event.mimeData())
+        if mid is None:
+            paths = video_paths_from_mime(event.mimeData())
+            if paths:                               # OS files: import them
+                self.filesDropped.emit(paths)
+                event.acceptProposedAction()
+            self.update()
+            return
+        if hover is None:                           # drop with no move seen
+            pos = event.position().toPoint()
+            t = self._lane_at(pos.y())
+            if t is None:
+                self.update()
+                return
+            x0, _x1 = self._track_x()
+            frame = (max(0, round((pos.x() - x0) / self._ppf()))
+                     if t.role == "video" else -1)
+            hover = (t.id, frame, 0)
+        self.mediaDroppedOnTrack.emit(mid, hover[0], hover[1])
+        event.acceptProposedAction()
+        self.update()
 
     def contextMenuEvent(self, event) -> None:
         from PySide6.QtWidgets import QMenu
@@ -1825,6 +1935,23 @@ class _HintListWidget(QListWidget):
             painter.drawText(self.viewport().rect(),
                              int(Qt.AlignmentFlag.AlignCenter), self._hint)
             painter.end()
+
+
+class _MediaList(_HintListWidget):
+    """The library list: a drag source, so media can be dropped straight onto
+    a timeline lane (the payload is the media id under ``MEDIA_MIME``)."""
+
+    def __init__(self, hint: str):
+        super().__init__(hint)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+
+    def mimeData(self, items) -> QMimeData:        # noqa: N802 (Qt signature)
+        mime = QMimeData()
+        if items:
+            mime.setData(MEDIA_MIME,
+                         str(items[0].data(Qt.ItemDataRole.UserRole)).encode())
+        return mime
 
 
 class InspectorPanel(QWidget):

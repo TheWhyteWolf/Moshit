@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from ..engine import EngineConfig, _ext_for_profile
 from .controller import AppController, _friendly_error
 from .widgets import (InspectorPanel, MediaLibrary, PreviewWidget, TimelinePane,
-                      TimelineWidget)
+                      TimelineWidget, video_paths_from_mime)
 
 _VIDEO_FILTER = "Video (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.gif);;All files (*)"
 
@@ -235,6 +235,7 @@ class MainWindow(QMainWindow):
                  ffprobe_bin: Optional[str] = None):
         super().__init__()
         self.resize(1180, 760)
+        self.setAcceptDrops(True)              # drop video files anywhere to import
         self._settings = QSettings("moshit", "moshit")
 
         self.controller = AppController(config=config, ffmpeg_bin=ffmpeg_bin,
@@ -570,6 +571,8 @@ class MainWindow(QMainWindow):
         self.timeline.reorderTrackRequested.connect(self.controller.reorder_track)
         self.timeline.trackEnabledToggled.connect(self.controller.set_track_enabled)
         self.timeline.addClipToTrackRequested.connect(self._on_add_clip_to_track)
+        self.timeline.mediaDroppedOnTrack.connect(self._on_media_dropped)
+        self.timeline.filesDropped.connect(self.controller.import_media_batch)
         self.timeline.enterSequenceRequested.connect(
             self.controller.set_current_sequence)
         c.sequence_changed.connect(self._on_sequence_changed)
@@ -632,6 +635,25 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Select a media item in the library first.")
             return
         self.controller.add_clip_for_media(media_id, track_id)
+
+    def _on_media_dropped(self, media_id: str, track_id: str, frame: int) -> None:
+        """Library media dropped on a timeline lane (frame -1 = append)."""
+        if frame < 0:
+            self.controller.add_clip_for_media(media_id, track_id)
+        else:
+            self.controller.place_clip_at(media_id, track_id, frame)
+
+    # -- OS file drops: anywhere on the window imports ------------------------ #
+
+    def dragEnterEvent(self, event) -> None:       # noqa: N802 (Qt signature)
+        if video_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:            # noqa: N802 (Qt signature)
+        paths = video_paths_from_mime(event.mimeData())
+        if paths:
+            self.controller.import_media_batch(paths)
+            event.acceptProposedAction()
 
     def _on_project_changed(self) -> None:
         self._set_dirty(True)

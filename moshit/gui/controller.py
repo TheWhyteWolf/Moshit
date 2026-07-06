@@ -306,6 +306,43 @@ class AppController(QObject):
         self._run(lambda: self._do_import(path, role), done,
                   f"Importing {Path(path).name}…")
 
+    def import_media_batch(self, paths, role: str = "any") -> None:
+        """Import several files as ONE background job (e.g. dropped files).
+
+        Per-file failures are collected and surfaced once at the end; the
+        files that did import still land. Like single imports, this is not an
+        undoable edit (media isn't part of the undo snapshots)."""
+        paths = [str(p) for p in paths]
+        if not paths:
+            return
+        if len(paths) == 1:                    # keep the single-file status text
+            return self.import_media(paths[0], role)
+        gen = self._job_gen
+
+        def work():
+            cb = self._progress_cb(gen)
+            items, errors = [], []
+            for i, p in enumerate(paths):
+                cb(i, len(paths), f"Importing {Path(p).name}…")
+                try:
+                    items.append(self._do_import(p, role))
+                except Exception as exc:       # keep going; report at the end
+                    errors.append(f"{Path(p).name}: {_friendly_error(exc)}")
+            return items, errors
+
+        def done(result):
+            items, errors = result
+            for item in items:
+                self.media_added.emit(item)
+            if items:
+                self.project_changed.emit()
+                self.status.emit(f"Imported {len(items)} file(s).")
+            if errors:
+                shown = errors[:3] + (["…"] if len(errors) > 3 else [])
+                self.error.emit("Some imports failed:\n" + "\n".join(shown))
+
+        self._run(work, done, f"Importing {len(paths)} files…")
+
     def missing_media(self) -> list:
         """Offline media items (their cached intermediate AVI is gone)."""
         return self.project.missing_media()
@@ -598,25 +635,58 @@ class AppController(QObject):
                          "(keyframe deleted at the cut)." if on
                          else "Easy mode off — added clips cut normally.")
 
+    def _add_melt_op(self, clip_id: str) -> None:
+        """Attach the Easy-mode transition: an ordinary iframe_removal op whose
+        region is the clip's first frame, deleting just the keyframe at the cut
+        — visible, tweakable and removable in the effect stack like any op."""
+        op = self.project.add_mosh(
+            "iframe_removal", {"keep_first": False, "keep_every": 0}, clip_id)
+        op.region_end = 1
+
     def add_clip_for_media(self, media_id: str, track: str = "main"):
         media = self.project.media[media_id]
         if track not in {t.id for t in self.project.tracks}:
             track = "motion" if track == "motion" else "main"   # legacy fallback
-        # Easy mode: a clip placed after another one melts into it — an ordinary
-        # iframe_removal op (region = the clip's first frame) deletes the
-        # keyframe at the cut, so it stays visible, tweakable and removable in
-        # the effect stack. The first clip on a track keeps its clean opening.
+        # Easy mode: a clip placed after another one melts into it. The first
+        # clip on a track keeps its clean opening.
         melt = (self.easy_mode and self.project.track(track).role == "video"
                 and bool(self.project.clips_for_track(track)))
         self._push_undo()
         clip = self.project.add_clip(media_id, track)
         if melt:
-            op = self.project.add_mosh(
-                "iframe_removal", {"keep_first": False, "keep_every": 0}, clip.id)
-            op.region_end = 1                  # just the keyframe at the cut
+            self._add_melt_op(clip.id)
         self.project_changed.emit()
         self.status.emit(f"Added {media.label} to {self.project.track(track).name}"
                          + (" — the cut melts (Easy mode)" if melt else ""))
+        return clip
+
+    def place_clip_at(self, media_id: str, track_id: str, start: int):
+        """Place a clip at an explicit timeline frame (library drag-and-drop).
+
+        Easy mode applies the same melt rule as :meth:`add_clip_for_media`.
+        A melted clip only chains across the cut while it stays butted against
+        the previous one — the timeline's drop ghost snaps to make that the
+        default; a deliberately gapped drop keeps its (removable) melt op.
+        """
+        media = self.project.media.get(media_id)
+        try:
+            track = self.project.track(track_id)
+        except KeyError:
+            track = None
+        if media is None or track is None:
+            return None
+        if track.role != "video":              # motion pool plays in order
+            return self.add_clip_for_media(media_id, track_id)
+        melt = self.easy_mode and bool(self.project.clips_for_track(track_id))
+        self._push_undo()
+        clip = self.project.add_clip(media_id, track_id,
+                                     start=max(0, int(start)))
+        if melt:
+            self._add_melt_op(clip.id)
+        self.project_changed.emit()
+        self.status.emit(
+            f"Placed {media.label} on {track.name} at frame {clip.start}"
+            + (" — the cut melts (Easy mode)" if melt else ""))
         return clip
 
     # -- tracks (compositing) ----------------------------------------------- #
