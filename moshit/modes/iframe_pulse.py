@@ -17,7 +17,7 @@ class IFramePulse(MoshMode):
     description = "Re-inject the keyframe every N P-frames for a strobing pulse."
     params = [
         Param("period", "int", 8, lo=1, hi=240, label="Period",
-              help="Insert a pulse every N P-frames."),
+              help="Insert a pulse every N P-frames.", automatable=True),
         Param("hold", "int", 1, lo=1, hi=16, label="Hold",
               help="Frames each pulse lasts (copies of the keyframe)."),
     ]
@@ -31,13 +31,17 @@ class IFramePulse(MoshMode):
 
         last_key = frames[0] if frames[0].is_iframe else None
         out: List[Frame] = []
-        p_index = 0
-        for f in frames:
+        # count P-frames since the last pulse rather than modulo a fixed period,
+        # so an automated period (accelerating / slowing strobe) works cleanly
+        since = 0
+        for i, f in enumerate(frames):
             if f.is_iframe:
                 last_key = f
             out.append(f)
             if f.is_pframe:
-                p_index += 1
-                if last_key is not None and p_index % period == 0:
+                since += 1
+                period_i = max(1, int(round(ctx.auto("period", i, period))))
+                if last_key is not None and since >= period_i:
                     out.extend(last_key.copy() for _ in range(hold))
+                    since = 0
         return out
