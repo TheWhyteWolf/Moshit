@@ -16,8 +16,12 @@ dependencies = []
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.5"]
+# Raw-frame effects (pixel sort, RGB recurse/shift, the CDP audio-bend family)
+# and motion_magnify need numpy only -- no OpenCV.
+raw = ["numpy>=1.21"]
 # Optical-flow motion transfer. OpenCV's OpenCL backend runs it on the GPU
-# (incl. AMD via Mesa rusticl); CPU fallback otherwise.
+# (incl. AMD via Mesa rusticl); CPU fallback otherwise. Also pulls numpy so
+# `[flow]` alone still enables the raw effects.
 flow = ["opencv-python-headless>=4.6", "numpy>=1.21"]
 test = ["pytest>=7"]
 
@@ -25,8 +29,8 @@ test = ["pytest>=7"]
 moshit = "moshit.cli:main"
 moshit-gui = "moshit.gui.app:launch"
 
-[tool.setuptools]
-packages = ["moshit", "moshit.modes", "moshit.gui"]
+[tool.setuptools.packages.find]
+include = ["moshit*"]        # auto-discover moshit and its subpackages
 
 [tool.pytest.ini_options]
 # Run from the repo without an install; integration tests skip without ffmpeg.

@@ -35,12 +35,15 @@ bitstream, with the AVI index used only as a cross-check. The heavy lifting
 - FFmpeg with the `mpeg4` encoder (effectively every normal build); `ffmpeg` and
   `ffprobe` must be on your `PATH`
 - PySide6 — only if you want the GUI (`pip install 'moshit[gui]'`)
-- OpenCV + numpy — only for **optical-flow motion transfer**
-  (`pip install 'moshit[flow]'`); it runs on the GPU via OpenCV's OpenCL backend
-  (including AMD through Mesa rusticl), CPU otherwise
+- numpy — for the **raw-frame effects** (pixel sort, RGB recurse/shift, the CDP
+  audio-bend family) (`pip install 'moshit[raw]'`)
+- OpenCV (plus numpy) — additionally for **optical-flow motion transfer** and
+  `motion_magnify` (`pip install 'moshit[flow]'`); flow runs on the GPU via
+  OpenCV's OpenCL backend (including AMD through Mesa rusticl), CPU otherwise.
+  `[flow]` includes numpy, so it also enables the raw effects.
 
 The core engine and CLI themselves have **no** third-party Python dependencies;
-the GUI and optical flow are opt-in extras.
+the GUI, raw effects and optical flow are opt-in extras.
 
 On Arch:
 
