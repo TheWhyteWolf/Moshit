@@ -9,20 +9,22 @@ misc) so commits can reference them. Tick items off as they land.
 
 ## Verified correctness bugs
 
-- [ ] **B1. `motion_weave` infinite loop** (`moshit/modes/motion_weave.py:45-60`).
+*(All fixed in Wave 1 — see the roadmap below; boxes ticked for consistency.)*
+
+- [x] **B1. `motion_weave` infinite loop** (`moshit/modes/motion_weave.py:45-60`).
   `base_run=0, motion_run≥1` passes the both-zero guard; `while bi < len(base_p)`
   never advances `bi` while appending motion frames forever → hang + unbounded
   memory. Reachable from the GUI (param `lo=0`).
-- [ ] **B2. `motion_gain` automation can't cross 1.0** (`moshit/modes/motion_gain.py:35-54`).
+- [x] **B2. `motion_gain` automation can't cross 1.0** (`moshit/modes/motion_gain.py:35-54`).
   Amplify/reduce branch chosen once from the static `gain` (curve start value); the
   amplify branch never thins, the reduce branch clamps `g ≤ 1.0` so it never
   amplifies — an automated 0.5→2.0 curve silently half-works. Fix: one per-frame
   error-diffusion loop that both duplicates (acc ≥ 1) and drops (acc < 1).
-- [ ] **B3. `pingpong` dead code + interior-I-frame loss** (`moshit/modes/pingpong.py:37-42`).
+- [x] **B3. `pingpong` dead code + interior-I-frame loss** (`moshit/modes/pingpong.py:37-42`).
   `out = [f for f in frames if f.is_iframe]` is never used; only `frames[0]` survives
   as anchor in `per_gop=False` mode. Delete the dead line, pin the intended behavior
   with a test.
-- [ ] **B4. ~11 mosh modes have zero behavioral tests** (`bitrot`, `gop_scramble`,
+- [x] **B4. ~11 mosh modes have zero behavioral tests** (`bitrot`, `gop_scramble`,
   `iframe_pulse`, `momentum`, `motion_weave`, `pframe_drop`, `pframe_echo`,
   `pframe_reverse`, `pframe_shuffle`, `pingpong`, `surge`) — none of B1–B3 would be
   caught today. Add a parametrized synth-frames test that runs EVERY registered mosh
