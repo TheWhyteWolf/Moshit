@@ -1354,6 +1354,127 @@ def test_easy_mode_toolbar_persists(qapp, tmp_path, monkeypatch):
         w2.controller.cleanup()
 
 
+def _seed_media(ctl, mid="m", n=20):
+    from moshit.project import MediaItem
+    ctl.project.media[mid] = MediaItem(
+        id=mid, source_path="x", label=mid, role="main",
+        intermediate_path="x", nb_frames=n)
+    return mid
+
+
+def test_copy_paste_clip_with_effects(ctl):
+    _seed_media(ctl, "m", 20)
+    c1 = ctl.add_clip_for_media("m", "main")             # 0..20
+    ctl.add_effect(c1.id, "bitrot", {"intensity": 0.4})
+    assert ctl.copy_clips([c1.id]) == 1 and ctl.can_paste
+    depth = len(ctl._undo)
+    new = ctl.paste_clips(at_frame=50)
+    assert len(new) == 1
+    n = new[0]
+    assert n.id != c1.id and n.media_id == "m" and n.start == 50
+    src_op = ctl.clip_effects(c1.id)[0]
+    new_op = ctl.clip_effects(n.id)
+    assert [e["mode"] for e in new_op] == ["bitrot"]
+    assert new_op[0]["id"] != src_op["id"]               # independent op id
+    assert new_op[0]["params"]["intensity"] == 0.4
+    assert len(ctl._undo) == depth + 1                   # one undo step
+    ctl.undo()
+    assert all(x.id != n.id for x in ctl.project.clips)  # paste rolled back
+    ctl.redo()
+    assert any(x.start == 50 for x in ctl.project.clips)
+
+
+def test_copy_multi_preserves_offsets(ctl):
+    _seed_media(ctl, "m", 10)
+    a = ctl.add_clip_for_media("m", "main")              # 0..10
+    b = ctl.add_clip_for_media("m", "main")              # 10..20
+    assert ctl.copy_clips([a.id, b.id]) == 2
+    new = ctl.paste_clips(at_frame=100)
+    assert sorted(x.start for x in new) == [100, 110]    # spacing kept
+
+
+def test_paste_skips_missing_source_media(ctl):
+    _seed_media(ctl, "m", 10)
+    c = ctl.add_clip_for_media("m", "main")
+    ctl.copy_clips([c.id])
+    del ctl.project.media["m"]                            # source went offline
+    depth = len(ctl._undo)
+    assert ctl.paste_clips(at_frame=5) == []
+    assert len(ctl._undo) == depth                        # no spurious undo entry
+
+
+def test_remove_clips_batch_is_one_undo(ctl):
+    _seed_media(ctl, "m", 10)
+    a = ctl.add_clip_for_media("m", "main")
+    b = ctl.add_clip_for_media("m", "main")
+    ctl.add_effect(a.id, "bitrot", {})
+    depth = len(ctl._undo)
+    ctl.remove_clips([a.id, b.id])
+    assert ctl.project.main_clips() == []                # both removed
+    assert not any(o.target_clip_id == a.id for o in ctl.project.mosh_ops)
+    assert len(ctl._undo) == depth + 1                    # single undo step
+    ctl.undo()
+    assert len(ctl.project.main_clips()) == 2
+
+
+def _multi_timeline(nb=10):
+    from PySide6.QtGui import QPixmap
+    from moshit.gui.widgets import TimelineWidget
+    from moshit.project import Project, Clip, MediaItem
+    proj = Project()
+    proj.media["m"] = MediaItem(id="m", source_path="x", label="m", role="main",
+                                intermediate_path="x", nb_frames=nb)
+    for i, cid in enumerate(("a", "b", "c")):
+        proj.clips.append(Clip(id=cid, media_id="m", track="main", start=i * nb))
+    tl = TimelineWidget()
+    tl.resize(800, 240)
+    tl.set_project(proj)
+    tl.render(QPixmap(tl.size()))
+    return tl
+
+
+def test_timeline_multi_select_ctrl_and_shift(qapp):
+    from PySide6.QtCore import Qt
+    tl = _multi_timeline()
+    none, ctrl, shift = (Qt.KeyboardModifier.NoModifier,
+                         Qt.KeyboardModifier.ControlModifier,
+                         Qt.KeyboardModifier.ShiftModifier)
+    tl._update_selection("a", "main", none)
+    assert tl._selected_ids == {"a"} and tl._selected == "a"
+    tl._update_selection("c", "main", ctrl)              # ctrl adds
+    assert tl._selected_ids == {"a", "c"} and tl._selected == "c"
+    tl._update_selection("c", "main", ctrl)              # ctrl toggles off
+    assert tl._selected_ids == {"a"}
+    tl._update_selection("a", "main", none)              # reset primary to a
+    tl._update_selection("c", "main", shift)             # shift range a..c
+    assert tl._selected_ids == {"a", "b", "c"}
+    assert tl.selected_ids()[0] == "c"                   # primary listed first
+    tl._update_selection("b", "main", none)              # plain click collapses
+    assert tl._selected_ids == {"b"}
+
+
+def test_timeline_delete_and_copy_emit_selection(qapp):
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtCore import QEvent
+    tl = _multi_timeline()
+    tl._update_selection("a", "main", Qt.KeyboardModifier.NoModifier)
+    tl._update_selection("b", "main", Qt.KeyboardModifier.ControlModifier)
+    removed, copied, pasted = [], [], []
+    tl.removeManyRequested.connect(lambda ids: removed.append(sorted(ids)))
+    tl.copyRequested.connect(lambda ids: copied.append(sorted(ids)))
+    tl.pasteRequested.connect(lambda: pasted.append(1))
+    tl.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_C,
+                              Qt.KeyboardModifier.ControlModifier))
+    tl.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_V,
+                              Qt.KeyboardModifier.ControlModifier))
+    tl.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete,
+                              Qt.KeyboardModifier.NoModifier))
+    assert copied == [["a", "b"]]
+    assert pasted == [1]
+    assert removed == [["a", "b"]]
+
+
 def test_cannot_remove_only_video_track(ctl):
     _seed_clip(ctl, "c")
     from moshit.project import MAIN_TRACK_ID

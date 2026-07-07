@@ -754,6 +754,9 @@ class TimelineWidget(QWidget):
     addClipToTrackRequested = Signal(str)          # track_id (uses library selection)
     mediaDroppedOnTrack = Signal(str, str, int)    # media_id, track_id, frame (-1=append)
     filesDropped = Signal(list)                    # OS video files dropped here
+    removeManyRequested = Signal(list)             # clip ids to remove together
+    copyRequested = Signal(list)                   # clip ids to copy
+    pasteRequested = Signal()                      # paste at the playhead
     enterSequenceRequested = Signal(str)           # seq_id (double-clicked a precomp)
     zoomStepRequested = Signal(float, int)         # wheel steps, anchor x (widget px)
     zoomFitRequested = Signal()
@@ -778,7 +781,8 @@ class TimelineWidget(QWidget):
         self._project = None
         self._play_frac = 0.0                       # playhead as 0..1 of the preview
         self._total = 1
-        self._selected: Optional[str] = None
+        self._selected: Optional[str] = None              # primary (drives inspector)
+        self._selected_ids: set = set()                   # multi-select set
         self._hits: List[Tuple[QRect, str, str]] = []     # (rect, clip_id, track)
         self._drag: Optional[dict] = None
         self._scrubbing = False
@@ -834,6 +838,10 @@ class TimelineWidget(QWidget):
         self.playheadMoved.emit(int(x0 + self._play_frac * max(1, x1 - x0)))
         self.update()
 
+    def playhead_frame(self) -> int:
+        """The playhead's timeline position, in frames (for paste-at-playhead)."""
+        return round(self._play_frac * self._total)
+
     def set_waveform(self, peaks) -> None:
         self._waveform = list(peaks) if peaks else None
         self.update()
@@ -845,7 +853,32 @@ class TimelineWidget(QWidget):
 
     def select(self, clip_id: Optional[str]) -> None:
         self._selected = clip_id
+        self._selected_ids = {clip_id} if clip_id else set()
         self.update()
+
+    def selected_ids(self) -> List[str]:
+        """Every selected clip id (multi-select), primary first."""
+        ordered = [self._selected] if self._selected in self._selected_ids else []
+        ordered += [c for c in self._selected_ids if c != self._selected]
+        return ordered
+
+    def _update_selection(self, clip_id: str, track: str, modifiers) -> None:
+        """Apply a click to the selection set: Ctrl toggles, Shift range-selects
+        on the same track, a plain click selects just this clip."""
+        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        if ctrl:
+            self._selected_ids ^= {clip_id}          # toggle in/out of the set
+        elif shift and self._selected and self._is_video(track):
+            ids = [c.id for c in self._project.clips_for_track(track)]
+            if self._selected in ids and clip_id in ids:
+                i, j = sorted((ids.index(self._selected), ids.index(clip_id)))
+                self._selected_ids |= set(ids[i:j + 1])
+            else:
+                self._selected_ids.add(clip_id)
+        else:
+            self._selected_ids = {clip_id}
+        self._selected = clip_id                     # clicked clip is the primary
 
     # -- geometry ----------------------------------------------------------- #
 
@@ -1056,10 +1089,18 @@ class TimelineWidget(QWidget):
 
     def _draw_clip(self, p, rect, clip, length, motion=False) -> None:
         base = QColor("#6a4ea5") if motion else QColor("#3b6ea5")
-        if clip.id == self._selected:
+        selected = clip.id in self._selected_ids
+        if selected:
             base = base.lighter(135)
         p.fillRect(rect, base)
-        p.setPen(QColor("#9fb4d6") if clip.id == self._selected else QColor("#2a2f37"))
+        # the primary (inspector-bound) clip gets a brighter outline than the
+        # rest of a multi-selection
+        if clip.id == self._selected:
+            p.setPen(QColor("#cfe0ff"))
+        elif selected:
+            p.setPen(QColor("#9fb4d6"))
+        else:
+            p.setPen(QColor("#2a2f37"))
         p.drawRect(rect.adjusted(0, 0, -1, -1))
         media = self._project.media.get(clip.media_id)
         label = media.label if media else clip.id
@@ -1245,7 +1286,7 @@ class TimelineWidget(QWidget):
         if not hit:
             return
         rect, clip_id, track = hit
-        self._selected = clip_id
+        self._update_selection(clip_id, track, event.modifiers())
         self.clipSelected.emit(clip_id)
 
         if self._tool == "cut":                      # split at the clicked frame
@@ -1335,8 +1376,14 @@ class TimelineWidget(QWidget):
             self.enterSequenceRequested.emit(media.sequence_id)
 
     def keyPressEvent(self, event) -> None:
-        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self._selected:
-            self.removeRequested.emit(self._selected)
+        sel = self.selected_ids()
+        ctrl = event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and sel:
+            self.removeManyRequested.emit(sel)
+        elif ctrl and event.key() == Qt.Key.Key_C and sel:
+            self.copyRequested.emit(sel)
+        elif ctrl and event.key() == Qt.Key.Key_V:
+            self.pasteRequested.emit()
         else:
             super().keyPressEvent(event)
 
@@ -1433,22 +1480,37 @@ class TimelineWidget(QWidget):
         hit = self._hit(event.pos())
         if hit:
             clip_id, track = hit[1], hit[2]
-            self._selected = clip_id
+            # right-clicking outside the current multi-selection selects just
+            # this clip; right-clicking one that's already selected keeps the set
+            if clip_id not in self._selected_ids:
+                self._update_selection(clip_id, track,
+                                       Qt.KeyboardModifier.NoModifier)
+            else:
+                self._selected = clip_id
             self.clipSelected.emit(clip_id)
             self.update()
+            sel = self.selected_ids()
             menu = QMenu(self)
             act_dup = menu.addAction("Duplicate clip")
+            act_copy = menu.addAction(f"Copy {len(sel)} clip(s)" if len(sel) > 1
+                                      else "Copy clip")
+            act_paste = menu.addAction("Paste at playhead")
             act_split = (menu.addAction("Split at playhead")
                          if self._is_video(track) else None)
             menu.addSeparator()
-            act_remove = menu.addAction("Remove from timeline")
+            act_remove = menu.addAction(f"Remove {len(sel)} clips"
+                                        if len(sel) > 1 else "Remove from timeline")
             chosen = menu.exec(event.globalPos())
             if chosen == act_dup:
                 self.duplicateRequested.emit(clip_id)
+            elif chosen == act_copy:
+                self.copyRequested.emit(sel)
+            elif chosen == act_paste:
+                self.pasteRequested.emit()
             elif act_split is not None and chosen == act_split:
                 self.request_split_at_playhead()
             elif chosen == act_remove:
-                self.removeRequested.emit(clip_id)
+                self.removeManyRequested.emit(sel)
             return
         # empty area: act on the lane (track) under the cursor
         t = self._lane_at(event.pos().y())

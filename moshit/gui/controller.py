@@ -156,6 +156,7 @@ class AppController(QObject):
         self._undo: List = []                 # snapshots (clips, ops, tracks, seqs)
         self._redo: List = []
         self._undo_limit = 64
+        self._clipboard: List = []            # copied clips (+ their effect stacks)
         self._live = None                     # in-flight live effect-edit session
         # Safety net: clean the temp dir even if the window's closeEvent never
         # fires (e.g. the process is interrupted from the terminal).
@@ -1351,17 +1352,90 @@ class AppController(QObject):
         self.project_changed.emit()
 
     def remove_clip(self, clip_id: str) -> None:
-        try:
-            c = self.project.clip(clip_id)
-        except KeyError:
+        self.remove_clips([clip_id])
+
+    def remove_clips(self, clip_ids) -> None:
+        """Remove one or more clips (and their ops) in a single undo step."""
+        ids = {cid for cid in clip_ids
+               if self._clip_ok(cid)}
+        if not ids:
             return
-        if c.archived:                 # archived clips are bake history; leave them
-            return
-        self._push_undo("Remove clip")
-        self.project.clips = [x for x in self.project.clips if x.id != clip_id]
+        self._push_undo("Remove clips" if len(ids) > 1 else "Remove clip")
+        self.project.clips = [x for x in self.project.clips if x.id not in ids]
         self.project.mosh_ops = [o for o in self.project.mosh_ops
-                                 if o.target_clip_id != clip_id]
+                                 if o.target_clip_id not in ids]
         self.project_changed.emit()
+
+    def _clip_ok(self, clip_id: str) -> bool:
+        """True if *clip_id* is a live (non-archived) clip that can be edited."""
+        try:
+            return not self.project.clip(clip_id).archived
+        except KeyError:
+            return False
+
+    # -- copy / paste (clips + their effect stacks) ------------------------- #
+
+    def copy_clips(self, clip_ids) -> int:
+        """Copy clips and their effect stacks to the internal clipboard, keeping
+        each clip's offset from the earliest so paste preserves their spacing.
+        Returns the number copied."""
+        valid = [self.project.clip(cid) for cid in clip_ids if self._clip_ok(cid)]
+        if not valid:
+            return 0
+        origin = min(c.start for c in valid)
+        self._clipboard = [
+            {"clip": c.to_dict(), "offset": c.start - origin,
+             "ops": [o.to_dict() for o in self.project.clip_ops(c.id)
+                     if not o.archived]}
+            for c in valid]
+        self.status.emit(f"Copied {len(valid)} clip(s).")
+        return len(valid)
+
+    @property
+    def can_paste(self) -> bool:
+        return bool(self._clipboard)
+
+    def paste_clips(self, at_frame: Optional[int] = None,
+                    track_id: Optional[str] = None):
+        """Paste the clipboard's clips (with their effect stacks) at *at_frame*
+        (default 0) on *track_id* (default each clip's original track), as one
+        undo step. New ids are minted, so the copies are independent. Clips whose
+        source media is gone are skipped."""
+        if not self._clipboard:
+            return []
+        base = max(0, int(at_frame or 0))
+        track_ids = {t.id for t in self.project.tracks}
+        self._push_undo("Paste")
+        carry = ("speed", "reverse", "fade_in", "fade_out", "opacity",
+                 "blend_mode", "gain", "pixel_effects", "raw_effects",
+                 "flow_transfer", "layer_mask", "fx_mask")
+        new_clips = []
+        for entry in self._clipboard:
+            cd = entry["clip"]
+            if cd["media_id"] not in self.project.media:      # source gone
+                continue
+            tid = track_id or cd.get("track") or MAIN_TRACK_ID
+            if tid not in track_ids:
+                tid = MAIN_TRACK_ID
+            new = self.project.add_clip(
+                cd["media_id"], tid, start=base + int(entry["offset"]),
+                in_point=cd.get("in_point", 0), out_point=cd.get("out_point"))
+            for f in carry:                              # finishing + compositing
+                if f in cd and cd[f] is not None:
+                    setattr(new, f, copy.deepcopy(cd[f]))
+            for od in entry["ops"]:                      # rebuild the effect stack
+                op = self.project.add_mosh(od["mode"], dict(od.get("params") or {}),
+                                           new.id)
+                op.region_start = od.get("region_start", 0)
+                op.region_end = od.get("region_end")
+                op.enabled = od.get("enabled", True)
+            new_clips.append(new)
+        if not new_clips:                                # nothing pasteable
+            self._undo.pop()
+            return []
+        self.project_changed.emit()
+        self.status.emit(f"Pasted {len(new_clips)} clip(s).")
+        return new_clips
 
     def split_clip(self, clip_id: str, offset: int) -> None:
         snap = self._snapshot()

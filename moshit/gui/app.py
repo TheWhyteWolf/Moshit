@@ -355,6 +355,12 @@ class MainWindow(QMainWindow):
         self.act_redo.setEnabled(False)
         self._update_undo_labels()
         edit.addSeparator()
+        a_copy = edit.addAction("&Copy clip")
+        a_copy.setShortcut("Ctrl+C")
+        a_copy.triggered.connect(self._copy_selected)
+        a_paste = edit.addAction("&Paste clip")
+        a_paste.setShortcut("Ctrl+V")
+        a_paste.triggered.connect(self._on_paste_clips)
         a_dup = edit.addAction("&Duplicate clip")
         a_dup.setShortcut("Ctrl+D")
         a_dup.triggered.connect(self._duplicate_selected)
@@ -574,6 +580,9 @@ class MainWindow(QMainWindow):
         self.timeline.moveRequested.connect(self.controller.move_clip)
         self.timeline.trimRequested.connect(self._on_trim)
         self.timeline.removeRequested.connect(self._on_remove)
+        self.timeline.removeManyRequested.connect(self._on_remove_many)
+        self.timeline.copyRequested.connect(self._on_copy_clips)
+        self.timeline.pasteRequested.connect(self._on_paste_clips)
         self.timeline.seekRequested.connect(self._on_seek)
         self.timeline.splitRequested.connect(self.controller.split_clip)
         self.timeline.duplicateRequested.connect(self.controller.duplicate_clip)
@@ -916,6 +925,35 @@ class MainWindow(QMainWindow):
             self._selected_clip = None
             self.inspector.set_enabled_for_clip(None, None)
         self.controller.remove_clip(clip_id)
+
+    def _on_remove_many(self, clip_ids) -> None:
+        if self._selected_clip in set(clip_ids):
+            self._selected_clip = None
+            self.inspector.set_enabled_for_clip(None, None)
+        self.controller.remove_clips(clip_ids)
+
+    # -- copy / paste ------------------------------------------------------- #
+
+    def _copy_selected(self) -> None:
+        ids = self.timeline.selected_ids()
+        if ids:
+            self._on_copy_clips(ids)
+        else:
+            self.statusBar().showMessage("Select a clip to copy.")
+
+    def _on_copy_clips(self, clip_ids) -> None:
+        if not self.controller.copy_clips(clip_ids):
+            self.statusBar().showMessage("Nothing to copy.")
+
+    def _on_paste_clips(self) -> None:
+        if not self.controller.can_paste:
+            self.statusBar().showMessage("Clipboard is empty — copy a clip first.")
+            return
+        new = self.controller.paste_clips(at_frame=self.timeline.playhead_frame())
+        if new:
+            self.timeline.select(new[0].id)
+            self._on_clip_selected(new[0].id)
+            self._schedule_auto_refresh(immediate=True)
 
     def _reload_library(self) -> None:
         self.library.list.clear()
