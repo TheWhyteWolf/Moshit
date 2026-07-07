@@ -143,9 +143,11 @@ misc) so commits can reference them. Tick items off as they land.
   drag-pan, Fit/1:1 buttons; busy badge pinned to the viewport) + sub-range loop
   (I/O markers drawn on a `_LoopSlider`; `_advance` wraps the range; stale range
   cleared on a shorter re-render).
-- [~] U11/U12/U13: **U12 snapping done** — drag/trim snap to clip edges/playhead/0
-  (`_snap_adjust`, 12px, Alt bypasses) with a ghost + snap-line, reused by the
-  library→timeline drop. Still open: multi-select (U11), copy/paste (U13).
+- [x] U11/U12/U13: snapping (`_snap_adjust`, 12px, Alt bypasses) with a ghost +
+  snap-line, reused by the library→timeline drop; **multi-select** (Ctrl/Shift-
+  click, primary keeps the brighter outline, batch delete via
+  `controller.remove_clips`); **copy/paste** of clips *with their effect stacks*
+  (`copy_clips`/`paste_clips`, offsets preserved, fresh ids, skips offline media).
 - [x] **Drag & drop + timeline legibility** (new): drop video files anywhere to
   batch-import (`controller.import_media_batch`); drag library media onto a lane
   to place at a snapped frame (`place_clip_at`, Easy-mode aware, one undo step);
@@ -157,15 +159,24 @@ misc) so commits can reference them. Tick items off as they land.
   `controller.randomise_effect`, one undo step); effect/pixel/raw lists grow to fit
   (`_fit_list_height`); library empty-state hint + right-click menu (add/relink);
   `setAccessibleName` on the icon-only buttons.
-- [ ] U15: undo survives bake/flow; undo labels.
-- [ ] U1/U3/U4: beat detection off the UI thread; queue edits during renders; stop
-  greying the whole inspector.
-- [ ] M8/M4/M6: fill missing param help text; broaden `automatable`; CLI choice validation.
-- [ ] M2/M1: shared `group_by_gop` helper; registry mixin for the three mode classes.
-- [ ] M9/M7/M10: document `rgb_iterative_shift`; fix stale README effects table; correct
-  "bundled CDP8" claim + document `$MOSHIT_CDP_DIR`; split numpy out of the `flow`
-  extra; align `requires-python` with CI.
-- [ ] M5: selftest `_FakeEngine` — derive from an ABC or cover composite/audio paths.
+- [x] U15: bake/flow are undoable (snapshot pre-op + commit on success; snapshots
+  carry media + bake_records, imported footage preserved on restore) and every
+  undo entry is labelled ("Undo Move clip" / "Redo Bake"). revert-bake still
+  clears undo (it deletes the baked file on disk).
+- [x] U1/U4: onset detection warmed on the audio worker thread (beat_positions
+  is a cache hit on the UI thread); the inspector stays live during read-only
+  preview renders (`busy_is_preview`), locking only for heavy ops. U3 is largely
+  covered by the debounced auto-refresh retry (edits during a render land next pass).
+- [x] M8/M4/M6: every mosh/pixel/raw param has help text (asserted by a test);
+  `pframe_drop.probability`, `iframe_pulse.period`, `pframe_echo.copies/delay`
+  are automatable; CLI `--param` validates numbers/choices/ranges.
+- [x] M2/M1: `modes/_gop.py` (`split_gops` + `map_pframe_runs`) shared across four
+  modes (golden-tested); one `RegisteredMode` base for the three mode families.
+- [x] M9/M7/M10: `rgb_iterative_shift` documented; effects table completed
+  (motion_gain/pframe_stutter); CDP "bundled" claim corrected + `$MOSHIT_CDP_DIR`;
+  `[raw]` numpy extra split out; packages auto-discovered; CI tests 3.9–3.12.
+- [x] M5: selftest `_FakeEngine` gained a `__getattr__` drift guard and now
+  exercises the composite render + multi-track audio plan/mix.
 
 ---
 
