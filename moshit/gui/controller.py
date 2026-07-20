@@ -32,9 +32,21 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from ..engine import EngineConfig, MoshEngine
 from ..ffmpeg import FFmpeg, FFmpegError
 from ..modes import load_modes
-from ..project import Project, ROOT_SEQ_ID, MAIN_TRACK_ID, MOTION_TRACK_ID
+from ..project import (Project, Clip, ROOT_SEQ_ID, MAIN_TRACK_ID,
+                       MOTION_TRACK_ID)
 from .. import beats, waveform
 from .preview import PreviewDecoder
+
+
+# Identity/placement fields a paste re-derives rather than carries; every
+# *other* Clip field rides along. Derived from the dataclass so a field added
+# to Clip is carried by default instead of being silently dropped until someone
+# remembers to extend a hand-written list. ``transition_in`` is excluded on
+# purpose: like duplicate_clip, the pasted copy hard-cuts in.
+_PASTE_SKIP = frozenset({"id", "media_id", "track", "seq_id", "start",
+                         "in_point", "out_point", "archived", "transition_in"})
+_PASTE_FIELDS = tuple(f.name for f in dataclasses.fields(Clip)
+                      if f.name not in _PASTE_SKIP)
 
 
 class _WorkerSignals(QObject):
@@ -189,6 +201,16 @@ class AppController(QObject):
         import, where editing should be blocked)."""
         return self._busy_preview
 
+    @property
+    def edits_locked(self) -> bool:
+        """True while a heavy job owns the project and edits must be refused.
+
+        A preview renders from a detached view (``Project.render_view``), so it
+        never locks; a bake/flow/export/import works on the live project and
+        holds a pre-snapshot it will commit on completion, so an edit (or an
+        undo) landing mid-job would be clobbered by that commit."""
+        return self.is_busy and not self._busy_preview
+
     def export_profiles(self) -> List[str]:
         return self.ff.capabilities().available_export_profiles()
 
@@ -286,6 +308,10 @@ class AppController(QObject):
         self._job_gen += 1
         self._busy = False
         self._draining = True                  # block new jobs until the worker drains
+        # _busy_preview deliberately survives the cancel: the worker is still
+        # running, and whether it may race the model (edits_locked) depends on
+        # what it is, not on whether we've asked it to stop. The drain handlers
+        # clear the flag once it has actually finished.
         self._pending = None
         self.ff.terminate_active()
         self.decoder.terminate()
@@ -295,8 +321,10 @@ class AppController(QObject):
     def _on_finished(self, result, gen):
         if gen != self._job_gen:               # superseded by a cancel
             self._draining = False             # the cancelled worker has now drained
+            self._busy_preview = False
             return
         self._busy = False
+        self._busy_preview = False
         self.busy.emit(False, "")
         cb, self._pending = self._pending, None
         if cb:
@@ -305,8 +333,10 @@ class AppController(QObject):
     def _on_error(self, message: str, gen=None):
         if gen is not None and gen != self._job_gen:    # cancelled job's failure
             self._draining = False
+            self._busy_preview = False
             return
         self._busy = False
+        self._busy_preview = False
         self._pending = None
         self.busy.emit(False, "")
         self.error.emit(message)
@@ -419,10 +449,14 @@ class AppController(QObject):
         self.ff.reset_abort()                  # a prior cancel must not block us
         self.busy.emit(True, "Rendering preview…")
         out = self._dir / "preview.avi"
+        # Editing stays live during a preview (U1/U4), so the worker must not
+        # read the lists the UI is mutating -- render from a detached view taken
+        # here, on the main thread, where it can't tear.
+        view = self.project.render_view()
 
         def work(emit_begin, emit_batch):
-            r = self.project.render(self.preview_engine, out, sequence_id=seq_id,
-                                    progress=self._progress_cb(gen))
+            r = view.render(self.preview_engine, out, sequence_id=seq_id,
+                            progress=self._progress_cb(gen))
             self.decoder.decode_stream(out, emit_begin, emit_batch,
                                        max_width=PREVIEW_MAX_WIDTH)
             self._preview_audio = self._build_preview_audio(r.get("audio_plans"))
@@ -555,8 +589,10 @@ class AppController(QObject):
     def _on_preview_done(self, gen):
         if gen != self._job_gen:               # superseded by a cancel
             self._draining = False             # the cancelled render has drained
+            self._busy_preview = False
             return
         self._busy = False
+        self._busy_preview = False
         self.busy.emit(False, "")
         self.preview_done.emit()
         self.preview_audio.emit(self._preview_audio)
@@ -699,11 +735,11 @@ class AppController(QObject):
 
     @property
     def can_undo(self) -> bool:
-        return bool(self._undo)
+        return bool(self._undo) and not self.edits_locked
 
     @property
     def can_redo(self) -> bool:
-        return bool(self._redo)
+        return bool(self._redo) and not self.edits_locked
 
     @property
     def undo_label(self) -> str:
@@ -714,6 +750,12 @@ class AppController(QObject):
         return self._redo[-1][0] if self._redo else ""
 
     def undo(self) -> None:
+        if self.edits_locked:
+            # bake/flow hold a pre-snapshot they commit on completion; undoing
+            # underneath that would be silently overwritten (and take the redo
+            # stack with it).
+            self.error.emit("Can't undo while a task is running.")
+            return
         if not self._undo:
             return
         label, snap = self._undo.pop()
@@ -723,6 +765,9 @@ class AppController(QObject):
         self.status.emit(f"Undo {label}".strip())
 
     def redo(self) -> None:
+        if self.edits_locked:
+            self.error.emit("Can't redo while a task is running.")
+            return
         if not self._redo:
             return
         label, snap = self._redo.pop()
@@ -1198,10 +1243,12 @@ class AppController(QObject):
         self._end_live((kind, clip_id, index), commit=commit)
 
     def remove_effect(self, op_id: str) -> None:
-        self._push_undo("Remove effect")
+        # snapshot first, commit only if something was removed -- popping a
+        # pushed entry can't undo _commit_undo's _redo.clear()
+        pre = self._snapshot()
         if not self.project.remove_mosh(op_id):
-            self._undo.pop()                       # nothing removed; drop the snapshot
             return
+        self._commit_undo(pre, "Remove effect")
         self.project_changed.emit()
         self.status.emit("Removed effect")
 
@@ -1351,6 +1398,24 @@ class AppController(QObject):
         c.transition_in = 0                # overlap (if any) now comes from position
         self.project_changed.emit()
 
+    def move_clips(self, clip_ids, delta: int) -> None:
+        """Shift every clip in a multi-selection by *delta* frames, in one undo
+        step, keeping their relative spacing. The whole group is clamped by the
+        earliest clip so a drag past zero slides rather than collapses."""
+        video = {t.id for t in self.project.tracks if t.role == "video"}
+        clips = [self.project.clip(cid) for cid in clip_ids if self._clip_ok(cid)]
+        clips = [c for c in clips if c.track in video]     # free positioning
+        if not clips:
+            return
+        delta = max(int(delta), -min(c.start for c in clips))
+        if delta == 0 and not any(c.transition_in for c in clips):
+            return
+        self._push_undo("Move clips" if len(clips) > 1 else "Move clip")
+        for c in clips:
+            c.start = max(0, c.start + delta)
+            c.transition_in = 0            # overlap (if any) now comes from position
+        self.project_changed.emit()
+
     def remove_clip(self, clip_id: str) -> None:
         self.remove_clips([clip_id])
 
@@ -1383,10 +1448,14 @@ class AppController(QObject):
         if not valid:
             return 0
         origin = min(c.start for c in valid)
+        # deepcopy, not to_dict(): to_dict is a shallow __dict__.copy(), so the
+        # raw dicts would alias the live clip's pixel_effects/raw_effects lists
+        # (and each op's params) -- editing an effect after copying would change
+        # what pastes.
         self._clipboard = [
-            {"clip": c.to_dict(), "offset": c.start - origin,
-             "ops": [o.to_dict() for o in self.project.clip_ops(c.id)
-                     if not o.archived]}
+            {"clip": copy.deepcopy(c.to_dict()), "offset": c.start - origin,
+             "ops": [copy.deepcopy(o.to_dict())
+                     for o in self.project.clip_ops(c.id) if not o.archived]}
             for c in valid]
         self.status.emit(f"Copied {len(valid)} clip(s).")
         return len(valid)
@@ -1398,29 +1467,26 @@ class AppController(QObject):
     def paste_clips(self, at_frame: Optional[int] = None,
                     track_id: Optional[str] = None):
         """Paste the clipboard's clips (with their effect stacks) at *at_frame*
-        (default 0) on *track_id* (default each clip's original track), as one
-        undo step. New ids are minted, so the copies are independent. Clips whose
-        source media is gone are skipped."""
+        (default 0) on *track_id* (default the closest match in the sequence on
+        screen), as one undo step. New ids are minted, so the copies are
+        independent. Clips whose source media is gone are skipped."""
         if not self._clipboard:
             return []
         base = max(0, int(at_frame or 0))
-        track_ids = {t.id for t in self.project.tracks}
-        self._push_undo("Paste")
-        carry = ("speed", "reverse", "fade_in", "fade_out", "opacity",
-                 "blend_mode", "gain", "pixel_effects", "raw_effects",
-                 "flow_transfer", "layer_mask", "fx_mask")
+        # Snapshot up front but commit only once something lands: _commit_undo
+        # clears the redo stack, so pushing first and popping on the empty path
+        # would destroy redo for a paste that did nothing.
+        pre = self._snapshot()
         new_clips = []
         for entry in self._clipboard:
             cd = entry["clip"]
             if cd["media_id"] not in self.project.media:      # source gone
                 continue
-            tid = track_id or cd.get("track") or MAIN_TRACK_ID
-            if tid not in track_ids:
-                tid = MAIN_TRACK_ID
+            tid = track_id or self._paste_track(cd.get("track"))
             new = self.project.add_clip(
                 cd["media_id"], tid, start=base + int(entry["offset"]),
                 in_point=cd.get("in_point", 0), out_point=cd.get("out_point"))
-            for f in carry:                              # finishing + compositing
+            for f in _PASTE_FIELDS:                      # finishing + compositing
                 if f in cd and cd[f] is not None:
                     setattr(new, f, copy.deepcopy(cd[f]))
             for od in entry["ops"]:                      # rebuild the effect stack
@@ -1431,11 +1497,29 @@ class AppController(QObject):
                 op.enabled = od.get("enabled", True)
             new_clips.append(new)
         if not new_clips:                                # nothing pasteable
-            self._undo.pop()
             return []
+        self._commit_undo(pre, "Paste")
         self.project_changed.emit()
         self.status.emit(f"Pasted {len(new_clips)} clip(s).")
         return new_clips
+
+    def _paste_track(self, source_track: Optional[str]) -> str:
+        """The track a pasted clip should land on, always within the sequence
+        the timeline is showing -- pasting into a precomp must not drop clips
+        back into the root sequence, where they'd be invisible."""
+        seq_id = self.current_seq_id
+        here = self.project.tracks_for(seq_id)
+        if any(t.id == source_track for t in here):
+            return source_track                          # same sequence: keep it
+        # a different sequence (or a deleted track): match the source's role
+        role = "video"
+        src = next((t for t in self.project.tracks if t.id == source_track), None)
+        if src is not None:
+            role = src.role
+        same_role = [t for t in here if t.role == role]
+        if same_role:
+            return same_role[0].id
+        return here[0].id if here else MAIN_TRACK_ID
 
     def split_clip(self, clip_id: str, offset: int) -> None:
         snap = self._snapshot()

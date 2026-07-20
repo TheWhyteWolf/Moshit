@@ -20,6 +20,7 @@ undone:
 from __future__ import annotations
 
 import collections
+import copy
 import json
 import shutil
 import threading
@@ -890,6 +891,30 @@ class Project:
     def main_layout(self) -> List[Tuple[Clip, int, int, int]]:
         """Overlap-aware layout of the root sequence's first video track."""
         return self.track_layout(MAIN_TRACK_ID)
+
+    def render_view(self) -> "Project":
+        """A detached view of the editable model, safe to render on a worker
+        thread while the UI keeps editing this project (U1/U4).
+
+        ``render`` walks ``clips``/``mosh_ops``/``tracks``/``sequences`` for
+        seconds at a time, so the view owns private copies of those four -- an
+        edit on the main thread can no longer resize a list mid-iteration or
+        show the render a half-applied change.
+
+        Everything else is shared by reference on purpose: ``config``, the
+        parsed-media LRU and the segment caches are what make a render fast,
+        and sharing ``media`` lets a precomp's digest write-back (see
+        ``_render_sequence_to_media``) land on the real project instead of
+        being discarded with the view. Sharing ``media`` is safe because it is
+        only ever *added* to by an import, and imports can't start while a
+        render is in flight.
+        """
+        view = copy.copy(self)
+        view.clips = copy.deepcopy(self.clips)
+        view.mosh_ops = copy.deepcopy(self.mosh_ops)
+        view.tracks = copy.deepcopy(self.tracks)
+        view.sequences = copy.deepcopy(self.sequences)
+        return view
 
     def render(self, engine: MoshEngine, out_avi, *,
                profile: Optional[str] = None, export_path=None,

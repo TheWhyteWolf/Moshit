@@ -102,16 +102,20 @@ to place it at that point — with the same snapping, so clips butt cleanly.
 Clips carrying mosh effects show an **≋N** badge, and a melting Easy-mode cut
 shows an orange notch on its left edge. **Multi-select** with **Ctrl-click**
 (toggle) or **Shift-click** (range on a track); the primary clip (the one the
-inspector edits) gets the brightest outline. **Copy** (`Ctrl+C`) the selection —
-each clip *with its effect stack* — and **Paste** (`Ctrl+V`) it at the playhead,
-preserving the clips' spacing. You can also **split at the playhead** (`S`, or
+inspector edits) gets the brightest outline, and dragging any member moves the
+whole selection together. **Copy** (`Ctrl+C`) the selection — each clip *with
+its effect stack* — and **Paste** (`Ctrl+V`) it at the playhead, preserving the
+clips' spacing. You can also **split at the playhead** (`S`, or
 Edit → Split at playhead) and **duplicate** a clip with its effect (`Ctrl+D`, or
 right-click → Duplicate); right-click a clip for those plus Copy/Paste and
 Remove. Delete (or right-click → Remove) takes the selected clips off the
 timeline in one step. **Undo** and **Redo** (Ctrl+Z / Ctrl+Shift+Z, under the
 Edit menu) cover timeline and effect edits — add, move, trim, cut, duplicate,
-remove, and effect changes. Baking is a commit point: it starts a fresh undo
-history, and is separately reversible with **Revert bake**. Edits re-render the
+remove, and effect changes — and each menu entry names the step it will reverse
+("Undo Trim clip"). Baking and the optical-flow transfer are undoable too, and a
+bake is separately reversible with **Revert bake**. Undo is unavailable while a
+bake, flow or export is running, since those commit their own step on finishing.
+Edits re-render the
 preview automatically after a short pause; toggle **Auto-refresh** off in the
 toolbar to render only on demand with **Refresh preview** (useful on large
 projects). A **waveform strip** under the ruler shows the assembled audio, so you

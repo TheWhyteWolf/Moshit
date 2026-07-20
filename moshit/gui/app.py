@@ -577,9 +577,10 @@ class MainWindow(QMainWindow):
         c.status.connect(self.statusBar().showMessage)
 
         self.timeline.clipSelected.connect(self._on_clip_selected)
+        self.timeline.selectionCleared.connect(self._on_selection_cleared)
         self.timeline.moveRequested.connect(self.controller.move_clip)
+        self.timeline.moveManyRequested.connect(self.controller.move_clips)
         self.timeline.trimRequested.connect(self._on_trim)
-        self.timeline.removeRequested.connect(self._on_remove)
         self.timeline.removeManyRequested.connect(self._on_remove_many)
         self.timeline.copyRequested.connect(self._on_copy_clips)
         self.timeline.pasteRequested.connect(self._on_paste_clips)
@@ -920,16 +921,13 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("No source frame here.")
 
-    def _on_remove(self, clip_id: str) -> None:
-        if self._selected_clip == clip_id:
-            self._selected_clip = None
-            self.inspector.set_enabled_for_clip(None, None)
-        self.controller.remove_clip(clip_id)
+    def _on_selection_cleared(self) -> None:
+        self._selected_clip = None
+        self.inspector.set_enabled_for_clip(None, None)
 
     def _on_remove_many(self, clip_ids) -> None:
         if self._selected_clip in set(clip_ids):
-            self._selected_clip = None
-            self.inspector.set_enabled_for_clip(None, None)
+            self._on_selection_cleared()
         self.controller.remove_clips(clip_ids)
 
     # -- copy / paste ------------------------------------------------------- #
@@ -1225,12 +1223,18 @@ class MainWindow(QMainWindow):
     def _on_busy(self, busy: bool, message: str) -> None:
         for act in (self.act_import, self.act_preview, self.act_export):
             act.setEnabled(not busy)
-        # A preview render is read-only, so keep the inspector editable (it's the
-        # frequent auto-refresh; greying it on every edit was jarring). Heavy
-        # state-changing ops (bake/export/import) still lock it (U4). The timeline
-        # is likewise left live during previews, so this just matches it.
+        # A preview renders from a detached view of the model, so editing stays
+        # live during one (it's the frequent auto-refresh; greying it on every
+        # edit was jarring). Heavy state-changing ops (bake/flow/export/import)
+        # work on the live project and commit a pre-snapshot when they finish,
+        # so everything that mutates the model -- inspector, timeline, undo and
+        # redo alike -- is locked for the duration (U4).
         keep_editable = busy and self.controller.busy_is_preview
-        self.inspector.setEnabled(not busy or keep_editable)
+        editable = not busy or keep_editable
+        self.inspector.setEnabled(editable)
+        self.timeline.setEnabled(editable)
+        self.act_undo.setEnabled(editable and self.controller.can_undo)
+        self.act_redo.setEnabled(editable and self.controller.can_redo)
         if busy:
             self.progress.setRange(0, 0)        # indeterminate until steps arrive
         self.progress.setVisible(busy)

@@ -741,9 +741,10 @@ class TimelineWidget(QWidget):
     """
 
     clipSelected = Signal(str)
+    selectionCleared = Signal()                    # ctrl-click emptied the set
     moveRequested = Signal(str, int)               # clip_id, new start frame
+    moveManyRequested = Signal(list, int)          # clip ids, delta frames
     trimRequested = Signal(str, int, int)          # clip_id, in|-1, out|-1
-    removeRequested = Signal(str)
     seekRequested = Signal(float)                  # scrub position, 0..1
     splitRequested = Signal(str, int)              # clip_id, offset frames
     duplicateRequested = Signal(str)               # clip_id
@@ -801,6 +802,7 @@ class TimelineWidget(QWidget):
                                            for s in project.sequences):
             self._seq_id = project.root_seq_id
         self._scan_ops(project)
+        self._prune_selection()
         self._total = self._seq_total()
         self._update_height()
         self.update()
@@ -878,7 +880,21 @@ class TimelineWidget(QWidget):
                 self._selected_ids.add(clip_id)
         else:
             self._selected_ids = {clip_id}
-        self._selected = clip_id                     # clicked clip is the primary
+        # The clicked clip is the primary -- unless the Ctrl-click just toggled
+        # it *out* of the set, in which case the primary (which drives the
+        # inspector and the brightest outline) must fall back to a clip that is
+        # still selected, or to nothing.
+        self._selected = (clip_id if clip_id in self._selected_ids
+                          else next(iter(self._selected_ids), None))
+
+    def _prune_selection(self) -> None:
+        """Drop selected ids that no longer exist. Every path that removes a
+        clip -- delete, undo, bake, remove-track, precompose -- lands here via
+        set_project, so the selection can't outlive its clips."""
+        live = {c.id for c in self._project.clips} if self._project else set()
+        self._selected_ids &= live
+        if self._selected not in live:
+            self._selected = next(iter(self._selected_ids), None)
 
     # -- geometry ----------------------------------------------------------- #
 
@@ -1286,8 +1302,20 @@ class TimelineWidget(QWidget):
         if not hit:
             return
         rect, clip_id, track = hit
-        self._update_selection(clip_id, track, event.modifiers())
-        self.clipSelected.emit(clip_id)
+        mods = event.modifiers()
+        self._update_selection(clip_id, track, mods)
+        if self._selected:
+            self.clipSelected.emit(self._selected)
+        else:                                        # ctrl-click emptied the set
+            self.selectionCleared.emit()
+
+        # Ctrl/Shift are the selection modifiers; a click holding one is a
+        # selection gesture, not the start of a drag. Arming _drag anyway let a
+        # few pixels of jitter move the clip the user only meant to select.
+        if mods & (Qt.KeyboardModifier.ControlModifier
+                   | Qt.KeyboardModifier.ShiftModifier):
+            self.update()
+            return
 
         if self._tool == "cut":                      # split at the clicked frame
             offset = round((pos.x() - rect.left()) / self._ppf())
@@ -1357,7 +1385,11 @@ class TimelineWidget(QWidget):
         self._snap_frame = None
         if d["mode"] == "move":
             if self._is_video(d["track"]) and dframes != 0:    # free positioning
-                self.moveRequested.emit(d["id"], max(0, d["start"] + dframes))
+                sel = self.selected_ids()
+                if len(sel) > 1:               # drag the whole multi-selection
+                    self.moveManyRequested.emit(sel, dframes)
+                else:
+                    self.moveRequested.emit(d["id"], max(0, d["start"] + dframes))
         elif d["mode"] == "trim_l" and dframes != 0:
             self.trimRequested.emit(d["id"], max(0, d["in"] + dframes), -1)
         elif d["mode"] == "trim_r" and dframes != 0:
@@ -1376,14 +1408,13 @@ class TimelineWidget(QWidget):
             self.enterSequenceRequested.emit(media.sequence_id)
 
     def keyPressEvent(self, event) -> None:
+        # Ctrl+C/Ctrl+V are owned by the Edit-menu QActions (window-context
+        # shortcuts, which Qt dispatches before this handler ever runs) --
+        # handling them here too would be dead code with its own copy of the
+        # rules. Delete has no menu action, so it lives here.
         sel = self.selected_ids()
-        ctrl = event.modifiers() & Qt.KeyboardModifier.ControlModifier
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and sel:
             self.removeManyRequested.emit(sel)
-        elif ctrl and event.key() == Qt.Key.Key_C and sel:
-            self.copyRequested.emit(sel)
-        elif ctrl and event.key() == Qt.Key.Key_V:
-            self.pasteRequested.emit()
         else:
             super().keyPressEvent(event)
 

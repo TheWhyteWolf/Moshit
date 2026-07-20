@@ -1453,26 +1453,221 @@ def test_timeline_multi_select_ctrl_and_shift(qapp):
     assert tl._selected_ids == {"b"}
 
 
-def test_timeline_delete_and_copy_emit_selection(qapp):
+def test_timeline_delete_emits_whole_selection(qapp):
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QKeyEvent
     from PySide6.QtCore import QEvent
     tl = _multi_timeline()
     tl._update_selection("a", "main", Qt.KeyboardModifier.NoModifier)
     tl._update_selection("b", "main", Qt.KeyboardModifier.ControlModifier)
-    removed, copied, pasted = [], [], []
+    removed = []
     tl.removeManyRequested.connect(lambda ids: removed.append(sorted(ids)))
-    tl.copyRequested.connect(lambda ids: copied.append(sorted(ids)))
-    tl.pasteRequested.connect(lambda: pasted.append(1))
-    tl.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_C,
-                              Qt.KeyboardModifier.ControlModifier))
-    tl.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_V,
-                              Qt.KeyboardModifier.ControlModifier))
     tl.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete,
                               Qt.KeyboardModifier.NoModifier))
-    assert copied == [["a", "b"]]
-    assert pasted == [1]
     assert removed == [["a", "b"]]
+
+
+def test_timeline_leaves_copy_paste_keys_to_the_menu_actions(qapp):
+    """Ctrl+C/Ctrl+V belong to the Edit-menu QActions (window-context
+    shortcuts Qt dispatches before keyPressEvent). Handling them here too
+    would be unreachable code carrying its own copy of the rules."""
+    from PySide6.QtCore import Qt, QEvent
+    from PySide6.QtGui import QKeyEvent
+    tl = _multi_timeline()
+    tl._update_selection("a", "main", Qt.KeyboardModifier.NoModifier)
+    fired = []
+    tl.copyRequested.connect(lambda ids: fired.append("copy"))
+    tl.pasteRequested.connect(lambda: fired.append("paste"))
+    for key in (Qt.Key.Key_C, Qt.Key.Key_V):
+        tl.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key,
+                                   Qt.KeyboardModifier.ControlModifier))
+    assert fired == []                       # the QActions are the sole owner
+
+
+def test_clipboard_is_a_snapshot_not_a_live_alias(ctl):
+    """to_dict() is a shallow __dict__.copy(), so copying without a deepcopy
+    would leave the clipboard aliasing the clip's live effect lists."""
+    _seed_media(ctl, "m", 20)
+    c = ctl.add_clip_for_media("m", "main")
+    c.pixel_effects.append({"name": "glow", "params": {"amount": 0.2}})
+    ctl.copy_clips([c.id])
+    c.pixel_effects[0]["params"]["amount"] = 0.9      # edit after copying
+    c.pixel_effects.append({"name": "blur", "params": {}})
+    new = ctl.paste_clips(at_frame=40)
+    assert [e["name"] for e in new[0].pixel_effects] == ["glow"]   # not ["glow","blur"]
+    assert new[0].pixel_effects[0]["params"]["amount"] == 0.2      # not 0.9
+
+
+def test_paste_carries_every_clip_field_it_does_not_re_derive(ctl):
+    """The carried-field set is derived from the Clip dataclass, so a field
+    added to Clip rides along instead of being silently dropped."""
+    import dataclasses
+    from moshit.project import Clip
+    from moshit.gui.controller import _PASTE_FIELDS, _PASTE_SKIP
+    assert set(_PASTE_FIELDS) | _PASTE_SKIP == {f.name for f in
+                                                dataclasses.fields(Clip)}
+    assert "enabled" in _PASTE_FIELDS                 # was dropped by the old list
+    _seed_media(ctl, "m", 20)
+    c = ctl.add_clip_for_media("m", "main")
+    c.enabled, c.gain, c.blend_mode = False, 0.25, "screen"
+    ctl.copy_clips([c.id])
+    new = ctl.paste_clips(at_frame=40)[0]
+    assert (new.enabled, new.gain, new.blend_mode) == (False, 0.25, "screen")
+
+
+def test_failed_paste_keeps_the_redo_stack(ctl):
+    """_commit_undo clears redo, so a paste that lands nothing must not have
+    pushed one -- popping the entry can't put redo back."""
+    _seed_media(ctl, "m", 10)
+    c = ctl.add_clip_for_media("m", "main")
+    ctl.copy_clips([c.id])
+    ctl.remove_clips([c.id])
+    ctl.undo()                                        # something to redo
+    assert ctl.can_redo
+    del ctl.project.media["m"]                        # source went offline
+    assert ctl.paste_clips(at_frame=5) == []
+    assert ctl.can_redo                               # redo survived the no-op
+
+
+def test_remove_effect_no_op_keeps_the_redo_stack(ctl):
+    _seed_media(ctl, "m", 10)
+    c = ctl.add_clip_for_media("m", "main")
+    ctl.add_effect(c.id, "bitrot", {})
+    ctl.undo()
+    assert ctl.can_redo
+    ctl.remove_effect("op_does_not_exist")            # removes nothing
+    assert ctl.can_redo
+
+
+def test_paste_lands_in_the_sequence_on_screen(ctl):
+    """Pasting while inside a precomp must not drop clips into the root
+    sequence, where the timeline would never show them."""
+    _seed_media(ctl, "m", 10)
+    c = ctl.add_clip_for_media("m", "main")
+    ctl.copy_clips([c.id])
+    seq = ctl.project.add_sequence("Precomp")
+    ctl.current_seq_id = seq.id
+    new = ctl.paste_clips(at_frame=0)
+    assert len(new) == 1
+    assert new[0].seq_id == seq.id
+    assert new[0].track in {t.id for t in ctl.project.tracks_for(seq.id)}
+
+
+def test_move_clips_shifts_the_group_in_one_undo_step(ctl):
+    _seed_media(ctl, "m", 10)
+    a = ctl.add_clip_for_media("m", "main")
+    b = ctl.add_clip_for_media("m", "main")
+    ctl.move_clip(a.id, 20)
+    ctl.move_clip(b.id, 50)
+    depth = len(ctl._undo)
+    ctl.move_clips([a.id, b.id], 15)
+    assert (a.start, b.start) == (35, 65)             # spacing preserved
+    assert len(ctl._undo) == depth + 1                # single undo step
+    ctl.undo()                                        # _restore rebuilds the clips
+    assert (ctl.project.clip(a.id).start,
+            ctl.project.clip(b.id).start) == (20, 50)
+
+
+def test_move_clips_clamps_the_group_at_zero(ctl):
+    """A drag past the start slides the group; it must not collapse clips
+    onto frame 0 by clamping each one independently."""
+    _seed_media(ctl, "m", 10)
+    a = ctl.add_clip_for_media("m", "main")
+    b = ctl.add_clip_for_media("m", "main")
+    ctl.move_clip(a.id, 10)
+    ctl.move_clip(b.id, 40)
+    ctl.move_clips([a.id, b.id], -100)
+    assert (a.start, b.start) == (0, 30)              # not (0, 0)
+
+
+def test_undo_is_refused_while_a_heavy_job_runs(ctl):
+    """bake/flow commit a pre-snapshot when they finish; an undo landing
+    mid-job would be clobbered by that commit (and take redo with it)."""
+    _seed_media(ctl, "m", 10)
+    c = ctl.add_clip_for_media("m", "main")
+    ctl.move_clip(c.id, 5)
+    assert ctl.can_undo
+    ctl._busy, ctl._busy_preview = True, False        # a bake is running
+    assert ctl.edits_locked and not ctl.can_undo
+    ctl.undo()
+    assert ctl.project.clip(c.id).start == 5          # refused, state untouched
+    ctl._busy_preview = True                          # a preview instead
+    assert not ctl.edits_locked and ctl.can_undo
+    ctl.undo()                                        # _restore rebuilds the clips
+    assert ctl.project.clip(c.id).start == 0          # allowed
+    ctl._busy = False
+
+
+def test_render_view_detaches_the_model_from_the_worker(ctl):
+    """A preview renders on a worker thread while the UI keeps editing, so the
+    view must not share the lists the main thread mutates."""
+    _seed_media(ctl, "m", 10)
+    c = ctl.add_clip_for_media("m", "main")
+    ctl.add_effect(c.id, "bitrot", {})
+    view = ctl.project.render_view()
+    n_clips, n_ops = len(view.clips), len(view.mosh_ops)
+    ctl.remove_clips([c.id])                          # edit during the "render"
+    d = ctl.add_clip_for_media("m", "main")
+    ctl.add_effect(d.id, "bitrot", {})
+    assert (len(view.clips), len(view.mosh_ops)) == (n_clips, n_ops)
+    assert view.media is ctl.project.media            # caches/media stay shared
+
+
+def test_ctrl_click_deselect_moves_the_primary(qapp):
+    """Toggling a clip out of the set must not leave it as the primary -- it
+    drives the inspector and the brightest outline."""
+    from PySide6.QtCore import Qt
+    tl = _multi_timeline()
+    none, ctrl = Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.ControlModifier
+    tl._update_selection("a", "main", none)
+    tl._update_selection("c", "main", ctrl)
+    tl._update_selection("c", "main", ctrl)            # toggle "c" back out
+    assert tl._selected_ids == {"a"}
+    assert tl._selected == "a"                         # not the deselected "c"
+    assert tl.selected_ids() == ["a"]
+    tl._update_selection("a", "main", ctrl)            # now empty the set
+    assert tl._selected_ids == set() and tl._selected is None
+
+
+def test_selection_is_pruned_when_clips_disappear(qapp):
+    """set_project is the one chokepoint every removal path goes through
+    (delete, undo, bake, remove-track), so the selection can't go stale."""
+    from PySide6.QtCore import Qt
+    tl = _multi_timeline()
+    tl._update_selection("a", "main", Qt.KeyboardModifier.NoModifier)
+    tl._update_selection("b", "main", Qt.KeyboardModifier.ControlModifier)
+    proj = tl._project
+    proj.clips = [c for c in proj.clips if c.id != "b"]
+    tl.set_project(proj)
+    assert tl._selected_ids == {"a"} and tl._selected == "a"
+    proj.clips = [c for c in proj.clips if c.id != "a"]
+    tl.set_project(proj)
+    assert tl._selected_ids == set() and tl._selected is None
+
+
+def test_modifier_click_selects_without_arming_a_drag(qapp):
+    """Ctrl/Shift click is a selection gesture; arming a move drag let a few
+    pixels of jitter reposition a clip the user only meant to select."""
+    from PySide6.QtCore import Qt, QPointF
+    from PySide6.QtGui import QMouseEvent, QPointingDevice
+    from PySide6.QtCore import QEvent
+    tl = _multi_timeline()
+    dev = QPointingDevice.primaryPointingDevice()
+
+    def press(pos, mods):
+        tl.mousePressEvent(QMouseEvent(
+            QEvent.Type.MouseButtonPress, QPointF(pos), QPointF(pos),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, mods,
+            dev))
+
+    hit = tl._hits[0][0].center()
+    press(hit, Qt.KeyboardModifier.NoModifier)
+    assert tl._drag is not None                        # a plain click still drags
+    tl._drag = None
+    press(hit, Qt.KeyboardModifier.ControlModifier)
+    assert tl._drag is None
+    press(hit, Qt.KeyboardModifier.ShiftModifier)
+    assert tl._drag is None
 
 
 def test_cannot_remove_only_video_track(ctl):
