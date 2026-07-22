@@ -286,6 +286,198 @@ def test_timeline_melt_marker_and_fx_badge_scan(qapp):
     tl.render(QPixmap(tl.size()))                  # badge + zigzag paint path
 
 
+# -- junction (transition-area) selection ----------------------------------- #
+
+def _junction_timeline(b_start=100):
+    """An 800px timeline with a(0..100) and b at *b_start* (100 = butted hard
+    cut, <100 = positional overlap)."""
+    from PySide6.QtGui import QPixmap
+    from moshit.gui.widgets import TimelineWidget
+    from moshit.project import Project, Clip, MediaItem
+    proj = Project()
+    proj.media["m"] = MediaItem(id="m", source_path="x", label="m", role="main",
+                                intermediate_path="x", nb_frames=100)
+    proj.clips.append(Clip(id="a", media_id="m", track="main"))
+    proj.clips.append(Clip(id="b", media_id="m", track="main", start=b_start))
+    tl = TimelineWidget()
+    tl.resize(800, 240)
+    tl.set_project(proj)
+    tl.render(QPixmap(tl.size()))                  # populate hit rects
+    return tl
+
+
+def test_timeline_hard_cut_tab_selects_junction(qapp):
+    from PySide6.QtCore import QEvent
+    tl = _junction_timeline(b_start=100)
+    jhits = [j for j in tl._junction_hits if (j[1], j[2]) == ("a", "b")]
+    assert jhits                                   # the butt cut has a click target
+    got = []
+    tl.junctionSelected.connect(lambda l, r: got.append((l, r)))
+    c = jhits[0][0].center()
+    tl.mousePressEvent(_mouse_ev(QEvent.Type.MouseButtonPress, c.x(), c.y()))
+    assert got == [("a", "b")]
+    assert tl._selected_junction == ("a", "b")
+    assert tl.selected_ids() == [] and tl._drag is None
+    # clicking a clip body afterwards drops the junction selection
+    rect = next(r for r, cid, _t in tl._hits if cid == "a")
+    tl.mousePressEvent(_mouse_ev(QEvent.Type.MouseButtonPress,
+                                 rect.center().x(), rect.center().y()))
+    assert tl._selected_junction is None and tl.selected_ids() == ["a"]
+
+
+def test_timeline_overlap_band_selects_junction(qapp):
+    from PySide6.QtCore import QEvent, Qt
+    tl = _junction_timeline(b_start=60)            # 40-frame positional overlap
+    band = next(j[0] for j in tl._junction_hits if j[0].height() == tl.LANE_H)
+    got = []
+    tl.junctionSelected.connect(lambda l, r: got.append((l, r)))
+    c = band.center()
+    tl.mousePressEvent(_mouse_ev(QEvent.Type.MouseButtonPress, c.x(), c.y()))
+    assert got == [("a", "b")] and tl._selected_junction == ("a", "b")
+    # Ctrl+click is a clip multi-select gesture: the junction must not steal it
+    tl.mousePressEvent(_mouse_ev(QEvent.Type.MouseButtonPress, c.x(), c.y(),
+                                 mods=Qt.KeyboardModifier.ControlModifier))
+    assert tl._selected_junction is None and "b" in tl.selected_ids()
+
+
+def test_timeline_junction_selection_prunes_when_seam_goes(qapp):
+    tl = _junction_timeline(b_start=100)
+    tl._selected_junction = ("a", "b")
+    tl.set_project(tl._project)                    # still butted: kept
+    assert tl._selected_junction == ("a", "b")
+    tl._project.clip("b").start = 150              # dragged apart: a gap, no seam
+    tl.set_project(tl._project)
+    assert tl._selected_junction is None
+
+
+def _seed_pair(ctl, b_start=20):
+    from moshit.project import Clip, MediaItem
+    ctl.project.media["m"] = MediaItem(id="m", source_path="x", label="m",
+                                       role="main", intermediate_path="x",
+                                       nb_frames=20)
+    ctl.project.clips += [
+        Clip(id="a", media_id="m", track="main"),
+        Clip(id="b", media_id="m", track="main", start=b_start)]
+
+
+def test_junction_info_shapes(ctl):
+    _seed_pair(ctl, b_start=20)                    # butted: a hard cut
+    info = ctl.junction_info("a", "b")
+    assert info and info["span"] == 0 and info["track_id"] == "main"
+    assert info["left_label"] == info["right_label"] == "m"
+    assert ctl.junction_info("b", "a") is None     # order matters
+    assert ctl.junction_info("a", "zz") is None    # unknown clip
+    ctl.project.clip("b").start = 15               # positional overlap
+    assert ctl.junction_info("a", "b")["span"] == 5
+    ctl.project.clip("b").start = 30               # a gap is not a junction
+    assert ctl.junction_info("a", "b") is None
+
+
+def test_junction_effect_add_scopes_region_to_the_seam(ctl):
+    _seed_pair(ctl, b_start=15)                    # 5-frame overlap
+    op = ctl.begin_junction_effect_add("a", "b", "pframe_duplicate")
+    ctl.end_effect_edit(op.id, commit=True)
+    assert op.target_clip_id == "b" and op.at_cut
+    assert (op.region_start, op.region_end) == (0, 5)
+    assert [e["id"] for e in ctl.junction_effects("a", "b")] == [op.id]
+    # the op is real: absent from a's stack, present in b's own stack
+    assert ctl.clip_effects("a") == []
+    assert [e["id"] for e in ctl.clip_effects("b")] == [op.id]
+    assert ctl.undo_label == "Add pframe_duplicate at cut"
+    ctl.undo()
+    assert ctl.junction_effects("a", "b") == []
+
+
+def test_junction_effect_add_hard_cut_default_window(ctl):
+    from moshit.project import Clip
+    _seed_pair(ctl, b_start=20)                    # butted: no overlap to bound
+    op = ctl.begin_junction_effect_add("a", "b", "pframe_drop")
+    ctl.end_effect_edit(op.id, commit=True)
+    assert (op.region_start, op.region_end) == (0, ctl.HARD_CUT_SPAN)
+    # a short incoming clip clamps the window to its own length
+    ctl.project.clips.append(Clip(id="c", media_id="m", track="main",
+                                  start=40, out_point=4))
+    op2 = ctl.begin_junction_effect_add("b", "c", "pframe_drop")
+    ctl.end_effect_edit(op2.id, commit=True)
+    assert op2.region_end == 4
+    # and a seam that no longer exists refuses the add
+    ctl.project.clip("c").start = 99
+    assert ctl.begin_junction_effect_add("b", "c", "bitrot") is None
+
+
+def test_easy_mode_melt_shows_in_junction_stack(ctl):
+    from moshit.project import MediaItem
+    ctl.project.media["m"] = MediaItem(id="m", source_path="x", label="m",
+                                       role="main", intermediate_path="x",
+                                       nb_frames=20)
+    ctl.easy_mode = True
+    a = ctl.add_clip_for_media("m")
+    b = ctl.add_clip_for_media("m")
+    assert ctl.junction_info(a.id, b.id)["span"] == 0
+    assert [e["mode"] for e in ctl.junction_effects(a.id, b.id)] \
+        == ["iframe_removal"]
+
+
+def test_junction_ops_survive_duplicate_and_paste(ctl):
+    _seed_pair(ctl, b_start=15)                    # 5-frame overlap
+    op = ctl.begin_junction_effect_add("a", "b", "pframe_duplicate")
+    ctl.end_effect_edit(op.id, commit=True)
+    dup = ctl.project.duplicate_clip("b")          # regions used to be dropped
+    cop = ctl.project.clip_ops(dup.id)[0]
+    assert (cop.region_start, cop.region_end, cop.at_cut) == (0, 5, True)
+    ctl.copy_clips(["b"])
+    new = ctl.paste_clips(at_frame=60)
+    pop = ctl.project.clip_ops(new[0].id)[0]
+    assert pop.at_cut and (pop.region_start, pop.region_end) == (0, 5)
+
+
+def test_inspector_junction_mode_shows_only_the_stack(qapp):
+    from moshit.gui.widgets import InspectorPanel
+    from moshit.project import Clip
+    insp = InspectorPanel()
+    insp.set_enabled_for_junction("A", "B", 5, [
+        {"id": "o1", "mode": "bitrot", "params": {}, "enabled": True,
+         "region": (0, 5)}], "b")
+    assert not insp._body.isHidden()
+    assert insp._sec_clip.isHidden() and insp._clip_actions.isHidden()
+    assert insp._sec_pixel.isHidden() and insp._sec_flow.isHidden()
+    assert not insp._sec_effects.isHidden()
+    assert not insp.preset_apply_btn.isEnabled()   # presets are clip-stack tools
+    assert "Transition" in insp.clip_lbl.text()
+    assert insp.effect_list.count() == 1 and insp._clip_id == "b"
+    # selecting a clip afterwards restores the clip-level groups
+    insp.set_enabled_for_clip("c", "clip",
+                              clip=Clip(id="c", media_id="m", track="main"),
+                              effects=[])
+    assert not insp._sec_clip.isHidden() and not insp._clip_actions.isHidden()
+    assert insp.preset_apply_btn.isEnabled()
+
+
+def test_app_junction_effect_add_flow(win):
+    from moshit.project import Clip, MediaItem
+    c = win.controller
+    c.project.media["m"] = MediaItem(id="m", source_path="x", label="m",
+                                     role="main", intermediate_path="x",
+                                     nb_frames=20)
+    c.project.clips += [Clip(id="a", media_id="m", track="main"),
+                        Clip(id="b", media_id="m", track="main", start=20)]
+    win._on_junction_selected("a", "b")
+    assert win._selected_junction == ("a", "b")
+    assert win.inspector._junction and win.inspector._clip_id == "b"
+    win._on_effect_add_begin("pframe_drop")        # junction-scoped add
+    dlg = win.inspector._live_dlg
+    assert dlg is not None
+    dlg.accept()                                   # commit the default params
+    assert [e["mode"] for e in c.junction_effects("a", "b")] == ["pframe_drop"]
+    op = c.project.clip_ops("b")[0]
+    assert op.at_cut and (op.region_start, op.region_end) == (0, c.HARD_CUT_SPAN)
+    # removing the left clip kills the seam; the project change clears the
+    # selection and blanks the inspector instead of showing a stale stack
+    c.remove_clip("a")
+    assert win._selected_junction is None
+    assert win.inspector._body.isHidden()
+
+
 def _drain(qapp, c, timeout_s=90):
     """Pump the event loop until the controller's background job finishes."""
     import time

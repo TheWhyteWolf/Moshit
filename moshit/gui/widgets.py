@@ -742,6 +742,7 @@ class TimelineWidget(QWidget):
 
     clipSelected = Signal(str)
     selectionCleared = Signal()                    # ctrl-click emptied the set
+    junctionSelected = Signal(str, str)            # left/right clip of a seam
     moveRequested = Signal(str, int)               # clip_id, new start frame
     moveManyRequested = Signal(list, int)          # clip ids, delta frames
     trimRequested = Signal(str, int, int)          # clip_id, in|-1, out|-1
@@ -784,7 +785,9 @@ class TimelineWidget(QWidget):
         self._total = 1
         self._selected: Optional[str] = None              # primary (drives inspector)
         self._selected_ids: set = set()                   # multi-select set
+        self._selected_junction: Optional[Tuple[str, str]] = None  # (left, right)
         self._hits: List[Tuple[QRect, str, str]] = []     # (rect, clip_id, track)
+        self._junction_hits: List[Tuple[QRect, str, str, str]] = []
         self._drag: Optional[dict] = None
         self._scrubbing = False
         self._tool = "pointer"                      # "pointer" | "cut"
@@ -794,6 +797,7 @@ class TimelineWidget(QWidget):
         self._snap_frame: Optional[int] = None      # engaged snap target (frames)
         self._fx_count: Dict[str, int] = {}         # clip_id -> live mosh-op count
         self._melt_heads: set = set()               # clips whose opening cut melts
+        self._junction_fx: Dict[str, int] = {}      # clip_id -> live at-cut ops
         self._drop_hover: Optional[Tuple[str, int, int]] = None  # track, frame, len
 
     def set_project(self, project) -> None:
@@ -815,11 +819,15 @@ class TimelineWidget(QWidget):
         frame 0) — so the timeline can mark moshed clips and melting cuts."""
         self._fx_count = {}
         self._melt_heads = set()
+        self._junction_fx = {}
         for o in project.mosh_ops:
             if o.archived or not o.enabled:
                 continue
             self._fx_count[o.target_clip_id] = \
                 self._fx_count.get(o.target_clip_id, 0) + 1
+            if getattr(o, "at_cut", False):        # lives on the clip's junction
+                self._junction_fx[o.target_clip_id] = \
+                    self._junction_fx.get(o.target_clip_id, 0) + 1
             if (o.mode == "iframe_removal"
                     and not (o.params or {}).get("keep_first", True)
                     and not (o.params or {}).get("keep_every", 0)
@@ -856,6 +864,7 @@ class TimelineWidget(QWidget):
     def select(self, clip_id: Optional[str]) -> None:
         self._selected = clip_id
         self._selected_ids = {clip_id} if clip_id else set()
+        self._selected_junction = None
         self.update()
 
     def selected_ids(self) -> List[str]:
@@ -867,6 +876,7 @@ class TimelineWidget(QWidget):
     def _update_selection(self, clip_id: str, track: str, modifiers) -> None:
         """Apply a click to the selection set: Ctrl toggles, Shift range-selects
         on the same track, a plain click selects just this clip."""
+        self._selected_junction = None               # clips and seams are exclusive
         ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
         shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
         if ctrl:
@@ -895,6 +905,26 @@ class TimelineWidget(QWidget):
         self._selected_ids &= live
         if self._selected not in live:
             self._selected = next(iter(self._selected_ids), None)
+        if (self._selected_junction
+                and self._selected_junction not in self._junction_pairs()):
+            self._selected_junction = None           # clips moved apart / removed
+
+    def _junction_pairs(self) -> set:
+        """Every (left, right) adjacent pair -- butted or overlapping -- on the
+        project's video tracks; the seams that are selectable as junctions."""
+        pairs = set()
+        if not self._project:
+            return pairs
+        for t in self._project.tracks:
+            if t.role != "video":
+                continue
+            lay = self._project.track_layout(t.id)
+            for i in range(1, len(lay)):
+                _pc, ps, pl, _pt = lay[i - 1]
+                c, s, _l, trans = lay[i]
+                if trans > 0 or s == ps + pl:
+                    pairs.add((lay[i - 1][0].id, c.id))
+        return pairs
 
     # -- geometry ----------------------------------------------------------- #
 
@@ -980,6 +1010,7 @@ class TimelineWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         p.fillRect(self.rect(), QColor("#1c1f24"))
         self._hits = []
+        self._junction_hits = []
         x0, x1 = self._track_x()
         track_w = max(1, x1 - x0)
         ppf = self._ppf()
@@ -1008,21 +1039,26 @@ class TimelineWidget(QWidget):
         self._draw_waveform(p, x0, track_w, vis)
 
         # lanes (video tracks top-to-bottom, motion at the bottom)
-        bands = []
+        junctions = []              # seams between adjacent clips (see _draw_junction)
         for lane, t in enumerate(self._lanes()):
             y = self._lane_y(lane)
             on = getattr(t, "enabled", True)
             p.fillRect(QRect(x0, y, track_w, self.LANE_H),
                        QColor("#262b33") if on else QColor("#202329"))
             if t.role == "video":
+                prev_id, prev_end = None, 0
                 for clip, start, length, trans in self._project.track_layout(t.id):
                     rect = QRect(int(x0 + start * ppf), y,
                                  max(2, int(length * ppf) - 2), self.LANE_H)
                     self._draw_clip(p, rect, clip, length)
                     self._hits.append((rect, clip.id, t.id))
-                    if trans > 0:
-                        bands.append(QRect(int(x0 + start * ppf), y,
-                                           max(2, int(trans * ppf)), self.LANE_H))
+                    if prev_id is not None and (trans > 0 or start == prev_end):
+                        band = (QRect(int(x0 + start * ppf), y,
+                                      max(2, int(trans * ppf)), self.LANE_H)
+                                if trans > 0 else None)
+                        junctions.append((prev_id, clip.id, t.id, band,
+                                          int(x0 + start * ppf), y))
+                    prev_id, prev_end = clip.id, start + length
             else:                                     # motion: contiguous pool
                 cursor = 0
                 for clip in self._project.clips_for_track(t.id):
@@ -1032,8 +1068,8 @@ class TimelineWidget(QWidget):
                     self._draw_clip(p, rect, clip, length, motion=True)
                     self._hits.append((rect, clip.id, t.id))
                     cursor += length
-        for band in bands:                            # overlay after all clips
-            self._draw_xfade_band(p, band)
+        for j in junctions:                           # overlay after all clips
+            self._draw_junction(p, *j)
 
         # lane labels — stick to the visible left edge when scrolled, drawn
         # over the clips on a translucent chip so they stay readable
@@ -1174,21 +1210,52 @@ class TimelineWidget(QWidget):
         p.setPen(QColor("#2a3038"))                   # centre baseline
         p.drawLine(x0 + c0, int(mid), x0 + c1, int(mid))
 
-    def _draw_xfade_band(self, p, rect) -> None:
+    def _draw_xfade_band(self, p, rect, selected: bool = False) -> None:
         """Shade the crossfade overlap region with a hatched translucent band."""
         p.save()
         p.setClipRect(rect)
-        p.fillRect(rect, QColor(255, 209, 102, 70))   # translucent yellow wash
+        p.fillRect(rect, QColor(255, 209, 102, 110 if selected else 70))
         p.setPen(QColor(255, 209, 102, 150))          # diagonal hatch
         h = rect.height()
         x = rect.left() - h
         while x < rect.right():
             p.drawLine(x, rect.bottom(), x + h, rect.top())
             x += 6
-        p.setPen(QColor("#ffd166"))                   # crisp edges
+        p.setPen(QColor("#fff3d6") if selected else QColor("#ffd166"))
         p.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
         p.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
         p.restore()
+
+    JTAB = 12                                         # px junction tab size
+
+    def _draw_junction(self, p, left_id, right_id, track_id, band, cx, y) -> None:
+        """One seam between adjacent clips: the selectable transition area.
+
+        Draws the crossfade band when the clips overlap, plus a small tab at
+        the top of the lane. Band interior and tab are click targets that
+        select the *junction* -- the transition area between the two clips --
+        rather than either clip; the tab keeps zero-width hard cuts selectable
+        without stealing the trim handles' full-height hot zones (the band
+        interior is inset past the EDGE zones for the same reason)."""
+        selected = self._selected_junction == (left_id, right_id)
+        if band is not None:
+            self._draw_xfade_band(p, band, selected)
+            inner = band.adjusted(self.EDGE + 1, 0, -(self.EDGE + 1), 0)
+            if inner.width() >= 3:
+                self._junction_hits.append((inner, left_id, right_id, track_id))
+            cx = band.center().x()
+        elif selected:                                # hard cut: mark the seam
+            p.setPen(QColor("#ffd166"))
+            p.drawLine(cx, y, cx, y + self.LANE_H - 1)
+        tab = QRect(cx - self.JTAB // 2, y, self.JTAB, self.JTAB)
+        self._junction_hits.append((tab, left_id, right_id, track_id))
+        p.fillRect(tab, QColor(255, 209, 102, 230 if selected else 130))
+        p.setPen(QColor("#fff3d6") if selected else QColor(255, 209, 102, 200))
+        p.drawRect(tab.adjusted(0, 0, -1, -1))
+        n = self._junction_fx.get(right_id, 0)
+        if n:                                         # effects live at this seam
+            p.setPen(QColor("#ffd166"))
+            p.drawText(tab.right() + 3, tab.bottom(), f"≋{n}")
 
     # -- hit testing -------------------------------------------------------- #
 
@@ -1298,11 +1365,27 @@ class TimelineWidget(QWidget):
             self._scrubbing = True
             self._emit_seek(pos.x())
             return
+        mods = event.modifiers()
+        # A junction (the seam between two adjacent clips) wins over the clips
+        # under it -- but only for a plain pointer click: Ctrl/Shift are clip
+        # multi-select gestures and the cut tool splits whatever clip is hit.
+        if (self._tool == "pointer"
+                and not mods & (Qt.KeyboardModifier.ControlModifier
+                                | Qt.KeyboardModifier.ShiftModifier)):
+            jhit = next((j for j in self._junction_hits if j[0].contains(pos)),
+                        None)
+            if jhit is not None:
+                _rect, left_id, right_id, _tid = jhit
+                self._selected_junction = (left_id, right_id)
+                self._selected = None
+                self._selected_ids = set()
+                self.junctionSelected.emit(left_id, right_id)
+                self.update()
+                return
         hit = self._hit(pos)
         if not hit:
             return
         rect, clip_id, track = hit
-        mods = event.modifiers()
         self._update_selection(clip_id, track, mods)
         if self._selected:
             self.clipSelected.emit(self._selected)
@@ -2384,19 +2467,26 @@ class InspectorPanel(QWidget):
         layout.setSpacing(0)
         # Each group is collapsible so the inspector isn't a wall of controls;
         # the primary stacks (Clip, Effects) start open, the rest folded away.
-        layout.addWidget(_CollapsibleSection(
-            "Clip", self._build_clip_group(), expanded=True))
-        layout.addWidget(_CollapsibleSection(
-            "Effects (top → bottom)", self._build_effects_group(), expanded=True))
-        layout.addWidget(_CollapsibleSection(
-            "Pixel FX", self._build_pixel_group(), expanded=False))
-        layout.addWidget(_CollapsibleSection(
-            "Raw FX (numpy)", self._build_raw_group(), expanded=False))
-        layout.addWidget(_CollapsibleSection(
-            "Masks", self._build_mask_group(), expanded=False))
-        layout.addWidget(_CollapsibleSection(
-            "Flow FX (motion warp)", self._build_flow_group(), expanded=False))
-        layout.addWidget(self._build_clip_actions())   # always-visible actions
+        # The sections are kept as attributes so junction mode -- where only
+        # the effect stack applies -- can hide the clip-level ones.
+        self._junction = False
+        self._sec_clip = _CollapsibleSection(
+            "Clip", self._build_clip_group(), expanded=True)
+        self._sec_effects = _CollapsibleSection(
+            "Effects (top → bottom)", self._build_effects_group(), expanded=True)
+        self._sec_pixel = _CollapsibleSection(
+            "Pixel FX", self._build_pixel_group(), expanded=False)
+        self._sec_raw = _CollapsibleSection(
+            "Raw FX (numpy)", self._build_raw_group(), expanded=False)
+        self._sec_mask = _CollapsibleSection(
+            "Masks", self._build_mask_group(), expanded=False)
+        self._sec_flow = _CollapsibleSection(
+            "Flow FX (motion warp)", self._build_flow_group(), expanded=False)
+        self._clip_actions = self._build_clip_actions()   # always-visible actions
+        for w in (self._sec_clip, self._sec_effects, self._sec_pixel,
+                  self._sec_raw, self._sec_mask, self._sec_flow,
+                  self._clip_actions):
+            layout.addWidget(w)
         layout.addStretch(1)
 
         self.set_enabled_for_clip(None, None)
@@ -3005,6 +3095,7 @@ class InspectorPanel(QWidget):
 
     def set_enabled_for_clip(self, clip_id: Optional[str], label: Optional[str],
                              clip=None, effects: Optional[List[dict]] = None) -> None:
+        self._set_junction_layout(False)
         self._clip_id = clip_id
         on = clip_id is not None
         self._body.setVisible(on)           # blank panel until a clip is selected
@@ -3036,6 +3127,35 @@ class InspectorPanel(QWidget):
             self._populate_flow(None)
             self.set_clip_effects([])
         self._update_stack_buttons()
+
+    def set_enabled_for_junction(self, left_label: str, right_label: str,
+                                 span: int, effects: List[dict],
+                                 right_clip_id: str) -> None:
+        """Point the panel at a selected timeline junction: the transition area
+        between two adjacent clips. Only the effect stack applies -- its ops
+        live on the incoming clip, region-scoped to the frames at the cut -- so
+        the clip-level groups are hidden. Presets are whole-stack tools for
+        clips and stay disabled here."""
+        self._set_junction_layout(True)
+        self._clip_id = right_clip_id     # add/edit flows bind the incoming clip
+        self._body.setVisible(True)
+        self.effect_list.setEnabled(True)
+        what = f"{span}-frame overlap" if span else "hard cut"
+        self.clip_lbl.setText(
+            f"Transition: <b>{left_label}</b> ⟶ <b>{right_label}</b> ({what}). "
+            f"Effects here touch only the frames at the cut.")
+        self.set_clip_effects(effects)
+        self._update_stack_buttons()
+
+    def _set_junction_layout(self, junction: bool) -> None:
+        """Show/hide the clip-only groups when entering/leaving junction mode."""
+        self._junction = junction
+        for w in (self._sec_clip, self._sec_pixel, self._sec_raw,
+                  self._sec_mask, self._sec_flow, self._clip_actions):
+            w.setVisible(not junction)
+        for w in (self.preset_combo, self.preset_save_btn,
+                  self.preset_apply_btn, self.preset_del_btn):
+            w.setEnabled(not junction)
 
     # -- effect stack ------------------------------------------------------- #
 

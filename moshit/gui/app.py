@@ -241,6 +241,7 @@ class MainWindow(QMainWindow):
         self.controller = AppController(config=config, ffmpeg_bin=ffmpeg_bin,
                                         ffprobe_bin=ffprobe_bin)
         self._selected_clip: Optional[str] = None
+        self._selected_junction: Optional[tuple] = None  # (left_id, right_id)
         self._live_editing = False             # a non-modal param editor is open
         self._dirty = False
         self._project_path: Optional[str] = None    # set by Open / Save As
@@ -578,6 +579,7 @@ class MainWindow(QMainWindow):
 
         self.timeline.clipSelected.connect(self._on_clip_selected)
         self.timeline.selectionCleared.connect(self._on_selection_cleared)
+        self.timeline.junctionSelected.connect(self._on_junction_selected)
         self.timeline.moveRequested.connect(self.controller.move_clip)
         self.timeline.moveManyRequested.connect(self.controller.move_clips)
         self.timeline.trimRequested.connect(self._on_trim)
@@ -687,10 +689,14 @@ class MainWindow(QMainWindow):
         self.act_undo.setEnabled(self.controller.can_undo)
         self.act_redo.setEnabled(self.controller.can_redo)
         self._update_undo_labels()
-        # keep inspector in sync with the selected clip's current op -- but not
+        # keep inspector in sync with the selection's current state -- but not
         # while a live param editor is open, or every drag tick would tear down
         # and rebuild the inspector body (and the effect list) underneath it.
-        if self._selected_clip and not self._live_editing:
+        if self._live_editing:
+            pass
+        elif self._selected_junction:          # clears itself if the seam is gone
+            self._on_junction_selected(*self._selected_junction)
+        elif self._selected_clip:
             self._on_clip_selected(self._selected_clip)
 
     def _update_undo_labels(self) -> None:
@@ -701,6 +707,7 @@ class MainWindow(QMainWindow):
 
     def _on_clip_selected(self, clip_id: str) -> None:
         self._selected_clip = clip_id
+        self._selected_junction = None
         try:
             clip = self.controller.project.clip(clip_id)
         except KeyError:
@@ -730,9 +737,13 @@ class MainWindow(QMainWindow):
     # -- live effect editing (non-modal, re-renders as you drag) ------------- #
 
     def _on_effect_add_begin(self, mode: str) -> None:
-        if not self._selected_clip:
+        if self._selected_junction:            # scoped to the transition area
+            op = self.controller.begin_junction_effect_add(
+                *self._selected_junction, mode)
+        elif self._selected_clip:
+            op = self.controller.begin_effect_add(self._selected_clip, mode)
+        else:
             return
-        op = self.controller.begin_effect_add(self._selected_clip, mode)
         if op is None:
             return
         # begin_effect_add emitted project_changed, so the inspector's effect
@@ -753,7 +764,9 @@ class MainWindow(QMainWindow):
     def _on_effect_edit_end(self, op_id: str, committed: bool) -> None:
         self._live_editing = False
         self.controller.end_effect_edit(op_id, commit=committed)
-        if self._selected_clip:                    # resync the inspector body once
+        if self._selected_junction:                # resync the inspector body once
+            self._on_junction_selected(*self._selected_junction)
+        elif self._selected_clip:
             self._on_clip_selected(self._selected_clip)
         self._schedule_auto_refresh(immediate=True)
 
@@ -775,7 +788,9 @@ class MainWindow(QMainWindow):
 
     def _on_effect_randomise(self, op_id: str) -> None:
         self.controller.randomise_effect(op_id)
-        if self._selected_clip:                    # refresh the inspector body
+        if self._selected_junction:                # refresh the inspector body
+            self._on_junction_selected(*self._selected_junction)
+        elif self._selected_clip:
             self._on_clip_selected(self._selected_clip)
         self._schedule_auto_refresh(immediate=True)
 
@@ -923,7 +938,26 @@ class MainWindow(QMainWindow):
 
     def _on_selection_cleared(self) -> None:
         self._selected_clip = None
+        self._selected_junction = None
         self.inspector.set_enabled_for_clip(None, None)
+
+    def _on_junction_selected(self, left_id: str, right_id: str) -> None:
+        """A timeline junction (crossfade band / cut tab) was clicked: point
+        the inspector at the transition area between the two clips."""
+        info = self.controller.junction_info(left_id, right_id)
+        if info is None:                       # clips moved apart under the click
+            self._on_selection_cleared()
+            return
+        self._selected_junction = (left_id, right_id)
+        self._selected_clip = None
+        self.inspector.set_enabled_for_junction(
+            info["left_label"], info["right_label"], info["span"],
+            self.controller.junction_effects(left_id, right_id), right_id)
+        self.statusBar().showMessage(
+            f"Transition selected — effects added here hit only the "
+            f"{info['span']}-frame overlap." if info["span"] else
+            "Cut selected — effects added here hit the first frames after the "
+            "cut (e.g. P-frame drop or duplicate).")
 
     def _on_remove_many(self, clip_ids) -> None:
         if self._selected_clip in set(clip_ids):

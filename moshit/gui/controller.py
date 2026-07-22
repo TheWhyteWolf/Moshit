@@ -796,6 +796,7 @@ class AppController(QObject):
         op = self.project.add_mosh(
             "iframe_removal", {"keep_first": False, "keep_every": 0}, clip_id)
         op.region_end = 1
+        op.at_cut = True                   # lives in the junction's stack too
 
     def add_clip_for_media(self, media_id: str, track: str = "main"):
         media = self.project.media[media_id]
@@ -1068,6 +1069,79 @@ class AppController(QObject):
             out.append({"id": o.id, "mode": o.mode, "params": dict(o.params),
                         "enabled": o.enabled, "region": region})
         return out
+
+    # -- junctions (the transition area between two adjacent clips) ---------- #
+    #
+    # The seam between two clips on a video track -- a positional overlap or a
+    # hard butt cut -- is selectable in the timeline as its own thing. Effects
+    # added there are ordinary MoshOps on the *incoming* (right) clip, tagged
+    # ``at_cut`` and region-scoped to the clip's head, so only the transition
+    # area is touched. That is exactly how Easy-mode melts are built, so a melt
+    # shows up in its junction's stack like any other transition effect.
+
+    HARD_CUT_SPAN = 10   # default head window (frames) for effects at a butt cut
+    #                      -- wide enough for P-frame drop/dup to bite (frame 0 is
+    #                      a keyframe), and tweakable in the effect's region row
+
+    def junction_info(self, left_id: str, right_id: str):
+        """Describe the junction between two clips, or None if they are no
+        longer adjacent (same video track, right follows left, butted or
+        overlapping). ``span`` is the overlap in timeline frames (0 = hard cut).
+        """
+        try:
+            left, right = self.project.clip(left_id), self.project.clip(right_id)
+        except KeyError:
+            return None
+        if left.track != right.track:
+            return None
+        try:
+            track = self.project.track(left.track)
+        except KeyError:
+            return None
+        if track.role != "video":
+            return None
+        lay = self.project.track_layout(track.id)
+        for i in range(1, len(lay)):
+            pc, ps, pl, _pt = lay[i - 1]
+            c, s, _l, trans = lay[i]
+            if pc.id != left_id or c.id != right_id:
+                continue
+            if trans > 0 or s == ps + pl:          # overlapping or butted
+                def _label(clip):
+                    m = self.project.media.get(clip.media_id)
+                    return m.label if m else clip.id
+                return {"span": int(trans), "track_id": track.id,
+                        "left_label": _label(left), "right_label": _label(right)}
+            return None                            # a gap: no junction
+        return None                                # not consecutive any more
+
+    def junction_effects(self, left_id: str, right_id: str) -> List[dict]:
+        """The junction's effect stack: the incoming clip's ``at_cut`` ops."""
+        return [e for e, o in zip(self.clip_effects(right_id),
+                                  self.project.clip_ops(right_id)) if o.at_cut]
+
+    def begin_junction_effect_add(self, left_id: str, right_id: str, mode: str):
+        """Create an effect on the junction inside a live session (the junction
+        twin of :meth:`begin_effect_add`): an ``at_cut`` op on the incoming clip,
+        region-scoped to the overlap -- or to the first :data:`HARD_CUT_SPAN`
+        frames at a butt cut, where there is no overlap to bound it."""
+        info = self.junction_info(left_id, right_id)
+        if info is None:
+            return None
+        right = self.project.clip(right_id)
+        span = int(info["span"]) or self.HARD_CUT_SPAN
+        # regions index the clip's *source* frames; the overlap is measured in
+        # timeline (post-speed) frames
+        src_span = max(1, min(round(span * (right.speed or 1.0)),
+                              self.project._source_len(right)))
+        pre = self._snapshot()
+        op = self.project.add_mosh(mode, {}, right_id)
+        op.region_start, op.region_end = 0, src_span
+        op.at_cut = True
+        self._begin_live(("mosh", op.id), created=True, pre=pre,
+                         label=f"Add {mode} at cut")
+        self.project_changed.emit()
+        return op
 
     def add_effect(self, clip_id: str, mode: str, params: dict, region=None):
         self._push_undo("Add effect")
@@ -1495,6 +1569,7 @@ class AppController(QObject):
                 op.region_start = od.get("region_start", 0)
                 op.region_end = od.get("region_end")
                 op.enabled = od.get("enabled", True)
+                op.at_cut = od.get("at_cut", False)
             new_clips.append(new)
         if not new_clips:                                # nothing pasteable
             return []

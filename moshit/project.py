@@ -129,12 +129,16 @@ class MoshOp:
     archived: bool = False
     region_start: int = 0              # apply only to frames [start, end) of its
     region_end: Optional[int] = None   # input; None end = through the last frame
+    at_cut: bool = False               # anchored to the clip's opening cut: shown
+    #                                    in the timeline junction's stack, not just
+    #                                    the clip's (Easy-mode melts, junction FX)
 
     def to_dict(self) -> Dict:
         return {"id": self.id, "mode": self.mode, "params": self.params,
                 "target_clip_id": self.target_clip_id,
                 "enabled": self.enabled, "archived": self.archived,
-                "region_start": self.region_start, "region_end": self.region_end}
+                "region_start": self.region_start, "region_end": self.region_end,
+                "at_cut": self.at_cut}
 
     @classmethod
     def from_dict(cls, d: Dict) -> "MoshOp":
@@ -807,7 +811,9 @@ class Project:
                 if o.target_clip_id == clip_id and o.enabled and not o.archived:
                     self.mosh_ops.append(
                         MoshOp(id=_new_id("op"), mode=o.mode,
-                               params=dict(o.params), target_clip_id=new.id))
+                               params=dict(o.params), target_clip_id=new.id,
+                               region_start=o.region_start,
+                               region_end=o.region_end, at_cut=o.at_cut))
         return new
 
     def _timeline_end(self, track: str) -> int:

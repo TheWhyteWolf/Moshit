@@ -133,6 +133,21 @@ first clip on a track is left intact so the sequence still opens on a clean
 image; the melt re-blooms at the next natural keyframe unless you widen the
 effect's region.
 
+**Transitions are selectable.** The seam between two adjacent clips is its own
+thing on the timeline: where clips **overlap**, click the hatched crossfade band
+(or the small yellow tab above it); at a **hard cut**, click the tab that sits on
+the cut line. The inspector switches to the transition — *left clip ⟶ right
+clip* — and its **+ Add** menu drops effects scoped to just that area: on an
+overlap the effect's frame region is preset to exactly the overlapping frames,
+and at a hard cut to the first few frames after it, so `pframe_drop` or
+`pframe_duplicate` there stutters or blooms only the moment of the cut. These
+are ordinary region-limited ops on the incoming clip (an **≋N** count next to
+the tab shows how many a seam carries), so they also appear in that clip's own
+stack, survive copy/paste and duplicate, and can have their region widened in
+the effect editor like any other. Easy-mode melts are built the same way, so
+selecting a melting cut shows its `iframe_removal` right there in the seam's
+stack.
+
 **Preview.** Frames are decoded with FFmpeg, so the GUI needs nothing beyond
 PySide6 — no extra media libraries. The preview streams in as it decodes (you see
 it build rather than waiting on a frozen window), and your scrub position is kept
@@ -165,7 +180,9 @@ compose with moshing: you can mosh a clip *and* slow it, reverse it, or dissolve
 into it. They only kick in a re-encode when used; plain moshing keeps the fast
 codec-only path. Speed shows on the timeline as a `2×` badge (reverse `⇄`, fades
 `⊳`/`⊲`), and a crossfade shows as a hatched overlap band where the two clips
-dissolve — the same region the renderer blends.
+dissolve — the same region the renderer blends. Clicking that band selects the
+transition itself, so effects can be scoped to just the overlap (see
+*Transitions are selectable* above).
 
 **Effect stacks.** A clip holds a *stack* of effects, applied top to bottom — so
 glitches compound (e.g. `pframe_duplicate` → `bitrot` → `pframe_shuffle`). The
