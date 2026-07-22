@@ -229,6 +229,28 @@ class _Toast(QLabel):
         self.hide()
 
 
+_CONCEPTS_HTML = """
+<h3>Moshit concepts</h3>
+<p><b>Effect stack.</b> Each clip carries an ordered stack of datamosh effects,
+applied top to bottom, so glitches compound. Edit it in the inspector's
+<i>Effects</i> section.</p>
+<p><b>Easy mode.</b> The classic datamosh with zero setup: toggle it on and add
+clips end to end — each new clip's opening keyframe is dropped, so the picture
+melts across the cut.</p>
+<p><b>Motion track.</b> The lane at the bottom of the timeline holds
+<i>motion sources</i>: any clip whose <i>movement</i> (not its picture) drives an
+effect like <code>motion_splice</code> or optical-flow transfer on a base clip.</p>
+<p><b>Precomp (nested sequence).</b> Bundle several clips into their own sequence
+and use it as a single clip — then mosh, retime or composite the whole thing.
+Double-click a precomp clip to step inside it.</p>
+<p><b>Masks (mattes).</b> Key part of a clip by luminance, alpha, motion or a
+chroma colour: a <i>layer</i> matte controls where the clip shows through; an
+<i>FX</i> matte controls where its effects apply.</p>
+<p><b>Baking.</b> Freeze an effect stack into a new clip (reversible) — the
+recipe stays archived in the project, so you can always revert.</p>
+"""
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: Optional[EngineConfig] = None,
                  ffmpeg_bin: Optional[str] = None,
@@ -307,6 +329,7 @@ class MainWindow(QMainWindow):
         self.inspector.set_flow_sources(self.controller.media_choices())
         self.inspector.set_beat_provider(self.controller.beat_positions)
         self._restore_ui_state()
+        self._maybe_show_welcome()
 
     # -- toolbar ------------------------------------------------------------ #
 
@@ -376,6 +399,130 @@ class MainWindow(QMainWindow):
             act = gen.addAction(f"{label} motion source")
             act.triggered.connect(
                 lambda _checked=False, k=kind: self.controller.add_transform_source(k))
+
+        self._build_help_menu()
+
+    def _build_help_menu(self) -> None:
+        h = self.menuBar().addMenu("&Help")
+        a_keys = h.addAction("&Keyboard shortcuts…")
+        a_keys.setShortcut("F1")
+        a_keys.triggered.connect(self._show_shortcuts)
+        a_concepts = h.addAction("&Concepts…")
+        a_concepts.triggered.connect(self._show_concepts)
+        h.addSeparator()
+        a_about = h.addAction("&About Moshit")
+        a_about.triggered.connect(self._show_about)
+
+    # -- navigation shortcuts + Help dialogs + first-run hint --------------- #
+
+    def _add_selected_media(self) -> None:
+        self._add_to_timeline(self.library.selected_media_id())
+
+    def _select_adjacent_clip(self, delta: int) -> None:
+        """Select the previous/next clip on the current clip's track (or the
+        first video-track clip when nothing is selected yet)."""
+        proj = self.controller.project
+        track_id = None
+        if self._selected_clip:
+            try:
+                track_id = proj.clip(self._selected_clip).track
+            except KeyError:
+                track_id = None
+        if track_id is None:
+            vts = proj.video_tracks(self.controller.current_seq_id)
+            if not vts:
+                return
+            track_id = vts[0].id
+        ids = [c.id for c in proj.clips_for_track(track_id)]
+        if not ids:
+            return
+        if self._selected_clip in ids:
+            i = min(max(ids.index(self._selected_clip) + delta, 0), len(ids) - 1)
+        else:
+            i = 0 if delta >= 0 else len(ids) - 1
+        self.timeline.select(ids[i])
+        self._on_clip_selected(ids[i])
+
+    def _collect_shortcuts(self):
+        """(key, description) rows for the cheat-sheet: the window shortcut table
+        plus every menu action that carries a shortcut, so nothing drifts."""
+        rows = [(seq, label) for seq, label, _slot in
+                getattr(self, "_shortcut_table", [])]
+        seen = {r[0] for r in rows}
+        for menu_act in self.menuBar().actions():
+            menu = menu_act.menu()
+            if menu is None:
+                continue
+            group = menu_act.text().replace("&", "")
+            for act in menu.actions():
+                ks = act.shortcut().toString()
+                if ks and ks not in seen:
+                    seen.add(ks)
+                    rows.append((ks, f"{act.text().replace('&', '')}  ·  {group}"))
+        return rows
+
+    def _show_shortcuts(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard shortcuts")
+        v = QVBoxLayout(dlg)
+        form = QWidget()
+        grid = QFormLayout(form)
+        for key, label in self._collect_shortcuts():
+            grid.addRow(QLabel(f"<b>{key}</b>"), QLabel(label))
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setWidget(form)
+        area.setMinimumSize(420, 380)
+        v.addWidget(area)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.reject)
+        bb.accepted.connect(dlg.accept)
+        v.addWidget(bb)
+        dlg.exec()
+
+    def _show_concepts(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Concepts")
+        v = QVBoxLayout(dlg)
+        body = QLabel(_CONCEPTS_HTML)
+        body.setWordWrap(True)
+        body.setTextFormat(Qt.TextFormat.RichText)
+        body.setAlignment(Qt.AlignmentFlag.AlignTop)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setWidget(body)
+        area.setMinimumSize(460, 380)
+        v.addWidget(area)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.reject)
+        bb.accepted.connect(dlg.accept)
+        v.addWidget(bb)
+        dlg.exec()
+
+    def _show_about(self) -> None:
+        from .. import __version__
+        QMessageBox.about(
+            self, "About Moshit",
+            f"<b>Moshit</b> {__version__}<br><br>"
+            "A standalone, FFmpeg-backed datamoshing tool — a desktop app, a "
+            "command-line tool, and an embeddable engine.<br><br>"
+            "Corrupt compressed video on purpose: drop keyframes and smear "
+            "motion so one shot bleeds into the next.")
+
+    def _maybe_show_welcome(self) -> None:
+        """A one-time, non-modal first-run nudge (never blocks construction)."""
+        self._showed_welcome = False
+        if self._settings.value("ui/seen_welcome", False, type=bool):
+            return
+        if self.controller.project.media:          # not a blank first launch
+            return
+        self._settings.setValue("ui/seen_welcome", True)
+        self._settings.sync()
+        self._showed_welcome = True
+        self.statusBar().showMessage(
+            "Welcome to Moshit! Import a video (Ctrl+I) or drop one in, add it to "
+            "a track, then try Easy mode. Help → Keyboard shortcuts lists the keys.",
+            20000)
 
     def _build_toolbar(self) -> None:
         tb = self.addToolBar("Main")
@@ -528,24 +675,33 @@ class MainWindow(QMainWindow):
         return strip
 
     def _build_shortcuts(self) -> None:
-        """Playback/transport keys, scoped to the window. Editable widgets
-        consume their own text keys first, so these only fire when focus is on
-        the preview/timeline/library rather than a parameter field."""
-        for seq, slot in (
-            ("Space", self.preview.toggle),
-            (",", lambda: self.preview.step(-1)),
-            (".", lambda: self.preview.step(1)),
-            ("Home", self.preview.go_start),
-            ("End", self.preview.go_end),
-            ("I", self.preview.set_loop_in),          # loop sub-range
-            ("O", self.preview.set_loop_out),
-            ("Shift+I", self.preview.clear_loop),
-            ("Shift+O", self.preview.clear_loop),
-            ("=", self.timeline_pane.zoom_in),        # timeline zoom
-            ("+", self.timeline_pane.zoom_in),
-            ("-", self.timeline_pane.zoom_out),
-            ("0", self.timeline_pane.zoom_fit),
-        ):
+        """Playback/transport + navigation keys, scoped to the window. Editable
+        widgets consume their own text keys first, so these only fire when focus
+        is on the preview/timeline/library rather than a parameter field. The
+        Help → Keyboard shortcuts sheet is generated from this same table, so it
+        can never drift out of sync with what actually fires."""
+        self._shortcut_table = [
+            ("Space", "Play / pause", self.preview.toggle),
+            (",", "Step back one frame", lambda: self.preview.step(-1)),
+            (".", "Step forward one frame", lambda: self.preview.step(1)),
+            ("Home", "Jump to start", self.preview.go_start),
+            ("End", "Jump to end", self.preview.go_end),
+            ("I", "Set loop in-point", self.preview.set_loop_in),
+            ("O", "Set loop out-point", self.preview.set_loop_out),
+            ("Shift+I", "Clear loop range", self.preview.clear_loop),
+            ("Shift+O", "Clear loop range", self.preview.clear_loop),
+            ("=", "Zoom timeline in", self.timeline_pane.zoom_in),
+            ("+", "Zoom timeline in", self.timeline_pane.zoom_in),
+            ("-", "Zoom timeline out", self.timeline_pane.zoom_out),
+            ("0", "Fit timeline to view", self.timeline_pane.zoom_fit),
+            ("Ctrl+I", "Import video…", self._import),
+            ("A", "Add selected media to the timeline", self._add_selected_media),
+            ("[", "Select previous clip", lambda: self._select_adjacent_clip(-1)),
+            ("]", "Select next clip", lambda: self._select_adjacent_clip(1)),
+            ("V", "Pointer tool", self.btn_pointer.click),
+            ("B", "Cut tool", self.btn_cut.click),
+        ]
+        for seq, _label, slot in self._shortcut_table:
             QShortcut(QKeySequence(seq), self, activated=slot)
 
     # -- signal wiring ------------------------------------------------------ #
@@ -713,13 +869,15 @@ class MainWindow(QMainWindow):
         except KeyError:
             self.inspector.set_enabled_for_clip(None, None)
             return
-        if clip.track != "main":
+        track = next((t for t in self.controller.project.tracks
+                      if t.id == clip.track), None)
+        if track is None or track.role != "video":
             media = self.controller.project.media.get(clip.media_id)
             label = media.label if media else clip_id
             self.inspector.set_enabled_for_clip(
                 None, label)
             self.statusBar().showMessage(
-                f"{label} is a motion source — effects apply to main-track clips.")
+                f"{label} is a motion source — effects apply to video-track clips.")
             return
         media = self.controller.project.media.get(clip.media_id)
         label = media.label if media else clip_id
@@ -886,7 +1044,7 @@ class MainWindow(QMainWindow):
 
     def _schedule_auto_refresh(self, *, immediate: bool = False) -> None:
         """Coalesce edit-driven and explicit preview renders onto one timer."""
-        if not self.controller.project.main_clips():
+        if not self.controller.has_video_clips():
             return
         if immediate:
             self._refresh_timer.start(0)
@@ -894,7 +1052,7 @@ class MainWindow(QMainWindow):
             self._refresh_timer.start(350)
 
     def _auto_refresh_fire(self) -> None:
-        if not self.controller.project.main_clips():
+        if not self.controller.has_video_clips():
             return
         if self.controller.is_busy:               # retry once the engine is free
             self._refresh_timer.start(150)

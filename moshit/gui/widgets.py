@@ -1892,7 +1892,9 @@ class PreviewWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(_heading("Preview"))
 
-        self.view = QLabel("No preview yet — add clips, then Refresh Preview.")
+        self.view = QLabel("No preview yet — import a video (Ctrl+I) or drop one "
+                           "in, add it to a track, then it renders here.  Try "
+                           "Easy mode to mosh across cuts.")
         self.view.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.view.setMinimumSize(360, 240)
         self.view.setStyleSheet(
@@ -3119,7 +3121,7 @@ class InspectorPanel(QWidget):
             self._populate_flow(getattr(clip, "flow_transfer", None))
             self.set_clip_effects(effects or [])
         else:
-            self.clip_lbl.setText("Select a clip on the main track.")
+            self.clip_lbl.setText("Select a clip.")
             self._populate_clip_props(object())        # reset to defaults
             self.set_clip_pixel_fx([])
             self.set_clip_raw_fx([])

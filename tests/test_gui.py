@@ -96,6 +96,58 @@ def test_preview_audio_builds_and_mutes(qapp, tmp_path, monkeypatch):
     c.cleanup()
 
 
+def test_preview_skips_redecode_when_unchanged(qapp, tmp_path, monkeypatch):
+    from PySide6.QtCore import QEventLoop, QTimer
+    from moshit.gui.controller import AppController
+    from moshit.engine import EngineConfig
+    from moshit.ffmpeg import FFmpeg
+    from moshit.project import MoshOp, _new_id
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    ff = FFmpeg()
+    src = tmp_path / "s.mp4"
+    ff._run(["-f", "lavfi", "-i", "testsrc=size=128x96:rate=24:duration=0.5",
+             "-pix_fmt", "yuv420p", "-y", str(src)], "mk")
+    c = AppController(config=EngineConfig(width=128, height=96, fps=24.0, gop=12))
+
+    def run_op(call):
+        loop = QEventLoop()
+        c.busy.connect(lambda busy, _m: loop.quit() if not busy else None)
+        QTimer.singleShot(40000, loop.quit)
+        call()
+        loop.exec()
+
+    calls = {"n": 0}
+    orig = c.decoder.decode_stream
+    monkeypatch.setattr(c.decoder, "decode_stream",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                         orig(*a, **k))[1])
+
+    run_op(lambda: c.import_media(str(src), "main"))
+    c.add_clip_for_media(list(c.project.media)[0], "main")
+
+    run_op(lambda: c.refresh_preview())
+    assert calls["n"] == 1                               # first render decodes
+    run_op(lambda: c.refresh_preview())
+    assert calls["n"] == 1                               # byte-identical -> decode skipped
+
+    cid = c.project.main_clips()[0].id                   # change the video output
+    c.project.mosh_ops.append(MoshOp(id=_new_id("op"), mode="pframe_duplicate",
+                                     params={"factor": 2}, target_clip_id=cid))
+    run_op(lambda: c.refresh_preview())
+    assert calls["n"] == 2                               # changed render re-decodes
+    c.cleanup()
+
+
+def test_cancel_resets_preview_skip_guard(ctl):
+    """A cancelled decode must not let the next identical render skip on top of
+    partial frames -- cancel() clears the byte-signature guard."""
+    ctl._busy = True
+    ctl._last_preview_sig = "deadbeef"
+    ctl.cancel()
+    assert ctl._last_preview_sig is None
+
+
 def test_inspector_opacity_blend(qapp):
     from moshit.gui.widgets import InspectorPanel
     from moshit.project import Clip
@@ -1409,6 +1461,51 @@ def test_beat_positions_clip_to_span(win, monkeypatch):
     assert len(b) == 1 and abs(b[0] - 0.5) < 1e-6        # the 30f onset (999s dropped)
 
 
+def test_inspector_enabled_on_any_video_track(win):
+    """The inspector edits clips on any video track, not just 'main'; a
+    motion-pool clip still shows the disabled 'motion source' state."""
+    from moshit.project import Clip, MOTION_TRACK_ID
+    ctl = win.controller
+    _seed_clip(ctl, "c")                                 # media "m", clip on main
+    t = ctl.add_video_track()
+    ctl.add_clip_for_media("m", t.id)
+    sec = ctl.project.clips_for_track(t.id)[0]
+    win._on_clip_selected(sec.id)
+    assert win.inspector._clip_id == sec.id              # enabled on the 2nd video track
+
+    ctl.project.clips.append(Clip(id="mo", media_id="m", track=MOTION_TRACK_ID))
+    win._on_clip_selected("mo")
+    assert win.inspector._clip_id is None                # motion pool stays disabled
+
+
+def test_auto_refresh_predicate_covers_secondary_tracks(ctl):
+    """has_video_clips() (the auto-refresh gate) sees clips on a secondary video
+    track even when the legacy main_clips() is empty."""
+    from moshit.project import MediaItem
+    ctl.project.media.setdefault("m", MediaItem(
+        id="m", source_path="x", label="x", role="main",
+        intermediate_path="x", nb_frames=20))
+    t = ctl.add_video_track()
+    ctl.add_clip_for_media("m", t.id)                    # clip only on the 2nd track
+    assert ctl.project.main_clips() == []                # nothing on the main track
+    assert ctl.has_video_clips()                         # but the 2nd track has a clip
+
+
+def test_beat_positions_on_secondary_track(win, monkeypatch):
+    """beat_positions resolves a clip's span on its own track (was main-only)."""
+    import moshit.beats as beats_mod
+    ctl = win.controller
+    _seed_clip(ctl, "a")                                 # media "m" on main
+    t = ctl.add_video_track()
+    ctl.add_clip_for_media("m", t.id)                    # 2nd track, span [0, 20]
+    sec = ctl.project.clips_for_track(t.id)[0]
+    ctl._audio_path_cache = "dummy.wav"                  # truthy: skip real audio
+    fps = ctl.config.fps
+    monkeypatch.setattr(beats_mod, "onsets", lambda wav: [10 / fps])
+    got = ctl.beat_positions(sec.id)                     # [] before the fix
+    assert len(got) == 1 and abs(got[0] - 0.5) < 1e-6
+
+
 def test_inspector_beat_fill(win):
     # beats fill an automatable param inside the per-effect pop-up dialog
     from moshit.gui.widgets import AutoParamWidget, EffectParamDialog
@@ -2193,3 +2290,49 @@ def test_inspector_automation_control(win):
     w.set_value(spec)
     out = w.get_value()
     assert out["interp"] == "smooth" and len(out["keys"]) == 3
+
+
+def test_help_menu_and_shortcut_sheet(win):
+    """The Help menu exists and the cheat-sheet is generated from the live
+    shortcut table + menu actions, so a new binding can't drift out of it."""
+    titles = [a.text().replace("&", "") for a in win.menuBar().actions()]
+    assert "Help" in titles
+    keys = {k for k, _ in win._collect_shortcuts()}
+    assert {"Space", "Ctrl+I", "Ctrl+E"} <= keys          # window table + menu action
+    win._shortcut_table.append(("Ctrl+Alt+T", "Temp probe", lambda: None))
+    assert any(k == "Ctrl+Alt+T" for k, _ in win._collect_shortcuts())   # no drift
+
+
+def test_select_adjacent_clip_navigates(win):
+    ctl = win.controller
+    _seed_clip(ctl, "a")                                  # media "m", main [0, 20]
+    ctl.add_clip_for_media("m", "main")                   # a second clip after it
+    ids = [c.id for c in ctl.project.clips_for_track("main")]
+    assert len(ids) == 2
+    win._selected_clip = ids[0]
+    win._select_adjacent_clip(1)
+    assert win._selected_clip == ids[1]                   # -> next clip
+    win._select_adjacent_clip(-1)
+    assert win._selected_clip == ids[0]                   # -> previous clip
+    win._select_adjacent_clip(-1)
+    assert win._selected_clip == ids[0]                   # clamped at the start
+
+
+def test_tool_switch_shortcut_slots(win):
+    win.btn_cut.click()                                   # the 'B' shortcut target
+    assert win.timeline._tool == "cut" and win.btn_cut.isChecked()
+    win.btn_pointer.click()                               # the 'V' shortcut target
+    assert win.timeline._tool == "pointer" and win.btn_pointer.isChecked()
+
+
+def test_first_run_welcome_shows_once(qapp, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from PySide6.QtCore import QSettings
+    QSettings("moshit", "moshit").remove("ui/seen_welcome")   # clean slate for this test
+    from moshit.gui.app import MainWindow
+    w1 = MainWindow()
+    assert w1._showed_welcome is True                     # first launch -> shown
+    w1.controller.cleanup()
+    w2 = MainWindow()
+    assert w2._showed_welcome is False                    # flag persisted -> not again
+    w2.controller.cleanup()

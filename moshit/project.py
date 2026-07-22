@@ -1323,7 +1323,8 @@ class Project:
         self.media[baked_id] = baked_media
         self._cache_parsed(baked_id, baked_clip_av)
 
-        new_clip = Clip(id=_new_id("clip"), media_id=baked_id, track="main",
+        new_clip = Clip(id=_new_id("clip"), media_id=baked_id,
+                        track=target.track, seq_id=target.seq_id,
                         start=target.start, in_point=0,
                         out_point=len(baked_clip_av.frames))
         self.clips.append(new_clip)
@@ -1373,7 +1374,8 @@ class Project:
         self.media[baked_id] = baked_media
         self._cache_parsed(baked_id, baked_av)
 
-        new_clip = Clip(id=_new_id("clip"), media_id=baked_id, track="main",
+        new_clip = Clip(id=_new_id("clip"), media_id=baked_id,
+                        track=target.track, seq_id=target.seq_id,
                         start=target.start, in_point=0,
                         out_point=len(baked_av.frames),
                         speed=target.speed, reverse=target.reverse,
@@ -1426,7 +1428,8 @@ class Project:
         self.media[warped_id] = derived
         self._cache_parsed(warped_id, warped_av)
 
-        new_clip = Clip(id=_new_id("clip"), media_id=warped_id, track="main",
+        new_clip = Clip(id=_new_id("clip"), media_id=warped_id,
+                        track=target.track, seq_id=target.seq_id,
                         start=target.start, in_point=0,
                         out_point=len(warped_av.frames),
                         speed=target.speed, reverse=target.reverse,

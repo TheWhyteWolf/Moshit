@@ -322,3 +322,20 @@ def test_parsed_media_cache_bounded(engine, project, make_clip):
     av = project._parsed_media(m1.id)              # evicted → re-parses cleanly
     assert len(av.frames) == m1.nb_frames
     assert list(project._parsed) == [m1.id]        # newest again, m3 evicted
+
+
+def test_bake_keeps_clip_on_its_track(engine, project, make_clip):
+    """Baking a clip on a non-main video track keeps the baked clip on that track
+    and in its sequence (regression: bake_clip/bake_op/apply_optical_flow used to
+    hard-code track="main", silently relocating the baked clip to the main lane)."""
+    from moshit.project import MoshOp, _new_id
+    m = project.import_media(engine, make_clip("bt.mp4"))
+    t = project.add_track(role="video")                  # a second video track
+    clip = project.add_clip(m.id, t.id)
+    project.mosh_ops.append(MoshOp(
+        id=_new_id("op"), mode="pframe_duplicate",
+        params={"factor": 2}, target_clip_id=clip.id))
+    rec = project.bake_clip(engine, clip.id)
+    baked = project.clip(rec.baked_clip_id)
+    assert baked.track == t.id                           # not "main"
+    assert baked.seq_id == project.root_seq_id

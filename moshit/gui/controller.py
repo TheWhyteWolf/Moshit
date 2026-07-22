@@ -15,6 +15,7 @@ import atexit
 import collections
 import copy
 import dataclasses
+import hashlib
 import os
 import shutil
 import tempfile
@@ -36,6 +37,16 @@ from ..project import (Project, Clip, ROOT_SEQ_ID, MAIN_TRACK_ID,
                        MOTION_TRACK_ID)
 from .. import beats, waveform
 from .preview import PreviewDecoder
+
+
+def _hash_file(path, _chunk: int = 1 << 20) -> str:
+    """A cheap content signature of a rendered ``preview.avi`` so an unchanged
+    re-render can skip the (linear, whole-file) re-decode."""
+    h = hashlib.blake2b(digest_size=16)
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(_chunk), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 # Identity/placement fields a paste re-derives rather than carries; every
@@ -158,6 +169,7 @@ class AppController(QObject):
         self._audio_path_cache = None
         self._preview_audio = None
         self._preview_waveform = None          # peak envelope for the timeline
+        self._last_preview_sig = None          # skip re-decode when the render is unchanged
         # A/B compare: its own FFmpeg (cancel() kills self.ff's processes and
         # must not take a hold-to-compare fetch with it) + a small frame cache.
         self._ab_ff = FFmpeg(ffmpeg=ffmpeg_bin, ffprobe=ffprobe_bin)
@@ -313,6 +325,7 @@ class AppController(QObject):
         # what it is, not on whether we've asked it to stop. The drain handlers
         # clear the flag once it has actually finished.
         self._pending = None
+        self._last_preview_sig = None          # a killed decode must not let the next one skip
         self.ff.terminate_active()
         self.decoder.terminate()
         self.busy.emit(False, "")
@@ -435,12 +448,19 @@ class AppController(QObject):
             self.status.emit(f"Generated {label} motion source")
         self._run(work, done, f"Generating {label} motion source…")
 
+    def has_video_clips(self, seq_id=None) -> bool:
+        """True if any enabled video track in *seq_id* (default: the current
+        sequence) holds clips to render. Shared by the preview guard and the
+        auto-refresh scheduler so the two can't drift apart."""
+        sid = seq_id or self.current_seq_id
+        return any(self.project.clips_for_track(t.id)
+                   for t in self.project.video_tracks(sid))
+
     def refresh_preview(self) -> None:
         if self.is_busy:                       # also waits out a draining cancel
             return
         seq_id = self.current_seq_id
-        if not any(self.project.clips_for_track(t.id)
-                   for t in self.project.video_tracks(seq_id)):
+        if not self.has_video_clips(seq_id):
             self.error.emit("Add a clip to a video track first.")
             return
         self._busy = True
@@ -457,8 +477,18 @@ class AppController(QObject):
         def work(emit_begin, emit_batch):
             r = view.render(self.preview_engine, out, sequence_id=seq_id,
                             progress=self._progress_cb(gen))
-            self.decoder.decode_stream(out, emit_begin, emit_batch,
-                                       max_width=PREVIEW_MAX_WIDTH)
+            # Skip the (linear, whole-file) re-decode when the coded preview is
+            # byte-identical to the last one -- undo/redo to a seen state, an
+            # audio-only edit (gain/mute), or a no-op refresh. When begin/batch
+            # never fire, the preview widget keeps its existing frames. Record the
+            # sig only for a live (non-superseded) decode, so a cancelled job can't
+            # let the next identical render skip on top of partial frames.
+            sig = _hash_file(out)
+            if sig != self._last_preview_sig:
+                self.decoder.decode_stream(out, emit_begin, emit_batch,
+                                           max_width=PREVIEW_MAX_WIDTH)
+                if gen == self._job_gen:
+                    self._last_preview_sig = sig
             self._preview_audio = self._build_preview_audio(r.get("audio_plans"))
 
         worker = _StreamWorker(work)
@@ -560,13 +590,18 @@ class AppController(QObject):
     def beat_positions(self, clip_id: str) -> List[float]:
         """Onsets in the preview audio that fall within *clip_id*'s span, as
         normalised 0..1 offsets within the clip (for beat-synced automation).
-        Empty if there's no preview audio yet or the clip isn't on the main track.
+        Empty if there's no preview audio yet or the clip has no timeline span.
         """
         wav = self._audio_path_cache
         if not wav:
             return []
-        span = next(((start, length) for clip, start, length, _t
-                     in self.project.main_layout() if clip.id == clip_id), None)
+        try:
+            clip = self.project.clip(clip_id)
+        except KeyError:
+            return []
+        span = next(((start, length) for c, start, length, _t
+                     in self.project.track_layout(clip.track) if c.id == clip_id),
+                    None)
         if not span or span[1] <= 0:
             return []
         fps = self.config.fps or 30.0
@@ -1406,7 +1441,7 @@ class AppController(QObject):
             self.status.emit(f"Deleted preset '{name}'")
 
     def set_clip_props(self, clip_id: str, props: dict):
-        """Set a main clip's finishing properties (speed/reverse/fades/crossfade).
+        """Set a clip's finishing properties (speed/reverse/fades/crossfade).
 
         No-ops (and records no undo) when nothing actually changes, so simply
         re-selecting a clip never dirties the project.
